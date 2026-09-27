@@ -13,8 +13,11 @@
 // Merge operands are folded onto the value beneath them by the Merger.
 // Compaction is the same iterator written back out into the next level.
 //
-// Keys are byte-comparable; the first byte names the key space. The
-// package does not know what the spaces mean.
+// Keys are byte-comparable and the first byte is the key's space. That is
+// a format rule: compaction never writes a file that spans two spaces,
+// tracks each file's per-space ranges (FileRef.Spaces), and uses them to
+// leave alone the files no input writes to. The package does not interpret
+// the space byte beyond that.
 //
 // A table, in file order: blocks of crc32c(payload), a mode byte (zstd or
 // stored) and the entries; an index of each block's offset, lengths and

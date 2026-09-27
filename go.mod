@@ -1,6 +1,6 @@
 module github.com/axiomhq/lsm
 
-go 1.27.1
+go 1.27
 
 require (
 	github.com/RoaringBitmap/roaring/v2 v2.28.0

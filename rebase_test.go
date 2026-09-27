@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/RoaringBitmap/roaring/v2"
+	"github.com/axiomhq/lsm/setmerge"
 )
 
 // randBatch is one flush's entries over universe, sorted and unique, with
@@ -21,7 +22,7 @@ func randBatch(rng *rand.Rand, universe [][]byte, m model) []Entry {
 		var e Entry
 		switch rng.IntN(10) {
 		case 0, 1:
-			e = Entry{Key: k, Kind: KindPut, Value: SetValue(set(uint32(rng.IntN(50))))}
+			e = Entry{Key: k, Kind: KindPut, Value: setmerge.Value(set(uint32(rng.IntN(50))))}
 		case 2:
 			e = Entry{Key: k, Kind: KindDelete}
 		default:
@@ -32,7 +33,7 @@ func randBatch(rng *rand.Rand, universe [][]byte, m model) []Entry {
 			if rng.IntN(2) == 0 {
 				remove = set(uint32(rng.IntN(50)))
 			}
-			e = Entry{Key: k, Kind: KindMerge, Value: SetOperand(add, remove)}
+			e = Entry{Key: k, Kind: KindMerge, Value: setmerge.Operand(add, remove)}
 		}
 		byKey[string(k)] = e
 	}
@@ -72,7 +73,7 @@ func TestRebaseOverFlushesMatchesModel(t *testing.T) {
 					continue
 				}
 				snap := v
-				_, e, err := Compact(ctx, snap, j, o, st.open, st.put)
+				_, e, err := Compact(ctx, snap, j, o, st.reader(), st.put)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -112,7 +113,7 @@ func TestRebaseRefusesAConcurrentCompaction(t *testing.T) {
 			t.Fatal(err)
 		}
 		if j, ok := Pick(v, o); ok {
-			if v, _, err = Compact(ctx, v, j, o, st.open, st.put); err != nil {
+			if v, _, err = Compact(ctx, v, j, o, st.reader(), st.put); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -127,11 +128,11 @@ func TestRebaseRefusesAConcurrentCompaction(t *testing.T) {
 	// Two jobs on snap: all of level 0, and one level-1 file down.
 	l0 := snap.job(0, snap.Levels[0], o)
 	l1 := snap.job(1, snap.Levels[1][:1], o)
-	_, ea, err := Compact(ctx, snap, l0, o, st.open, st.put)
+	_, ea, err := Compact(ctx, snap, l0, o, st.reader(), st.put)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, eb, err := Compact(ctx, snap, l1, o, st.open, st.put)
+	_, eb, err := Compact(ctx, snap, l1, o, st.reader(), st.put)
 	if err != nil {
 		t.Fatal(err)
 	}

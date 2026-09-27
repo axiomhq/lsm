@@ -18,7 +18,6 @@ type Options struct {
 	BaseBytes  int64 // level 1 target bytes
 	FileBytes  int64 // output file target
 	BlockBytes int
-	Merger     Merger
 	// Workers bounds the partitions one compaction merges at once: a job
 	// is split by its overlap files' key ranges, and each range is an
 	// independent merge (0: half the CPUs, at least one).
@@ -27,7 +26,7 @@ type Options struct {
 
 // DefaultOptions: 4 L0 files, ratio 10, 256 MiB L1, 48 MiB files.
 func DefaultOptions() Options {
-	return Options{L0Trigger: 4, LevelRatio: 10, BaseBytes: 256 << 20, FileBytes: 48 << 20, BlockBytes: DefaultBlockBytes, Merger: SetMerger{}}
+	return Options{L0Trigger: 4, LevelRatio: 10, BaseBytes: 256 << 20, FileBytes: 48 << 20, BlockBytes: DefaultBlockBytes}
 }
 
 func (o Options) workers() int {
@@ -53,9 +52,6 @@ func (o Options) withDefaults() Options {
 	}
 	if o.BlockBytes <= 0 {
 		o.BlockBytes = d.BlockBytes
-	}
-	if o.Merger == nil {
-		o.Merger = d.Merger
 	}
 	return o
 }
@@ -119,8 +115,8 @@ func keyRange(files []FileRef) (lo, hi []byte) {
 	return lo, hi
 }
 
-// hiInclusive turns an inclusive Max into an exclusive bound.
-func hiInclusive(max []byte) []byte { return append(bytes.Clone(max), 0) }
+// afterMax is the exclusive bound just past an inclusive Max.
+func afterMax(max []byte) []byte { return append(bytes.Clone(max), 0) }
 
 // receives reports whether any input may hold a key in [lo, hi] (hi
 // exclusive unless incl; nil is unbounded), by the inputs' key-space
@@ -181,7 +177,7 @@ func Pick(v Version, o Options) (Job, bool) {
 			var best FileRef
 			bestOverlap := int64(-1)
 			for _, f := range v.Levels[l] {
-				over := levelBytes(v.overlapIn(l+1, f.Min, hiInclusive(f.Max)))
+				over := levelBytes(v.overlapIn(l+1, f.Min, afterMax(f.Max)))
 				if bestOverlap < 0 || over < bestOverlap {
 					best, bestOverlap = f, over
 				}
@@ -199,7 +195,7 @@ func (v Version) overlapIn(level int, lo, hi []byte) []FileRef {
 	}
 	var out []FileRef
 	for _, f := range v.Levels[level] {
-		if f.overlaps(lo, hi) {
+		if f.Overlaps(lo, hi) {
 			out = append(out, f)
 		}
 	}
@@ -209,7 +205,7 @@ func (v Version) overlapIn(level int, lo, hi []byte) []FileRef {
 func (v Version) job(level int, inputs []FileRef, o Options) Job {
 	o = o.withDefaults()
 	lo, hi := keyRange(inputs)
-	hi = hiInclusive(hi)
+	hi = afterMax(hi)
 	j := Job{Level: level, Inputs: inputs, Overlap: v.overlapIn(level+1, lo, hi), Bottom: true}
 	// The level-below file just before the inputs joins when it is small:
 	// Compact grows it with the input keys in the gap after it (a space
@@ -230,7 +226,7 @@ func (v Version) job(level int, inputs []FileRef, o Options) Job {
 		if bytes.Compare(olo, lo) < 0 {
 			lo = olo
 		}
-		if ohi = hiInclusive(ohi); bytes.Compare(ohi, hi) > 0 {
+		if ohi = afterMax(ohi); bytes.Compare(ohi, hi) > 0 {
 			hi = ohi
 		}
 	}
@@ -258,11 +254,11 @@ func (v Version) job(level int, inputs []FileRef, o Options) Job {
 // only orphan objects. The returned Edit is the change from v (inputs and
 // rewritten overlap deleted, outputs added), for a caller that publishes
 // it over a newer version (Version.Rebase).
-func Compact(ctx context.Context, v Version, j Job, o Options, open Opener, put Putter) (Version, Edit, error) {
+func Compact(ctx context.Context, v Version, j Job, o Options, r Reader, put Putter) (Version, Edit, error) {
 	o = o.withDefaults()
 	inputs := make([]*Table, len(j.Inputs))
 	for i, f := range j.Inputs {
-		t, err := open(ctx, f)
+		t, err := r.Open(ctx, f)
 		if err != nil {
 			return Version{}, Edit{}, err
 		}
@@ -285,7 +281,7 @@ func Compact(ctx context.Context, v Version, j Job, o Options, open Opener, put 
 		if !receives(j.Inputs, f.Min, hi, incl) {
 			continue
 		}
-		t, err := open(ctx, f)
+		t, err := r.Open(ctx, f)
 		if err != nil {
 			return Version{}, Edit{}, err
 		}
@@ -309,7 +305,7 @@ func Compact(ctx context.Context, v Version, j Job, o Options, open Opener, put 
 		if overlaps[i] == nil {
 			cur.hi = f.Min
 			parts = append(parts, cur)
-			cur, curBytes = partition{lo: hiInclusive(f.Max)}, 0
+			cur, curBytes = partition{lo: afterMax(f.Max)}, 0
 			continue
 		}
 		if curBytes >= o.FileBytes/2 {
@@ -330,12 +326,12 @@ func Compact(ctx context.Context, v Version, j Job, o Options, open Opener, put 
 		g.Go(func() error {
 			its := make([]Iterator, 0, len(inputs)+len(p.overlaps))
 			for _, t := range inputs {
-				its = append(its, Bound(t.Iter(gctx), p.hi))
+				its = append(its, Bound(t.Iter(gctx), nil, p.hi))
 			}
 			for _, t := range p.overlaps {
-				its = append(its, Bound(t.Iter(gctx), p.hi))
+				its = append(its, Bound(t.Iter(gctx), nil, p.hi))
 			}
-			in := Resolve(NewMerge(its...), o.Merger, j.Bottom)
+			in := Resolve(NewMerge(its...), r.Merger, j.Bottom)
 			var w *TableWriter
 			finish := func() error {
 				if w == nil {

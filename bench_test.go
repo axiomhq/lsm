@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"math/rand/v2"
 	"testing"
+
+	"github.com/axiomhq/lsm/setmerge"
 )
 
 // benchTables builds n tables of rows entries each, keys disjoint by
@@ -68,7 +70,7 @@ func BenchmarkResolveIter(b *testing.B) {
 		for i, t := range tables {
 			its[i] = t.Iter(ctx)
 		}
-		r := Resolve(NewMerge(its...), SetMerger{}, true)
+		r := Resolve(NewMerge(its...), setmerge.Merger{}, true)
 		keys := 0
 		for ok := r.SeekGE(nil); ok; ok = r.Next() {
 			keys++

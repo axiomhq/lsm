@@ -23,17 +23,24 @@ For bytes without levels, `data, meta, err := lsm.BuildTable(entries, lsm.Defaul
 
 1. Write an `Opener`: `func(ctx, f lsm.FileRef) (*lsm.Table, error)`. Inside, call `lsm.OpenTableAt(ctx, src, f.Meta())`.
    `src` implements `ReadAt(ctx, off, length int64) ([]byte, error)`. Use `lsm.BytesSource(data)` for bytes in memory.
-2. Point read: `value, ok, err := v.Get(ctx, open, merger, key)`.
-3. Range read: `it, err := v.Iter(ctx, open, merger, lo, hi)`, then `for it.Next() { it.Key(); it.Value() }` and check `it.Err()`.
+2. Build a reader: `r := lsm.Reader{Open: open, Merger: setmerge.Merger{}}`.
+3. Point read: `value, ok, err := r.Get(ctx, v, key)`.
+4. Range read: `it, err := r.Iter(ctx, v, lo, hi)`, then `for ok := it.SeekGE(nil); ok; ok = it.Next() { it.Key(); it.Value() }` and check `it.Err()`. A nil seek lands on `lo`.
 
-`merger` folds `KindMerge` operands onto the value beneath them. `SetMerger`
-ships in the package: roaring-bitmap sets with add/remove operands
-(`SetValue`, `SetOperand`, `DecodeSet`).
+For large put-only values, `l, ok, err := r.Locate(ctx, v, key)` returns the
+value's extent in its table (`Table.Single`) when it sits alone in a stored
+block, so you read just those bytes with `l.Table.ReadAt`.
+
+`Merger` folds `KindMerge` operands onto the value beneath them; leave it nil
+when no key uses `KindMerge`. `setmerge.Merger` (import
+`github.com/axiomhq/lsm/setmerge`) ships with the module: roaring-bitmap sets
+with add/remove operands (`setmerge.Value`, `setmerge.Operand`,
+`setmerge.Decode`).
 
 ## Compact
 
 1. Pick a job: `job, ok := lsm.Pick(v, opts)`. `ok` is false when every level is in shape.
-2. Run it: `next, edit, err := lsm.Compact(ctx, v, job, opts, open, put)`.
+2. Run it: `next, edit, err := lsm.Compact(ctx, v, job, opts, r, put)`, with `r` the `Reader` from Read.
 3. Save `next` with a conditional write. Delete the inputs' objects only after that write succeeds.
 4. Lost the write to a newer version `head`? Rebase: `next, err = head.Rebase(v, edit)`, then write again. `lsm.ErrStale` means another compaction changed the same files: delete the outputs and pick again.
 
@@ -46,7 +53,7 @@ Rebase holds when the only other writer adds level-0 files (`Flush`).
 | --- | --- |
 | block | crc32c u32, mode byte (0 zstd, 1 stored), payload; raw is uvarint(count), then per entry uvarint(len key) key, kind byte, uvarint(len value) value |
 | index | uvarint(blocks), then per block offset, length, raw length, first key, last key (all uvarint-framed) |
-| footer | 32 bytes: index offset u64, index length u64, entry count u64, crc32c(index) u32, magic `DWL1` |
+| footer | 32 bytes: index offset u64, index length u64, entry count u64, crc32c(index) u32, magic `LSM1` |
 
 Blocks close at 64 KiB raw (`DefaultBlockBytes`). A value of 4 KiB or more
 (`LargeValueBytes`) is a block of its own, so a point read decodes only that
@@ -56,6 +63,12 @@ checks the checksums, and corrupt bytes return an error wrapping
 
 `lsm.DecompressBounded(data, max)` is that size-capped zstd decode on its
 own: a frame claiming or decoding to more than `max` bytes is refused.
+
+## Concurrency and format
+
+A `Table` is safe for concurrent reads; an iterator is not. The table format
+is versioned by its magic (`LSM1`), and while the module is v0 a format change
+bumps its minor version.
 
 ## Test
 

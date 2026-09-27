@@ -17,17 +17,17 @@ import (
 //
 // A block is crc32c(payload) as 4 bytes, then payload: a mode byte
 // (blockZstd: zstd(raw); blockStored: raw itself, for a block zstd could
-// not shrink by an eighth, which is what a block of vectors is), then the
-// bytes. raw is uvarint(count), then per entry uvarint(len key) key, kind
-// byte, uvarint(len value) value, keys strictly increasing. A value of
-// LargeValueBytes or more is a block of its own, so a point read of a
-// vector block decodes that block and nothing else. The index is
+// not shrink by an eighth, as a block of large incompressible values),
+// then the bytes. raw is uvarint(count), then per entry uvarint(len key)
+// key, kind byte, uvarint(len value) value, keys strictly increasing. A
+// value of LargeValueBytes or more is a block of its own, so a point read
+// of a large value decodes that block and nothing else. The index is
 // uvarint(blocks), then per block uvarint(offset) uvarint(length)
 // uvarint(raw length) uvarint(len first) first uvarint(len last) last. The
 // footer is 32 bytes: index offset u64, index length u64, entry count u64,
 // crc32c(index) u32, magic.
 const (
-	tableMagic  = "DWL1"
+	tableMagic  = "LSM1"
 	footerBytes = 32
 	// DefaultBlockBytes is the raw size a block is closed at.
 	DefaultBlockBytes = 64 << 10
@@ -112,7 +112,7 @@ type SpaceRange struct {
 // in the manifest so a reader opens the table with one range read.
 type TableMeta struct {
 	Min, Max           []byte
-	Count              uint64
+	Count              int64
 	Bytes              int64
 	IndexOff, IndexLen int64
 	Spaces             []SpaceRange
@@ -193,10 +193,10 @@ func (w *TableWriter) flushBlock() {
 	raw := binary.AppendUvarint(make([]byte, 0, len(w.raw)+8), uint64(w.n))
 	raw = append(raw, w.raw...)
 	// A block that is one large value (dense or already-encoded bytes,
-	// such as vectors, read by the thousand) is stored as it is; the fifth
-	// zstd saves on them is not worth decoding on every read. The rest is stored only when zstd
-	// saves less than an eighth. A stored block's cached decode aliases the
-	// table bytes and costs a checksum and nothing else.
+	// read by the thousand) is stored as it is; the fifth zstd saves on
+	// them is not worth decoding on every read. The rest is stored only
+	// when zstd saves less than an eighth. A stored block's cached decode
+	// aliases the table bytes and costs a checksum and nothing else.
 	var payload []byte
 	if w.n == 1 && len(w.raw) >= LargeValueBytes {
 		payload = append([]byte{blockStored}, raw...)
@@ -238,7 +238,7 @@ func (w *TableWriter) Finish() ([]byte, TableMeta, error) {
 	w.out = append(w.out, idx...)
 	w.out = binary.BigEndian.AppendUint64(w.out, uint64(w.meta.IndexOff))
 	w.out = binary.BigEndian.AppendUint64(w.out, uint64(w.meta.IndexLen))
-	w.out = binary.BigEndian.AppendUint64(w.out, w.meta.Count)
+	w.out = binary.BigEndian.AppendUint64(w.out, uint64(w.meta.Count))
 	w.out = binary.BigEndian.AppendUint32(w.out, crc32.Checksum(idx, castagnoli))
 	w.out = append(w.out, tableMagic...)
 	w.meta.Bytes = int64(len(w.out))
@@ -289,7 +289,7 @@ type BlockCache interface {
 type Table struct {
 	src   Source
 	index []blockIndex
-	count uint64
+	count int64
 	Name  string
 	Cache BlockCache
 }
@@ -311,7 +311,7 @@ func OpenTable(ctx context.Context, src Source, size int64) (*Table, error) {
 	if off < 0 || n < 0 || off+n != size-footerBytes {
 		return nil, fmt.Errorf("%w: lsm: table index position", ErrCorrupt)
 	}
-	return openTable(ctx, src, off, n, binary.BigEndian.Uint64(f[16:24]), binary.BigEndian.Uint32(f[24:28]), true)
+	return openTable(ctx, src, off, n, int64(binary.BigEndian.Uint64(f[16:24])), binary.BigEndian.Uint32(f[24:28]), true)
 }
 
 // OpenTableAt opens a table from its FileRef metadata with one range read.
@@ -319,9 +319,12 @@ func OpenTableAt(ctx context.Context, src Source, meta TableMeta) (*Table, error
 	return openTable(ctx, src, meta.IndexOff, meta.IndexLen, meta.Count, 0, false)
 }
 
-func openTable(ctx context.Context, src Source, off, n int64, count uint64, crc uint32, checkCRC bool) (*Table, error) {
+func openTable(ctx context.Context, src Source, off, n, count int64, crc uint32, checkCRC bool) (*Table, error) {
 	if n <= 0 || n > MaxTableBytes {
 		return nil, fmt.Errorf("%w: lsm: table index length %d", ErrCorrupt, n)
+	}
+	if count < 0 {
+		return nil, fmt.Errorf("%w: lsm: table entry count %d", ErrCorrupt, count)
 	}
 	idx, err := src.ReadAt(ctx, off, n)
 	if err != nil {
@@ -385,31 +388,39 @@ func (t *Table) Span(lo, hi []byte) (first, last int, ok bool) {
 	return first, last, true
 }
 
+// BlockModes counts a table's blocks, and their bytes, by how they are
+// stored.
+type BlockModes struct {
+	Stored, Zstd           int
+	StoredBytes, ZstdBytes int64
+}
+
 // BlockModes reads the table's blocks once and reports how many, and how
 // many bytes, are stored raw versus zstd: where compression still pays.
-func (t *Table) BlockModes(ctx context.Context) (stored, zstd int, storedBytes, zstdBytes int64, err error) {
+func (t *Table) BlockModes(ctx context.Context) (BlockModes, error) {
+	var m BlockModes
 	if len(t.index) == 0 {
-		return 0, 0, 0, 0, nil
+		return m, nil
 	}
 	last := t.index[len(t.index)-1]
 	data, err := t.src.ReadAt(ctx, 0, last.off+last.length)
 	if err != nil {
-		return 0, 0, 0, 0, err
+		return BlockModes{}, err
 	}
 	for _, bi := range t.index {
 		if bi.off+5 > int64(len(data)) {
-			return 0, 0, 0, 0, fmt.Errorf("%w: lsm: block header past the table", ErrCorrupt)
+			return BlockModes{}, fmt.Errorf("%w: lsm: block header past the table", ErrCorrupt)
 		}
 		switch data[bi.off+4] {
 		case blockStored:
-			stored++
-			storedBytes += bi.length
+			m.Stored++
+			m.StoredBytes += bi.length
 		default:
-			zstd++
-			zstdBytes += bi.length
+			m.Zstd++
+			m.ZstdBytes += bi.length
 		}
 	}
-	return stored, zstd, storedBytes, zstdBytes, nil
+	return m, nil
 }
 
 // Block is one decoded block: entry start offsets into raw.
@@ -546,15 +557,18 @@ func (t *Table) Get(ctx context.Context, key []byte) (Entry, bool, error) {
 }
 
 // Single locates key's value when key is the only entry of a block stored
-// raw: the value's extent in the table, computed from the index alone, so a
-// reader of a slice of a large value (one row of a vectors block) fetches
-// the bytes it needs and not the block. ok is false when the table has no
-// block for key, the block holds other keys too, or it is compressed.
+// raw and the value is LargeValueBytes or more: the value's extent in the
+// table, computed from the index alone, so a reader of a slice of a large
+// value fetches the bytes it needs and not the block. ok is false when the
+// table has no block for key, the block holds other keys too, it is
+// compressed, or the value is small (a delete or a small put alone in a
+// block, which Get reads as cheaply and with its kind).
 //
 // The extent is the entry's value whatever its kind: the kind byte is not
-// read. Callers use Single for key spaces written only with puts. A block's
-// checksum covers the whole block, so bytes read through Single are not
-// verified; the whole-block read path (Get, Iter) is.
+// read, so a merge operand of LargeValueBytes or more is located as if it
+// were a put. Callers use Single for key spaces written only with puts. A
+// block's checksum covers the whole block, so bytes read through Single are
+// not verified; the whole-block read path (Get, Iter) is.
 func (t *Table) Single(key []byte) (off, length int64, ok bool) {
 	i := sort.Search(len(t.index), func(i int) bool { return bytes.Compare(t.index[i].last, key) >= 0 })
 	if i == len(t.index) || !bytes.Equal(t.index[i].first, key) || !bytes.Equal(t.index[i].last, key) {
@@ -574,6 +588,9 @@ func (t *Table) Single(key []byte) (off, length int64, ok bool) {
 	for w := int64(1); w <= binary.MaxVarintLen64; w++ {
 		vl := bi.rawLen - hdr - w
 		if vl >= 0 && int64(uvarintLen(uint64(vl))) == w {
+			if vl < LargeValueBytes {
+				return 0, 0, false
+			}
 			return bi.off + 5 + hdr + w, vl, true
 		}
 	}
@@ -601,7 +618,8 @@ func (t *Table) Iter(ctx context.Context) *TableIter {
 	return &TableIter{ctx: ctx, t: t, bi: -1}
 }
 
-// TableIter iterates one table in key order.
+// TableIter iterates one table in key order. It stores its context
+// because Next reads blocks and the Iterator interface takes no context.
 type TableIter struct {
 	ctx context.Context
 	t   *Table
@@ -704,16 +722,6 @@ func (d *decoder) bytes() []byte {
 	out := d.b[:n]
 	d.b = d.b[n:]
 	return out
-}
-
-func (d *decoder) byte() byte {
-	if len(d.b) == 0 {
-		d.err = fmt.Errorf("byte")
-		return 0
-	}
-	v := d.b[0]
-	d.b = d.b[1:]
-	return v
 }
 
 func (d *decoder) rest() int { return len(d.b) }

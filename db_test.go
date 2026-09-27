@@ -3,37 +3,22 @@ package lsm
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"slices"
-	"sort"
 	"sync"
 	"testing"
 
 	"github.com/RoaringBitmap/roaring/v2"
+	"github.com/axiomhq/lsm/setmerge"
 )
-
-// sliceIter iterates entries already in memory, for hand-built cases.
-type sliceIter struct {
-	entries []Entry
-	i       int
-}
-
-func (s *sliceIter) SeekGE(target []byte) bool {
-	s.i = sort.Search(len(s.entries), func(i int) bool { return bytes.Compare(s.entries[i].Key, target) >= 0 })
-	return s.i < len(s.entries)
-}
-func (s *sliceIter) Next() bool    { s.i++; return s.i < len(s.entries) }
-func (s *sliceIter) Key() []byte   { return s.entries[s.i].Key }
-func (s *sliceIter) Kind() Kind    { return s.entries[s.i].Kind }
-func (s *sliceIter) Value() []byte { return s.entries[s.i].Value }
-func (s *sliceIter) Err() error    { return nil }
 
 func set(xs ...uint32) *roaring.Bitmap { return roaring.BitmapOf(xs...) }
 
 func TestMergeIterPrecedence(t *testing.T) {
-	newer := &sliceIter{entries: []Entry{{Key: []byte("b"), Kind: KindPut, Value: []byte("new")}, {Key: []byte("d"), Kind: KindDelete}}}
-	older := &sliceIter{entries: []Entry{{Key: []byte("a"), Kind: KindPut, Value: []byte("a")}, {Key: []byte("b"), Kind: KindPut, Value: []byte("old")}, {Key: []byte("c"), Kind: KindPut, Value: []byte("c")}}}
+	newer := &entriesIter{entries: []Entry{{Key: []byte("b"), Kind: KindPut, Value: []byte("new")}, {Key: []byte("d"), Kind: KindDelete}}}
+	older := &entriesIter{entries: []Entry{{Key: []byte("a"), Kind: KindPut, Value: []byte("a")}, {Key: []byte("b"), Kind: KindPut, Value: []byte("old")}, {Key: []byte("c"), Kind: KindPut, Value: []byte("c")}}}
 	m := NewMerge(newer, older)
 	var got []string
 	for ok := m.SeekGE(nil); ok; ok = m.Next() {
@@ -51,9 +36,9 @@ func TestMergeIterPrecedence(t *testing.T) {
 func TestResolveSemantics(t *testing.T) {
 	k := []byte("k")
 	op := func(add, remove *roaring.Bitmap) Entry {
-		return Entry{Key: k, Kind: KindMerge, Value: SetOperand(add, remove)}
+		return Entry{Key: k, Kind: KindMerge, Value: setmerge.Operand(add, remove)}
 	}
-	put := func(s *roaring.Bitmap) Entry { return Entry{Key: k, Kind: KindPut, Value: SetValue(s)} }
+	put := func(s *roaring.Bitmap) Entry { return Entry{Key: k, Kind: KindPut, Value: setmerge.Value(s)} }
 	del := Entry{Key: k, Kind: KindDelete}
 	cases := []struct {
 		name     string
@@ -78,9 +63,9 @@ func TestResolveSemantics(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			its := make([]Iterator, len(tc.newest))
 			for i, e := range tc.newest {
-				its[i] = &sliceIter{entries: []Entry{e}}
+				its[i] = &entriesIter{entries: []Entry{e}}
 			}
-			r := Resolve(NewMerge(its...), SetMerger{}, tc.bottom)
+			r := Resolve(NewMerge(its...), setmerge.Merger{}, tc.bottom)
 			ok := r.SeekGE(nil)
 			if tc.absent {
 				if ok {
@@ -93,14 +78,14 @@ func TestResolveSemantics(t *testing.T) {
 			}
 			switch tc.wantKind {
 			case KindPut:
-				got, err := DecodeSet(r.Value())
+				got, err := setmerge.Decode(r.Value())
 				if err != nil || !got.Equals(tc.wantSet) {
 					t.Fatalf("set %v %v", got, err)
 				}
 			case KindMerge:
-				v, keep := SetMerger{}.Full(SetValue(set(100)), [][]byte{r.Value()})
-				got, _ := DecodeSet(v)
-				if !keep || !got.Equals(tc.wantSet) {
+				v, keep, err := setmerge.Merger{}.Full(setmerge.Value(set(100)), [][]byte{r.Value()})
+				got, _ := setmerge.Decode(v)
+				if err != nil || !keep || !got.Equals(tc.wantSet) {
 					t.Fatalf("collapsed operand gives %v", got)
 				}
 			}
@@ -142,6 +127,8 @@ func (m *memStore) open(ctx context.Context, f FileRef) (*Table, error) {
 	return OpenTableAt(ctx, BytesSource(data), f.Meta())
 }
 
+func (m *memStore) reader() Reader { return Reader{Open: m.open, Merger: setmerge.Merger{}} }
+
 // model is the reference: the set each key should hold.
 type model map[string]*roaring.Bitmap
 
@@ -149,12 +136,12 @@ func (m model) apply(e Entry) {
 	k := string(e.Key)
 	switch e.Kind {
 	case KindPut:
-		s, _ := DecodeSet(e.Value)
+		s, _ := setmerge.Decode(e.Value)
 		m[k] = s
 	case KindDelete:
 		delete(m, k)
 	case KindMerge:
-		add, remove, _ := DecodeSetOperand(e.Value)
+		add, remove, _ := setmerge.DecodeOperand(e.Value)
 		s := m[k]
 		if s == nil {
 			s = roaring.New()
@@ -180,7 +167,7 @@ func (m model) sortedKeys() [][]byte {
 
 func checkModel(t *testing.T, ctx context.Context, v Version, st *memStore, m model, rng *rand.Rand, universe [][]byte) {
 	t.Helper()
-	it, err := v.Iter(ctx, st.open, SetMerger{}, nil, nil)
+	it, err := st.reader().Iter(ctx, v, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +180,7 @@ func checkModel(t *testing.T, ctx context.Context, v Version, st *memStore, m mo
 		if i >= len(keys) || !bytes.Equal(it.Key(), keys[i]) {
 			t.Fatalf("scan key %d: got %x", i, it.Key())
 		}
-		got, err := DecodeSet(it.Value())
+		got, err := setmerge.Decode(it.Value())
 		if err != nil || !got.Equals(m[string(keys[i])]) {
 			t.Fatalf("scan key %x: set %v (%v), want %v", keys[i], got, err, m[string(keys[i])])
 		}
@@ -204,7 +191,7 @@ func checkModel(t *testing.T, ctx context.Context, v Version, st *memStore, m mo
 	}
 	for range 64 {
 		k := universe[rng.IntN(len(universe))]
-		val, ok, err := v.Get(ctx, st.open, SetMerger{}, k)
+		val, ok, err := st.reader().Get(ctx, v, k)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -213,7 +200,7 @@ func checkModel(t *testing.T, ctx context.Context, v Version, st *memStore, m mo
 			t.Fatalf("get %x: present %v want %v", k, ok, exists)
 		}
 		if ok {
-			got, _ := DecodeSet(val)
+			got, _ := setmerge.Decode(val)
 			if !got.Equals(want) {
 				t.Fatalf("get %x: %v want %v", k, got, want)
 			}
@@ -225,12 +212,12 @@ func checkModel(t *testing.T, ctx context.Context, v Version, st *memStore, m mo
 		if bytes.Compare(lo, hi) > 0 {
 			lo, hi = hi, lo
 		}
-		it, err := v.Iter(ctx, st.open, SetMerger{}, lo, hi)
+		it, err := st.reader().Iter(ctx, v, lo, hi)
 		if err != nil {
 			t.Fatal(err)
 		}
 		n := 0
-		for ok := it.SeekGE(lo); ok; ok = it.Next() {
+		for ok := it.SeekGE(nil); ok; ok = it.Next() { // nil seeks to lo
 			if bytes.Compare(it.Key(), lo) < 0 || bytes.Compare(it.Key(), hi) >= 0 {
 				t.Fatalf("range [%x,%x) yielded %x", lo, hi, it.Key())
 			}
@@ -271,7 +258,7 @@ func TestVersionMatchesModel(t *testing.T) {
 					var e Entry
 					switch rng.IntN(10) {
 					case 0, 1:
-						e = Entry{Key: k, Kind: KindPut, Value: SetValue(set(uint32(rng.IntN(50)), uint32(rng.IntN(50))))}
+						e = Entry{Key: k, Kind: KindPut, Value: setmerge.Value(set(uint32(rng.IntN(50)), uint32(rng.IntN(50))))}
 					case 2:
 						e = Entry{Key: k, Kind: KindDelete}
 					default:
@@ -282,7 +269,7 @@ func TestVersionMatchesModel(t *testing.T) {
 						if rng.IntN(2) == 0 {
 							remove = set(uint32(rng.IntN(50)))
 						}
-						e = Entry{Key: k, Kind: KindMerge, Value: SetOperand(add, remove)}
+						e = Entry{Key: k, Kind: KindMerge, Value: setmerge.Operand(add, remove)}
 					}
 					byKey[string(k)] = e // one version per key per flush, last wins
 				}
@@ -306,7 +293,7 @@ func TestVersionMatchesModel(t *testing.T) {
 					if !ok {
 						break
 					}
-					if v, _, err = Compact(ctx, v, j, o, st.open, st.put); err != nil {
+					if v, _, err = Compact(ctx, v, j, o, st.reader(), st.put); err != nil {
 						t.Fatal(err)
 					}
 					checkModel(t, ctx, v, st, m, rng, universe)
@@ -321,7 +308,7 @@ func TestVersionMatchesModel(t *testing.T) {
 					continue
 				}
 				j := v.job(l, v.Levels[l], o)
-				next, _, err := Compact(ctx, v, j, o, st.open, st.put)
+				next, _, err := Compact(ctx, v, j, o, st.reader(), st.put)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -395,7 +382,7 @@ func TestCompactLeavesUntouchedFiles(t *testing.T) {
 	o := DefaultOptions()
 	o.FileBytes = 200 // the ten-key files (~105 bytes) are past half a file
 	put := func(key string, x uint32) Entry {
-		return Entry{Key: []byte(key), Kind: KindPut, Value: SetValue(set(x))}
+		return Entry{Key: []byte(key), Kind: KindPut, Value: setmerge.Value(set(x))}
 	}
 	m := model{}
 	var v Version
@@ -437,7 +424,7 @@ func TestCompactLeavesUntouchedFiles(t *testing.T) {
 		t.Fatalf("overlap %d files, want m and z", len(j.Overlap))
 	}
 	puts := st.puts
-	if v, _, err = Compact(ctx, v, j, o, st.open, st.put); err != nil {
+	if v, _, err = Compact(ctx, v, j, o, st.reader(), st.put); err != nil {
 		t.Fatal(err)
 	}
 	have := map[string]bool{}
@@ -466,13 +453,13 @@ func TestCompactCutsFilesAtSpaces(t *testing.T) {
 	o := DefaultOptions()
 	var entries []Entry
 	for _, k := range []string{"a1", "a2", "b1", "c1", "c2"} {
-		entries = append(entries, Entry{Key: []byte(k), Kind: KindPut, Value: SetValue(set(1))})
+		entries = append(entries, Entry{Key: []byte(k), Kind: KindPut, Value: setmerge.Value(set(1))})
 	}
 	v, _, err := Flush(ctx, Version{}, entries, o, st.put)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v, _, err = Compact(ctx, v, v.job(0, v.Levels[0], o), o, st.open, st.put); err != nil {
+	if v, _, err = Compact(ctx, v, v.job(0, v.Levels[0], o), o, st.reader(), st.put); err != nil {
 		t.Fatal(err)
 	}
 	if len(v.Levels[1]) != 3 {
@@ -497,7 +484,7 @@ func TestCompactGrowsSmallTailFile(t *testing.T) {
 	for round := range 6 {
 		var entries []Entry
 		for i := range 10 {
-			e := Entry{Key: []byte(fmt.Sprintf("d%04d", round*10+i)), Kind: KindPut, Value: SetValue(set(uint32(round)))}
+			e := Entry{Key: []byte(fmt.Sprintf("d%04d", round*10+i)), Kind: KindPut, Value: setmerge.Value(set(uint32(round)))}
 			entries = append(entries, e)
 			m.apply(e)
 		}
@@ -505,7 +492,7 @@ func TestCompactGrowsSmallTailFile(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if v, _, err = Compact(ctx, next, next.job(0, next.Levels[0], o), o, st.open, st.put); err != nil {
+		if v, _, err = Compact(ctx, next, next.job(0, next.Levels[0], o), o, st.reader(), st.put); err != nil {
 			t.Fatal(err)
 		}
 		if len(v.Levels[1]) != 1 {
@@ -517,4 +504,113 @@ func TestCompactGrowsSmallTailFile(t *testing.T) {
 		universe = append(universe, []byte(k))
 	}
 	checkModel(t, ctx, v, st, m, rand.New(rand.NewPCG(3, 4)), universe)
+}
+
+// readMergeErr reads key k of a one-file version holding a single merge
+// operand op, through Get and through Iter, and returns both errors.
+func readMergeErr(t *testing.T, r func(*memStore) Reader, op []byte) (getErr, iterErr error) {
+	t.Helper()
+	ctx := context.Background()
+	st := newMemStore()
+	k := []byte("k")
+	v, _, err := Flush(ctx, Version{}, []Entry{{Key: k, Kind: KindMerge, Value: op}}, DefaultOptions(), st.put)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, getErr = r(st).Get(ctx, v, k); getErr == nil {
+		t.Fatal("get: no error")
+	}
+	it, err := r(st).Iter(ctx, v, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if it.SeekGE(nil) {
+		t.Fatalf("iter: yielded %x", it.Key())
+	}
+	return getErr, it.Err()
+}
+
+func TestMergeWithoutMerger(t *testing.T) {
+	nilMerger := func(st *memStore) Reader { return Reader{Open: st.open} }
+	getErr, iterErr := readMergeErr(t, nilMerger, setmerge.Operand(set(1), nil))
+	if !errors.Is(getErr, ErrNoMerger) || !errors.Is(iterErr, ErrNoMerger) {
+		t.Fatalf("get %v, iter %v: want ErrNoMerger", getErr, iterErr)
+	}
+}
+
+func TestMalformedOperandIsCorrupt(t *testing.T) {
+	getErr, iterErr := readMergeErr(t, (*memStore).reader, []byte{0xff})
+	if !errors.Is(getErr, ErrCorrupt) || !errors.Is(iterErr, ErrCorrupt) {
+		t.Fatalf("get %v, iter %v: want ErrCorrupt", getErr, iterErr)
+	}
+}
+
+// TestVersionSignature: a file outside the ranges leaves the signature
+// alone, one inside changes it, and no overlap at all is not ok.
+func TestVersionSignature(t *testing.T) {
+	f := func(seq uint64, lo, hi string) FileRef {
+		return FileRef{Key: fmt.Sprint("f", seq), Seq: seq, Min: []byte(lo), Max: []byte(hi)}
+	}
+	r := [2][]byte{[]byte("b"), []byte("d")}
+	v, _ := Version{}.Apply(Edit{Add: map[int][]FileRef{1: {f(1, "a", "c")}}})
+	sig, ok := v.Signature(r)
+	if !ok {
+		t.Fatal("no overlap found")
+	}
+	unrelated, _ := v.Apply(Edit{Add: map[int][]FileRef{0: {f(2, "x", "z")}, 1: {f(3, "m", "n")}}})
+	if s, ok := unrelated.Signature(r); !ok || s != sig {
+		t.Fatal("an unrelated file changed the signature")
+	}
+	overlapping, _ := unrelated.Apply(Edit{Add: map[int][]FileRef{0: {f(4, "c", "c")}}})
+	if s, ok := overlapping.Signature(r); !ok || s == sig {
+		t.Fatal("an overlapping file kept the signature")
+	}
+	if _, ok := overlapping.Signature([2][]byte{[]byte("p"), []byte("w")}); ok {
+		t.Fatal("ok with no overlapping file")
+	}
+}
+
+// TestReaderLocate: a large value comes back as its extent, a small one as
+// the value, a deleted or missing key as not ok, and a merge entry as
+// ErrCorrupt.
+func TestReaderLocate(t *testing.T) {
+	ctx := context.Background()
+	st := newMemStore()
+	big := make([]byte, LargeValueBytes)
+	for i := range big {
+		big[i] = byte(i * 7)
+	}
+	v, _, err := Flush(ctx, Version{}, []Entry{
+		{Key: []byte("big"), Kind: KindPut, Value: big},
+		{Key: []byte("gone"), Kind: KindPut, Value: []byte("old")},
+		{Key: []byte("op"), Kind: KindMerge, Value: setmerge.Operand(set(1), nil)},
+		{Key: []byte("small"), Kind: KindPut, Value: []byte("tiny")},
+	}, DefaultOptions(), st.put)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The delete is alone in its file and so in a stored block: Single must
+	// decline it (the kind byte is not in the index) for Locate to see it.
+	if v, _, err = Flush(ctx, v, []Entry{{Key: []byte("gone"), Kind: KindDelete}}, DefaultOptions(), st.put); err != nil {
+		t.Fatal(err)
+	}
+	r := st.reader()
+	l, ok, err := r.Locate(ctx, v, []byte("big"))
+	if err != nil || !ok || l.Table == nil || l.Value != nil {
+		t.Fatalf("big: %+v %v %v, want an extent", l, ok, err)
+	}
+	if got, err := l.Table.ReadAt(ctx, l.Off, l.Length); err != nil || !bytes.Equal(got, big) {
+		t.Fatalf("big: extent reads %d bytes (%v)", len(got), err)
+	}
+	if l, ok, err := r.Locate(ctx, v, []byte("small")); err != nil || !ok || l.Table != nil || string(l.Value) != "tiny" {
+		t.Fatalf("small: %+v %v %v, want the value", l, ok, err)
+	}
+	for _, k := range []string{"gone", "missing"} {
+		if _, ok, err := r.Locate(ctx, v, []byte(k)); err != nil || ok {
+			t.Fatalf("%s: ok %v err %v", k, ok, err)
+		}
+	}
+	if _, _, err := r.Locate(ctx, v, []byte("op")); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("op: %v, want ErrCorrupt", err)
+	}
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"math/rand/v2"
 	"slices"
 	"testing"
@@ -233,7 +234,8 @@ func FuzzOpenTable(f *testing.F) {
 // that shares its block or sits in a compressed one. Large values of every
 // varint width of length, keys of varied length, a large value that zstd
 // would shrink (it is stored anyway: one value, one block), and a tiny
-// value left alone in the table's last block.
+// value left alone in the table's last block, which is declined: only a
+// large value is worth an unverified extent read.
 func TestSingleLocatesStoredValues(t *testing.T) {
 	rng := rand.New(rand.NewPCG(3, 4))
 	var entries []Entry
@@ -272,7 +274,7 @@ func TestSingleLocatesStoredValues(t *testing.T) {
 	singles := 0
 	for _, e := range entries {
 		off, length, ok := tb.Single(e.Key)
-		alone := len(e.Value) >= LargeValueBytes || string(e.Key) == "Zlast"
+		alone := len(e.Value) >= LargeValueBytes
 		if ok != alone {
 			t.Fatalf("%q: single %v, want %v", e.Key, ok, alone)
 		}
@@ -285,8 +287,8 @@ func TestSingleLocatesStoredValues(t *testing.T) {
 			t.Fatalf("%q: extent %d+%d reads %d bytes (%v), want the value of %d", e.Key, off, length, len(got), err, len(e.Value))
 		}
 	}
-	if singles != 8 {
-		t.Fatalf("%d single values, want 8", singles)
+	if singles != 7 {
+		t.Fatalf("%d single values, want 7", singles)
 	}
 	if _, _, ok := tb.Single([]byte("Fnone")); ok {
 		t.Fatal("a missing key located")
@@ -314,13 +316,51 @@ func TestSingleDeclinesAPackedBlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stored, zstd, _, _, err := tb.BlockModes(context.Background())
-	if err != nil || tb.Blocks() != 1 || stored != 1 || zstd != 0 {
-		t.Fatalf("%d blocks, %d stored %d zstd (%v): want one stored block", tb.Blocks(), stored, zstd, err)
+	m, err := tb.BlockModes(context.Background())
+	if err != nil || tb.Blocks() != 1 || m.Stored != 1 || m.Zstd != 0 {
+		t.Fatalf("%d blocks, %d stored %d zstd (%v): want one stored block", tb.Blocks(), m.Stored, m.Zstd, err)
 	}
 	for _, k := range keys {
 		if _, _, ok := tb.Single(k); ok {
 			t.Fatalf("%x located in a packed block", k)
 		}
 	}
+}
+
+// FuzzDecodeBlock: a block either fails with ErrCorrupt or decodes to
+// strictly increasing keys whose entries read without a panic. The
+// checksum is fixed up so the fuzzer reaches the decoder behind it.
+func FuzzDecodeBlock(f *testing.F) {
+	w := NewTableWriter(512)
+	for i := 0; len(w.index) == 0; i++ {
+		if err := w.Add(Entry{Key: binary.BigEndian.AppendUint32([]byte{'A'}, uint32(i)), Kind: KindPut, Value: []byte("value")}); err != nil {
+			f.Fatal(err)
+		}
+	}
+	bi := w.index[0]
+	f.Add(bytes.Clone(w.out[bi.off:bi.off+bi.length]), bi.rawLen)
+	f.Fuzz(func(t *testing.T, stored []byte, rawLen int64) {
+		if rawLen < 0 || rawLen > 1<<20 { // a bigger claim only costs memory
+			return
+		}
+		if len(stored) >= 4 {
+			binary.BigEndian.PutUint32(stored, crc32.Checksum(stored[4:], castagnoli))
+		}
+		b, err := decodeBlock(stored, rawLen)
+		if err != nil {
+			if !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("error %v does not wrap ErrCorrupt", err)
+			}
+			return
+		}
+		for i := range b.offs {
+			e := b.entry(i)
+			if !bytes.Equal(e.Key, b.key(i)) {
+				t.Fatalf("entry %d key %x, key() %x", i, e.Key, b.key(i))
+			}
+			if i > 0 && bytes.Compare(b.key(i-1), e.Key) >= 0 {
+				t.Fatalf("keys %x, %x not increasing", b.key(i-1), e.Key)
+			}
+		}
+	})
 }

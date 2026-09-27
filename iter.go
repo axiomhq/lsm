@@ -1,6 +1,10 @@
 package lsm
 
-import "bytes"
+import (
+	"bytes"
+	"fmt"
+	"sort"
+)
 
 // Iterator walks entries in key order. Key and Value alias the iterator's
 // buffers until the next call. An iterator is unpositioned until SeekGE.
@@ -189,13 +193,20 @@ func (r *ResolveIter) Next() bool {
 			r.ops[i], r.ops[j] = r.ops[j], r.ops[i]
 		}
 		if !hasBase && !deleted && !r.bottom {
-			r.kind, r.value = KindMerge, r.merger.Partial(r.ops)
+			if r.value, r.err = partialMerge(r.merger, r.ops); r.err != nil {
+				return false
+			}
+			r.kind = KindMerge
 			return true
 		}
 		if !hasBase {
 			base = nil
 		}
-		v, keep := r.merger.Full(base, r.ops)
+		v, keep, err := fullMerge(r.merger, base, r.ops)
+		if err != nil {
+			r.err = err
+			return false
+		}
 		if keep {
 			r.kind, r.value = KindPut, v
 			return true
@@ -222,11 +233,37 @@ func (r *ResolveIter) Kind() Kind    { return r.kind }
 func (r *ResolveIter) Value() []byte { return r.value }
 func (r *ResolveIter) Err() error    { return r.err }
 
-// boundIter stops an iterator before hi (exclusive); nil hi is unbounded.
+// fullMerge is Merger.Full with the read path's errors: ErrNoMerger
+// without a Merger, ErrCorrupt around the Merger's own.
+func fullMerge(m Merger, base []byte, operands [][]byte) ([]byte, bool, error) {
+	if m == nil {
+		return nil, false, ErrNoMerger
+	}
+	v, keep, err := m.Full(base, operands)
+	if err != nil {
+		return nil, false, fmt.Errorf("%w: lsm: merge: %v", ErrCorrupt, err)
+	}
+	return v, keep, nil
+}
+
+// partialMerge is Merger.Partial with fullMerge's errors.
+func partialMerge(m Merger, operands [][]byte) ([]byte, error) {
+	if m == nil {
+		return nil, ErrNoMerger
+	}
+	v, err := m.Partial(operands)
+	if err != nil {
+		return nil, fmt.Errorf("%w: lsm: merge: %v", ErrCorrupt, err)
+	}
+	return v, nil
+}
+
+// boundIter holds an iterator to [lo, hi); nil bounds are open. A seek
+// below lo lands on lo.
 type boundIter struct {
 	Iterator
-	hi   []byte
-	done bool
+	lo, hi []byte
+	done   bool
 }
 
 func (b *boundIter) check(ok bool) bool {
@@ -242,6 +279,9 @@ func (b *boundIter) check(ok bool) bool {
 
 func (b *boundIter) SeekGE(target []byte) bool {
 	b.done = false
+	if b.lo != nil && bytes.Compare(target, b.lo) < 0 {
+		target = b.lo
+	}
 	return b.check(b.Iterator.SeekGE(target))
 }
 
@@ -252,10 +292,28 @@ func (b *boundIter) Next() bool {
 	return b.check(b.Iterator.Next())
 }
 
-// Bound limits it to keys below hi.
-func Bound(it Iterator, hi []byte) Iterator {
-	if hi == nil {
+// Bound limits it to keys in [lo, hi): a seek below lo, nil included,
+// seeks to lo, and iteration stops before hi.
+func Bound(it Iterator, lo, hi []byte) Iterator {
+	if lo == nil && hi == nil {
 		return it
 	}
-	return &boundIter{Iterator: it, hi: hi}
+	return &boundIter{Iterator: it, lo: lo, hi: hi}
 }
+
+// entriesIter iterates sorted entries already in memory: a point read's
+// versions of one key, newest first, or a test's hand-built case.
+type entriesIter struct {
+	entries []Entry
+	i       int
+}
+
+func (s *entriesIter) SeekGE(target []byte) bool {
+	s.i = sort.Search(len(s.entries), func(i int) bool { return bytes.Compare(s.entries[i].Key, target) >= 0 })
+	return s.i < len(s.entries)
+}
+func (s *entriesIter) Next() bool    { s.i++; return s.i < len(s.entries) }
+func (s *entriesIter) Key() []byte   { return s.entries[s.i].Key }
+func (s *entriesIter) Kind() Kind    { return s.entries[s.i].Kind }
+func (s *entriesIter) Value() []byte { return s.entries[s.i].Value }
+func (s *entriesIter) Err() error    { return nil }

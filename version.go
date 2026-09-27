@@ -2,6 +2,7 @@ package lsm
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -17,7 +18,7 @@ type FileRef struct {
 	Min      []byte       `json:"min"`
 	Max      []byte       `json:"max"`
 	Bytes    int64        `json:"bytes"`
-	Count    uint64       `json:"count"`
+	Count    int64        `json:"count"`
 	IndexOff int64        `json:"index_off"`
 	IndexLen int64        `json:"index_len"`
 	Spaces   []SpaceRange `json:"spaces,omitempty"`
@@ -28,12 +29,9 @@ func (f FileRef) Meta() TableMeta {
 	return TableMeta{Min: f.Min, Max: f.Max, Count: f.Count, Bytes: f.Bytes, IndexOff: f.IndexOff, IndexLen: f.IndexLen, Spaces: f.Spaces}
 }
 
-// overlaps reports whether [Min, Max] meets [lo, hi); nil bounds are open.
 // Overlaps reports whether the file's key range meets [lo, hi); nil lo or
 // hi is unbounded.
-func (f FileRef) Overlaps(lo, hi []byte) bool { return f.overlaps(lo, hi) }
-
-func (f FileRef) overlaps(lo, hi []byte) bool {
+func (f FileRef) Overlaps(lo, hi []byte) bool {
 	if lo != nil && bytes.Compare(f.Max, lo) < 0 {
 		return false
 	}
@@ -64,7 +62,7 @@ func (v Version) Overlapping(lo, hi []byte) []FileRef {
 	var out []FileRef
 	for _, l := range v.Levels {
 		for _, f := range l {
-			if f.overlaps(lo, hi) {
+			if f.Overlaps(lo, hi) {
 				out = append(out, f)
 			}
 		}
@@ -81,7 +79,7 @@ func (v Version) Signature(ranges ...[2][]byte) (sig uint64, ok bool) {
 	for _, l := range v.Levels {
 		for _, f := range l {
 			for _, r := range ranges {
-				if f.overlaps(r[0], r[1]) {
+				if f.Overlaps(r[0], r[1]) {
 					h.Write([]byte(f.Key))
 					h.Write([]byte{0})
 					ok = true
@@ -125,7 +123,7 @@ func (v Version) Apply(e Edit) (Version, error) {
 			out.NextSeq = max(out.NextSeq, f.Seq+1)
 		}
 		if l == 0 {
-			slices.SortFunc(out.Levels[l], func(a, b FileRef) int { return -cmpUint(a.Seq, b.Seq) })
+			slices.SortFunc(out.Levels[l], func(a, b FileRef) int { return cmp.Compare(b.Seq, a.Seq) })
 			continue
 		}
 		slices.SortFunc(out.Levels[l], func(a, b FileRef) int { return bytes.Compare(a.Min, b.Min) })
@@ -185,16 +183,6 @@ func (v Version) Rebase(base Version, e Edit) (Version, error) {
 	return v.Apply(e)
 }
 
-func cmpUint(a, b uint64) int {
-	switch {
-	case a < b:
-		return -1
-	case a > b:
-		return 1
-	}
-	return 0
-}
-
 // Equal reports whether two versions name the same files in the same
 // places.
 func (v Version) Equal(o Version) bool {
@@ -212,67 +200,69 @@ func (v Version) Equal(o Version) bool {
 // Opener opens a file's table.
 type Opener func(ctx context.Context, f FileRef) (*Table, error)
 
+// Reader reads versions: Open opens a file's table and Merger folds merge
+// operands. Merger may be nil when no key uses KindMerge.
+type Reader struct {
+	Open   Opener
+	Merger Merger
+}
+
 // Iter is a resolved iterator over [lo, hi) across every level: the
 // merge of one iterator per overlapping file, newest first.
-func (v Version) Iter(ctx context.Context, open Opener, merger Merger, lo, hi []byte) (Iterator, error) {
+func (r Reader) Iter(ctx context.Context, v Version, lo, hi []byte) (Iterator, error) {
 	files := v.Overlapping(lo, hi)
 	its := make([]Iterator, 0, len(files))
 	for _, f := range files {
-		t, err := open(ctx, f)
+		t, err := r.Open(ctx, f)
 		if err != nil {
 			return nil, err
 		}
-		its = append(its, Bound(t.Iter(ctx), hi))
+		its = append(its, Bound(t.Iter(ctx), lo, hi))
 	}
-	return Resolve(NewMerge(its...), merger, true), nil
+	return Resolve(NewMerge(its...), r.Merger, true), nil
 }
 
-// Get is a point lookup: tables newest first until a Put or Delete.
-func (v Version) Get(ctx context.Context, open Opener, merger Merger, key []byte) ([]byte, bool, error) {
-	var ops [][]byte
+// Get is a point lookup: tables newest first until a Put or Delete, the
+// versions found resolved as Iter resolves them.
+func (r Reader) Get(ctx context.Context, v Version, key []byte) ([]byte, bool, error) {
+	var hits []Entry
 	// The files newest first, without materialising the overlapping list:
 	// a point lookup is the hottest read.
+walk:
 	for _, l := range v.Levels {
 		for _, f := range l {
-			if !f.overlaps(key, nil) || bytes.Compare(f.Min, key) > 0 {
+			if !f.Overlaps(key, nil) || bytes.Compare(f.Min, key) > 0 {
 				continue
 			}
-			e, ok, err := getIn(ctx, open, f, key)
+			e, ok, err := r.getIn(ctx, f, key)
 			if err != nil {
 				return nil, false, err
 			}
 			if !ok {
 				continue
 			}
-			switch e.Kind {
-			case KindPut:
-				if len(ops) == 0 {
-					return e.Value, true, nil
-				}
-				slices.Reverse(ops)
-				v, keep := merger.Full(e.Value, ops)
-				return v, keep, nil
-			case KindDelete:
-				if len(ops) == 0 {
-					return nil, false, nil
-				}
-				slices.Reverse(ops)
-				v, keep := merger.Full(nil, ops)
-				return v, keep, nil
-			case KindMerge:
-				ops = append(ops, e.Value)
+			if len(hits) == 0 && e.Kind == KindPut {
+				return e.Value, true, nil
+			}
+			if len(hits) == 0 && e.Kind == KindDelete {
+				return nil, false, nil
+			}
+			hits = append(hits, e)
+			if e.Kind != KindMerge {
+				break walk
 			}
 		}
 	}
-	if len(ops) == 0 {
+	if len(hits) == 0 {
 		return nil, false, nil
 	}
-	slices.Reverse(ops)
-	val, keep := merger.Full(nil, ops)
-	return val, keep, nil
+	res := Resolve(&entriesIter{entries: hits}, r.Merger, true)
+	if !res.SeekGE(key) {
+		return nil, false, res.Err()
+	}
+	return res.Value(), true, nil
 }
 
-// getIn is one table's point lookup.
 // Located is the newest version of a key: the value's extent in a table
 // when Table.Single applies, otherwise the value itself.
 type Located struct {
@@ -286,13 +276,13 @@ type Located struct {
 // is alone in a stored block, with the value when the block had to be
 // decoded anyway. ok is false for a missing or deleted key. A merge entry
 // is an error: Locate does not resolve merges.
-func (v Version) Locate(ctx context.Context, open Opener, key []byte) (l Located, ok bool, err error) {
+func (r Reader) Locate(ctx context.Context, v Version, key []byte) (l Located, ok bool, err error) {
 	for _, level := range v.Levels {
 		for _, f := range level {
-			if !f.overlaps(key, nil) || bytes.Compare(f.Min, key) > 0 {
+			if !f.Overlaps(key, nil) || bytes.Compare(f.Min, key) > 0 {
 				continue
 			}
-			t, err := open(ctx, f)
+			t, err := r.Open(ctx, f)
 			if err != nil {
 				return Located{}, false, err
 			}
@@ -318,8 +308,9 @@ func (v Version) Locate(ctx context.Context, open Opener, key []byte) (l Located
 	return Located{}, false, nil
 }
 
-func getIn(ctx context.Context, open Opener, f FileRef, key []byte) (Entry, bool, error) {
-	t, err := open(ctx, f)
+// getIn is one table's point lookup.
+func (r Reader) getIn(ctx context.Context, f FileRef, key []byte) (Entry, bool, error) {
+	t, err := r.Open(ctx, f)
 	if err != nil {
 		return Entry{}, false, err
 	}
