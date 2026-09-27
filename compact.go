@@ -17,7 +17,7 @@ type Options struct {
 	LevelRatio int64 // level n+1 holds LevelRatio × level n
 	BaseBytes  int64 // level 1 target bytes
 	FileBytes  int64 // output file target
-	BlockBytes int
+	BlockBytes int   // raw bytes a block closes at (DefaultBlockBytes when 0); a block never exceeds MaxTableBytes
 	// Workers bounds the partitions one compaction merges at once: a job
 	// is split by its overlap files' key ranges, and each range is an
 	// independent merge (0: half the CPUs, at least one).
@@ -50,7 +50,7 @@ func (o Options) withDefaults() Options {
 	if o.FileBytes <= 0 || o.FileBytes > MaxTableBytes {
 		o.FileBytes = d.FileBytes
 	}
-	if o.BlockBytes <= 0 || o.BlockBytes > maxBlockRaw {
+	if o.BlockBytes <= 0 {
 		o.BlockBytes = d.BlockBytes
 	}
 	return o
@@ -58,8 +58,8 @@ func (o Options) withDefaults() Options {
 
 // Putter stores one table and returns its object key. seq names it
 // uniquely within the namespace. Compact calls it from up to
-// Options.Workers goroutines at once, so it must be safe for concurrent
-// use, or Workers must be 1.
+// Options.Workers goroutines at once; it must be safe for concurrent use
+// unless Workers is 1.
 type Putter func(ctx context.Context, level int, seq uint64, data []byte) (string, error)
 
 // Flush writes sorted, unique entries as one level-0 file and returns the
@@ -406,17 +406,18 @@ func (c *compaction) writePartition(ctx context.Context, pi int, p partition) er
 		// A key space starts a file: the next round's untouched check
 		// (receives) can then leave a space no input writes to, where a
 		// file shared with a busy space is rewritten with it.
-		if w != nil && in.Key()[0] != space {
+		e := Entry{Key: in.Key(), Kind: in.Kind(), Value: in.Value()}
+		if w != nil && (e.Key[0] != space || !w.Fits(e)) {
 			if err := finish(); err != nil {
 				return err
 			}
 		}
 		if w == nil {
 			w = NewTableWriter(c.o.BlockBytes)
-			space = in.Key()[0]
+			space = e.Key[0]
 		}
-		if err := w.Add(Entry{Key: in.Key(), Kind: in.Kind(), Value: in.Value()}); err != nil {
-			return err
+		if err := w.Add(e); err != nil {
+			return fmt.Errorf("lsm: level %d: %w", c.j.Level+1, err)
 		}
 		if w.Bytes() >= c.o.FileBytes {
 			if err := finish(); err != nil {

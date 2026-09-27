@@ -10,6 +10,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -422,8 +423,9 @@ func FuzzDecodeBlock(f *testing.F) {
 }
 
 // TestLargeBlockBytesReopens: a writer asked for blocks past what a reader
-// accepts clamps them, so every table it finishes opens; an entry too big
-// for any block is refused up front.
+// accepts closes them at MaxTableBytes regardless, so every table it
+// finishes opens; an entry over MaxEntryBytes is ErrEntryTooLarge with its
+// key, and one at the limit finishes into a table a reader accepts.
 func TestLargeBlockBytesReopens(t *testing.T) {
 	w := NewTableWriter(1 << 30)
 	val := bytes.Repeat([]byte("x"), 1<<20) // compressible: the table stays small
@@ -443,7 +445,61 @@ func TestLargeBlockBytesReopens(t *testing.T) {
 	if n := len(collect(t, tb.Iter(context.Background()))); n != 40 {
 		t.Fatalf("%d entries", n)
 	}
-	if err := NewTableWriter(0).Add(Entry{Key: []byte("k"), Kind: KindPut, Value: make([]byte, maxBlockRaw)}); err == nil {
-		t.Fatal("oversized entry accepted")
+	key := []byte("Kbig")
+	err = NewTableWriter(0).Add(Entry{Key: key, Kind: KindPut, Value: make([]byte, MaxEntryBytes-3*len(key)+1)})
+	if !errors.Is(err, ErrEntryTooLarge) || !strings.Contains(err.Error(), "4b626967") {
+		t.Fatalf("oversized entry: %v", err)
+	}
+	w = NewTableWriter(0)
+	if err := w.Add(Entry{Key: key, Kind: KindPut, Value: make([]byte, MaxEntryBytes-3*len(key))}); err != nil {
+		t.Fatal(err)
+	}
+	if w.Fits(Entry{Key: []byte("Kc"), Kind: KindPut, Value: []byte("v")}) {
+		t.Fatal("a small entry after a large one should not fit a full table")
+	}
+	data, meta, err = w.Finish()
+	if err != nil || int64(len(data)) > MaxTableBytes {
+		t.Fatalf("max entry: %d bytes, %v", len(data), err)
+	}
+	if _, err := OpenTableAt(context.Background(), BytesSource(data), meta); err != nil {
+		t.Fatalf("reopen max entry: %v", err)
+	}
+}
+
+// TestFitsSplitsBeforeOverflow: Fits is an upper bound on the finished size,
+// so a writer that finishes whenever Fits says no never exceeds
+// MaxTableBytes; Bytes alone would let the index and a large final entry
+// push it over.
+func TestFitsSplitsBeforeOverflow(t *testing.T) {
+	rng := rand.New(rand.NewPCG(11, 12))
+	w := NewTableWriter(0)
+	big := make([]byte, 20<<20)
+	for i := range big {
+		big[i] = byte(rng.IntN(256))
+	}
+	small := make([]byte, 1<<10)
+	for i := range small {
+		small[i] = byte(rng.IntN(256))
+	}
+	var finished int
+	add := func(e Entry) {
+		if !w.Fits(e) {
+			data, _, err := w.Finish()
+			if err != nil || int64(len(data)) > MaxTableBytes {
+				t.Fatalf("finish: %d bytes, %v", len(data), err)
+			}
+			finished++
+			w = NewTableWriter(0)
+		}
+		if err := w.Add(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range 46 << 10 { // ~46 MiB of incompressible 1 KiB values
+		add(Entry{Key: fmt.Appendf(nil, "a%06d", i), Kind: KindPut, Value: small})
+	}
+	add(Entry{Key: []byte("a\xff"), Kind: KindPut, Value: big})
+	if finished != 1 {
+		t.Fatalf("%d files finished, want the large entry to start a second", finished)
 	}
 }

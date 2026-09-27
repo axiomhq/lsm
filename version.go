@@ -170,9 +170,10 @@ func (v Version) Rebase(base Version, e Edit) (Version, error) {
 type Opener func(ctx context.Context, f FileRef) (*Table, error)
 
 // Reader reads versions: Open opens a file's table and Merger folds merge
-// operands. Merger may be nil when no key uses KindMerge. Compact calls
-// both from up to Options.Workers goroutines at once, so they must be safe
-// for concurrent use, or Workers must be 1.
+// operands. Merger may be nil when no key uses KindMerge. Open is called
+// from one goroutine at a time. Merger, like Source.ReadAt, is called from
+// up to Options.Workers goroutines at once and must be safe for concurrent
+// use.
 type Reader struct {
 	Open   Opener
 	Merger Merger

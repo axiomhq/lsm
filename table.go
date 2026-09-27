@@ -52,9 +52,18 @@ const legacyMagic = "DWL1"
 // current nor the legacy one: bytes from a newer format, not corruption.
 var ErrUnsupportedFormat = errors.New("lsm: unsupported table format")
 
-// maxBlockRaw bounds a block's raw bytes so every table a writer finishes
-// is one a reader opens: a block is at most blockBytes plus one entry.
-const maxBlockRaw = MaxTableBytes / 2
+// MaxEntryBytes bounds one entry: its value plus three times its key (the
+// key is stored once in its block and twice, as first and last, in the
+// index). It is what fits in a table of its own, and it has not changed:
+// a writer before v0.4.0 refused the same entries at Finish.
+const MaxEntryBytes = MaxTableBytes - entryOverhead
+
+// entryOverhead is the most a table adds around one entry: block crc and
+// mode, count and length varints, index varints and the footer.
+const entryOverhead = 128
+
+// ErrEntryTooLarge is Add's refusal of an entry over MaxEntryBytes.
+var ErrEntryTooLarge = errors.New("lsm: entry too large")
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
@@ -150,6 +159,7 @@ type TableWriter struct {
 	meta       TableMeta
 	last       []byte
 	spaces     []SpaceRange
+	est        int64 // upper bound on the finished table's size
 }
 
 // NewTableWriter returns a writer closing blocks at blockBytes of raw
@@ -158,10 +168,12 @@ func NewTableWriter(blockBytes int) *TableWriter {
 	if blockBytes <= 0 {
 		blockBytes = DefaultBlockBytes
 	}
-	return &TableWriter{blockBytes: min(blockBytes, maxBlockRaw)}
+	return &TableWriter{blockBytes: blockBytes}
 }
 
-// Add appends e. Keys must be strictly increasing and non-empty.
+// Add appends e. Keys must be strictly increasing and non-empty, and an
+// entry is at most MaxEntryBytes (ErrEntryTooLarge). A block's raw bytes
+// never exceed MaxTableBytes, whatever blockBytes says.
 func (w *TableWriter) Add(e Entry) error {
 	if len(e.Key) == 0 {
 		return fmt.Errorf("lsm: empty key")
@@ -172,13 +184,15 @@ func (w *TableWriter) Add(e Entry) error {
 	if e.Kind < KindPut || e.Kind > KindMerge {
 		return fmt.Errorf("lsm: bad kind %d", e.Kind)
 	}
-	if len(e.Key)+len(e.Value) > maxBlockRaw-2*binary.MaxVarintLen64 {
-		return fmt.Errorf("lsm: entry of %d bytes exceeds %d", len(e.Key)+len(e.Value), maxBlockRaw)
+	size := entrySize(e)
+	if size > MaxEntryBytes {
+		return fmt.Errorf("%w: lsm: key %.32x: %d bytes, max %d", ErrEntryTooLarge, e.Key, size, MaxEntryBytes)
 	}
 	large := len(e.Value) >= LargeValueBytes
-	if w.n > 0 && (large || len(w.raw)+len(e.Value) > w.blockBytes) {
+	if w.n > 0 && (large || len(w.raw)+len(e.Value) > w.blockBytes || int64(len(w.raw))+size+entryOverhead > MaxTableBytes) {
 		w.flushBlock()
 	}
+	w.est += size + entryOverhead
 	if w.n == 0 {
 		w.first = append(w.first[:0], e.Key...)
 	}
@@ -209,6 +223,14 @@ func (w *TableWriter) Add(e Entry) error {
 // Bytes is the size written so far plus the open block, for splitting
 // output files.
 func (w *TableWriter) Bytes() int64 { return int64(len(w.out) + len(w.raw)) }
+
+// Fits reports whether the table can take e and still finish within
+// MaxTableBytes: an upper bound, since blocks compress.
+func (w *TableWriter) Fits(e Entry) bool { return w.est+entrySize(e)+entryOverhead <= MaxTableBytes }
+
+// entrySize is what an entry costs a table: its value and its key three
+// times (block, index first, index last).
+func entrySize(e Entry) int64 { return int64(len(e.Value) + 3*len(e.Key)) }
 
 func (w *TableWriter) flushBlock() {
 	if w.n == 0 {
@@ -366,25 +388,6 @@ func OpenTableAt(ctx context.Context, src Source, meta TableMeta) (*Table, error
 		return nil, fmt.Errorf("%w: lsm: table index trailing bytes", ErrCorrupt)
 	}
 	return t, nil
-}
-
-// Span is the index range [first, last] of the blocks that may hold keys
-// in [lo, hi) (nil hi: unbounded), or ok false when none does. It is the
-// table's own account of which of its bytes a range read touches, which
-// is what a cache key for a value derived from that range hashes.
-func (t *Table) Span(lo, hi []byte) (first, last int, ok bool) {
-	first = sort.Search(len(t.index), func(i int) bool { return bytes.Compare(t.index[i].last, lo) >= 0 })
-	if first == len(t.index) {
-		return 0, 0, false
-	}
-	if hi == nil {
-		return first, len(t.index) - 1, true
-	}
-	last = sort.Search(len(t.index), func(i int) bool { return bytes.Compare(t.index[i].first, hi) >= 0 }) - 1
-	if last < first {
-		return 0, 0, false
-	}
-	return first, last, true
 }
 
 // Block is one decoded block: entry start offsets into raw.

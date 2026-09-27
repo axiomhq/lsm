@@ -68,16 +68,24 @@ own: a frame claiming or decoding to more than `max` bytes is refused.
 ## Concurrency and format
 
 A `Table` is safe for concurrent reads; an iterator is not. `Compact` runs up
-to `Options.Workers` merges at once and calls your `Putter`, `Opener`,
-`Source.ReadAt` and `Merger` from all of them, so they must be safe for
-concurrent use, or set `Workers: 1`.
+to `Options.Workers` merges at once: `Source.ReadAt` and `Merger` are called
+from all of them and must be safe for concurrent use; `Putter` is too, unless
+`Workers` is 1; `Opener` is called from one goroutine at a time.
 
 `OpenTableAt` reads the index and the footer behind it in one range read and
-checks the magic, the footer's index position against the manifest, and the
-index crc32c. The magic is the format's version; while the module is v0 a
+checks, in order, the footer's index position against the manifest, the
+magic, and the index crc32c. The 32-byte footer frame (index offset and
+length first, magic last) is fixed for every format, so a footer that
+disagrees with the manifest is `ErrCorrupt` and a magic the reader does not
+know is `lsm.ErrUnsupportedFormat`: bytes from a newer format, not
+corruption. The magic is the format's version; while the module is v0 a
 format change bumps its minor version, and a reader keeps accepting the
-previous magic when the layout did not change. A magic it does not know is
-`lsm.ErrUnsupportedFormat`, not `ErrCorrupt`: bytes from a newer format.
+previous magic when the layout did not change.
+
+An entry is at most `lsm.MaxEntryBytes` (its value plus three times its key,
+a little under 64 MiB); `Add` returns `lsm.ErrEntryTooLarge` past that. A
+block's raw bytes never exceed `MaxTableBytes` whatever `BlockBytes` says,
+and a compaction output file never exceeds it either.
 
 The manifest encoding is the json names on `Version`, `FileRef`, `TableMeta`
 and `SpaceRange`. They are stable: a manifest written by any earlier version

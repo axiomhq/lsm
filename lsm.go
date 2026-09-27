@@ -34,8 +34,8 @@ type Entry struct {
 
 // Merger folds a key's merge operands, oldest first. An error is an
 // operand or base it cannot decode; reads wrap it in ErrCorrupt. Compact
-// calls it from up to Options.Workers goroutines at once, so it must be
-// safe for concurrent use.
+// calls it from up to Options.Workers goroutines at once; it must be safe
+// for concurrent use.
 type Merger interface {
 	// Full computes the key's value from base (nil when no Put lies beneath
 	// the operands) and the operands. keep false means the key is absent.
