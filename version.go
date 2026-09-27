@@ -1,0 +1,283 @@
+package lsm
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"hash/fnv"
+
+	"slices"
+)
+
+// FileRef names one table in the manifest with what a reader needs to
+// prune and open it without touching it.
+type FileRef struct {
+	Key      string       `json:"key"`
+	Seq      uint64       `json:"seq"` // allocation order; L0 precedence
+	Min      []byte       `json:"min"`
+	Max      []byte       `json:"max"`
+	Bytes    int64        `json:"bytes"`
+	Count    uint64       `json:"count"`
+	IndexOff int64        `json:"index_off"`
+	IndexLen int64        `json:"index_len"`
+	Spaces   []SpaceRange `json:"spaces,omitempty"`
+}
+
+// Meta is the TableMeta a reader opens the table with.
+func (f FileRef) Meta() TableMeta {
+	return TableMeta{Min: f.Min, Max: f.Max, Count: f.Count, Bytes: f.Bytes, IndexOff: f.IndexOff, IndexLen: f.IndexLen, Spaces: f.Spaces}
+}
+
+// overlaps reports whether [Min, Max] meets [lo, hi); nil bounds are open.
+// Overlaps reports whether the file's key range meets [lo, hi); nil lo or
+// hi is unbounded.
+func (f FileRef) Overlaps(lo, hi []byte) bool { return f.overlaps(lo, hi) }
+
+func (f FileRef) overlaps(lo, hi []byte) bool {
+	if lo != nil && bytes.Compare(f.Max, lo) < 0 {
+		return false
+	}
+	return hi == nil || bytes.Compare(f.Min, hi) < 0
+}
+
+// Version is the levels of a namespace's LSM at one manifest. Level 0 is
+// newest first and its files overlap; every later level is sorted by Min
+// with disjoint ranges. NextSeq names the next file.
+type Version struct {
+	Levels  [][]FileRef `json:"levels,omitempty"`
+	NextSeq uint64      `json:"next_seq,omitempty"`
+}
+
+// Files is every file, level 0 first.
+func (v Version) Files() []FileRef {
+	var out []FileRef
+	for _, l := range v.Levels {
+		out = append(out, l...)
+	}
+	return out
+}
+
+// Overlapping is the files whose range meets [lo, hi), newest first: level
+// 0 in Seq order, then each level in key order. That order is MergeIter's
+// precedence.
+func (v Version) Overlapping(lo, hi []byte) []FileRef {
+	var out []FileRef
+	for _, l := range v.Levels {
+		for _, f := range l {
+			if f.overlaps(lo, hi) {
+				out = append(out, f)
+			}
+		}
+	}
+	return out
+}
+
+// Signature identifies what a read of the given key ranges sees in v: a
+// hash of the names of the files overlapping any of them. Versions that
+// did not touch those files share the signature, so a value decoded from
+// the ranges can be cached under it. ok is false when no file overlaps.
+func (v Version) Signature(ranges ...[2][]byte) (sig uint64, ok bool) {
+	h := fnv.New64a()
+	for _, l := range v.Levels {
+		for _, f := range l {
+			for _, r := range ranges {
+				if f.overlaps(r[0], r[1]) {
+					h.Write([]byte(f.Key))
+					h.Write([]byte{0})
+					ok = true
+					break
+				}
+			}
+		}
+	}
+	return h.Sum64(), ok
+}
+
+// Edit is one change: files removed by key and files added to a level.
+type Edit struct {
+	Del []string
+	Add map[int][]FileRef
+}
+
+// Apply returns the version after e. Levels grow as needed; ordering
+// invariants are restored.
+func (v Version) Apply(e Edit) (Version, error) {
+	del := make(map[string]bool, len(e.Del))
+	for _, k := range e.Del {
+		del[k] = true
+	}
+	out := Version{NextSeq: v.NextSeq}
+	depth := len(v.Levels)
+	for l := range e.Add {
+		depth = max(depth, l+1)
+	}
+	out.Levels = make([][]FileRef, depth)
+	for l := range out.Levels {
+		if l < len(v.Levels) {
+			for _, f := range v.Levels[l] {
+				if !del[f.Key] {
+					out.Levels[l] = append(out.Levels[l], f)
+				}
+			}
+		}
+		out.Levels[l] = append(out.Levels[l], e.Add[l]...)
+		for _, f := range e.Add[l] {
+			out.NextSeq = max(out.NextSeq, f.Seq+1)
+		}
+		if l == 0 {
+			slices.SortFunc(out.Levels[l], func(a, b FileRef) int { return -cmpUint(a.Seq, b.Seq) })
+			continue
+		}
+		slices.SortFunc(out.Levels[l], func(a, b FileRef) int { return bytes.Compare(a.Min, b.Min) })
+		for i := 1; i < len(out.Levels[l]); i++ {
+			if bytes.Compare(out.Levels[l][i-1].Max, out.Levels[l][i].Min) >= 0 {
+				return Version{}, fmt.Errorf("lsm: level %d files %s and %s overlap", l, out.Levels[l][i-1].Key, out.Levels[l][i].Key)
+			}
+		}
+	}
+	for len(out.Levels) > 0 && len(out.Levels[len(out.Levels)-1]) == 0 {
+		out.Levels = out.Levels[:len(out.Levels)-1]
+	}
+	return out, nil
+}
+
+func cmpUint(a, b uint64) int {
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	}
+	return 0
+}
+
+// Equal reports whether two versions name the same files in the same
+// places.
+func (v Version) Equal(o Version) bool {
+	if v.NextSeq != o.NextSeq || len(v.Levels) != len(o.Levels) {
+		return false
+	}
+	for l := range v.Levels {
+		if !slices.EqualFunc(v.Levels[l], o.Levels[l], func(a, b FileRef) bool { return a.Key == b.Key && a.Seq == b.Seq }) {
+			return false
+		}
+	}
+	return true
+}
+
+// Opener opens a file's table.
+type Opener func(ctx context.Context, f FileRef) (*Table, error)
+
+// Iter is a resolved iterator over [lo, hi) across every level: the
+// merge of one iterator per overlapping file, newest first.
+func (v Version) Iter(ctx context.Context, open Opener, merger Merger, lo, hi []byte) (Iterator, error) {
+	files := v.Overlapping(lo, hi)
+	its := make([]Iterator, 0, len(files))
+	for _, f := range files {
+		t, err := open(ctx, f)
+		if err != nil {
+			return nil, err
+		}
+		its = append(its, Bound(t.Iter(ctx), hi))
+	}
+	return Resolve(NewMerge(its...), merger, true), nil
+}
+
+// Get is a point lookup: tables newest first until a Put or Delete.
+func (v Version) Get(ctx context.Context, open Opener, merger Merger, key []byte) ([]byte, bool, error) {
+	var ops [][]byte
+	// The files newest first, without materialising the overlapping list:
+	// a point lookup is the hottest read.
+	for _, l := range v.Levels {
+		for _, f := range l {
+			if !f.overlaps(key, nil) || bytes.Compare(f.Min, key) > 0 {
+				continue
+			}
+			e, ok, err := getIn(ctx, open, f, key)
+			if err != nil {
+				return nil, false, err
+			}
+			if !ok {
+				continue
+			}
+			switch e.Kind {
+			case KindPut:
+				if len(ops) == 0 {
+					return e.Value, true, nil
+				}
+				slices.Reverse(ops)
+				v, keep := merger.Full(e.Value, ops)
+				return v, keep, nil
+			case KindDelete:
+				if len(ops) == 0 {
+					return nil, false, nil
+				}
+				slices.Reverse(ops)
+				v, keep := merger.Full(nil, ops)
+				return v, keep, nil
+			case KindMerge:
+				ops = append(ops, e.Value)
+			}
+		}
+	}
+	if len(ops) == 0 {
+		return nil, false, nil
+	}
+	slices.Reverse(ops)
+	val, keep := merger.Full(nil, ops)
+	return val, keep, nil
+}
+
+// getIn is one table's point lookup.
+// Located is the newest version of a key: the value's extent in a table
+// when Table.Single applies, otherwise the value itself.
+type Located struct {
+	Table       *Table
+	Off, Length int64
+	Value       []byte
+}
+
+// Locate is Get for a key space of large put-only values (Table.Single):
+// the newest file holding key answers with the value's extent when the key
+// is alone in a stored block, with the value when the block had to be
+// decoded anyway. ok is false for a missing or deleted key. A merge entry
+// is an error: Locate does not resolve merges.
+func (v Version) Locate(ctx context.Context, open Opener, key []byte) (l Located, ok bool, err error) {
+	for _, level := range v.Levels {
+		for _, f := range level {
+			if !f.overlaps(key, nil) || bytes.Compare(f.Min, key) > 0 {
+				continue
+			}
+			t, err := open(ctx, f)
+			if err != nil {
+				return Located{}, false, err
+			}
+			if off, length, ok := t.Single(key); ok {
+				return Located{Table: t, Off: off, Length: length}, true, nil
+			}
+			e, ok, err := t.Get(ctx, key)
+			if err != nil {
+				return Located{}, false, err
+			}
+			if !ok {
+				continue
+			}
+			switch e.Kind {
+			case KindPut:
+				return Located{Value: e.Value}, true, nil
+			case KindDelete:
+				return Located{}, false, nil
+			}
+			return Located{}, false, fmt.Errorf("%w: lsm: merge entry under a located key", ErrCorrupt)
+		}
+	}
+	return Located{}, false, nil
+}
+
+func getIn(ctx context.Context, open Opener, f FileRef, key []byte) (Entry, bool, error) {
+	t, err := open(ctx, f)
+	if err != nil {
+		return Entry{}, false, err
+	}
+	return t.Get(ctx, key)
+}
