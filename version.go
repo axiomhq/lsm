@@ -3,9 +3,9 @@ package lsm
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
-
 	"slices"
 )
 
@@ -139,6 +139,50 @@ func (v Version) Apply(e Edit) (Version, error) {
 		out.Levels = out.Levels[:len(out.Levels)-1]
 	}
 	return out, nil
+}
+
+// ErrStale is Rebase's refusal: the newer version no longer holds what the
+// edit was computed against.
+var ErrStale = errors.New("lsm: edit is stale")
+
+// Rebase applies e, a compaction's edit computed on base, to v, a version
+// published since. It holds when v differs from base only by level-0 files
+// added (Flush): every file e deletes is still in v at its level in base,
+// and levels 1 and deeper name the same files as in base. Then the outputs
+// sit where the compaction put them, the added level-0 files stay newer
+// than every input, and a job that dropped tombstones (Job.Bottom) still
+// has nothing beneath it. Anything else, a second compaction say, is
+// ErrStale.
+func (v Version) Rebase(base Version, e Edit) (Version, error) {
+	level := func(ver Version) map[string]int {
+		at := map[string]int{}
+		for l, files := range ver.Levels {
+			for _, f := range files {
+				at[f.Key] = l
+			}
+		}
+		return at
+	}
+	was, now := level(base), level(v)
+	for _, k := range e.Del {
+		l, ok := was[k]
+		if nl, present := now[k]; !ok || !present || nl != l {
+			return Version{}, fmt.Errorf("%w: %s", ErrStale, k)
+		}
+	}
+	for l := 1; l < max(len(base.Levels), len(v.Levels)); l++ {
+		var a, b []FileRef
+		if l < len(base.Levels) {
+			a = base.Levels[l]
+		}
+		if l < len(v.Levels) {
+			b = v.Levels[l]
+		}
+		if !slices.EqualFunc(a, b, func(x, y FileRef) bool { return x.Key == y.Key }) {
+			return Version{}, fmt.Errorf("%w: level %d changed", ErrStale, l)
+		}
+	}
+	return v.Apply(e)
 }
 
 func cmpUint(a, b uint64) int {

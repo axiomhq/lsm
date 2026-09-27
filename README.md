@@ -33,10 +33,11 @@ ships in the package: roaring-bitmap sets with add/remove operands
 ## Compact
 
 1. Pick a job: `job, ok := lsm.Pick(v, opts)`. `ok` is false when every level is in shape.
-2. Run it: `next, written, err := lsm.Compact(ctx, v, job, opts, open, put)`.
+2. Run it: `next, edit, err := lsm.Compact(ctx, v, job, opts, open, put)`.
 3. Save `next` with a conditional write. Delete the inputs' objects only after that write succeeds.
+4. Lost the write to a newer version `head`? Rebase: `next, err = head.Rebase(v, edit)`, then write again. `lsm.ErrStale` means another compaction changed the same files: delete the outputs and pick again.
 
-`Options.Budget()` caps the bytes one round of compactions writes.
+Rebase holds when the only other writer adds level-0 files (`Flush`).
 `Options.Workers` caps the key-range partitions merged at once.
 
 ## Table format

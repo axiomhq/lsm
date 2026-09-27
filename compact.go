@@ -23,23 +23,11 @@ type Options struct {
 	// is split by its overlap files' key ranges, and each range is an
 	// independent merge (0: half the CPUs, at least one).
 	Workers int
-	// CompactBytes bounds the output one caller's round of compactions
-	// writes before it stops picking jobs (Budget); 0 is 512 MiB, about
-	// two level-1 rewrites, so one round stays a few seconds.
-	CompactBytes int64
 }
 
 // DefaultOptions: 4 L0 files, ratio 10, 256 MiB L1, 48 MiB files.
 func DefaultOptions() Options {
 	return Options{L0Trigger: 4, LevelRatio: 10, BaseBytes: 256 << 20, FileBytes: 48 << 20, BlockBytes: DefaultBlockBytes, Merger: SetMerger{}}
-}
-
-// Budget is the compaction output one round may write.
-func (o Options) Budget() int64 {
-	if o.CompactBytes > 0 {
-		return o.CompactBytes
-	}
-	return 512 << 20
 }
 
 func (o Options) workers() int {
@@ -267,14 +255,16 @@ func (v Version) job(level int, inputs []FileRef, o Options) Job {
 // file, so bounds alone would rewrite them every round.
 // Output files are unique by sequence, so a partition publishes as it
 // goes; the caller publishes the version, and a crash before that leaves
-// only orphan objects.
-func Compact(ctx context.Context, v Version, j Job, o Options, open Opener, put Putter) (Version, []FileRef, error) {
+// only orphan objects. The returned Edit is the change from v (inputs and
+// rewritten overlap deleted, outputs added), for a caller that publishes
+// it over a newer version (Version.Rebase).
+func Compact(ctx context.Context, v Version, j Job, o Options, open Opener, put Putter) (Version, Edit, error) {
 	o = o.withDefaults()
 	inputs := make([]*Table, len(j.Inputs))
 	for i, f := range j.Inputs {
 		t, err := open(ctx, f)
 		if err != nil {
-			return Version{}, nil, err
+			return Version{}, Edit{}, err
 		}
 		inputs[i] = t
 	}
@@ -297,7 +287,7 @@ func Compact(ctx context.Context, v Version, j Job, o Options, open Opener, put 
 		}
 		t, err := open(ctx, f)
 		if err != nil {
-			return Version{}, nil, err
+			return Version{}, Edit{}, err
 		}
 		overlaps[i] = t
 		touched = append(touched, f)
@@ -397,7 +387,7 @@ func Compact(ctx context.Context, v Version, j Job, o Options, open Opener, put 
 		})
 	}
 	if err := g.Wait(); err != nil {
-		return Version{}, nil, err
+		return Version{}, Edit{}, err
 	}
 	e := Edit{Add: map[int][]FileRef{}}
 	for _, f := range j.Inputs {
@@ -406,17 +396,15 @@ func Compact(ctx context.Context, v Version, j Job, o Options, open Opener, put 
 	for _, f := range touched {
 		e.Del = append(e.Del, f.Key)
 	}
-	var added []FileRef
 	for _, out := range outputs {
-		added = append(added, out...)
+		e.Add[j.Level+1] = append(e.Add[j.Level+1], out...)
 	}
-	e.Add[j.Level+1] = added
 	next, err := v.Apply(e)
 	if err != nil {
-		return Version{}, nil, fmt.Errorf("lsm: compaction of level %d: %w", j.Level, err)
+		return Version{}, Edit{}, fmt.Errorf("lsm: compaction of level %d: %w", j.Level, err)
 	}
 	if next.NextSeq < seq.Load() {
 		next.NextSeq = seq.Load()
 	}
-	return next, added, nil
+	return next, e, nil
 }
