@@ -54,6 +54,9 @@ block. A block zstd cannot shrink by an eighth is stored raw. Every read
 checks the checksums, and corrupt bytes return an error wrapping
 `lsm.ErrCorrupt`.
 
+`lsm.DecompressBounded(data, max)` is that size-capped zstd decode on its
+own: a frame claiming or decoding to more than `max` bytes is refused.
+
 ## Test
 
 ```sh

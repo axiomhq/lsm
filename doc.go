@@ -20,5 +20,6 @@
 // stored) and the entries; an index of each block's offset, lengths and
 // first and last key; a 32-byte footer with the index offset and length,
 // the entry count, crc32c(index) and the magic. Corrupt bytes return an
-// error wrapping ErrCorrupt.
+// error wrapping ErrCorrupt. DecompressBounded, the size-capped zstd decode
+// behind every block read, is exported for other formats.
 package lsm

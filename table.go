@@ -67,28 +67,29 @@ var blockDecoder = func() *zstd.Decoder {
 	return d
 }()
 
-// decompressBounded decodes one zstd frame of at most max bytes, and
-// refuses a frame whose header or output claims more: a corrupt index must
-// not make a read allocate gigabytes.
-func decompressBounded(data []byte, max uint64) ([]byte, error) {
+// DecompressBounded decodes one zstd frame of at most max bytes. max is a
+// ceiling, not a size the stream dictates: a frame whose header claims more
+// is refused before anything is allocated, and output past max is refused
+// after decoding. max is capped at 1 GiB. Every failure wraps ErrCorrupt.
+func DecompressBounded(data []byte, max uint64) ([]byte, error) {
 	max = min(max, maxBlockBytes)
 	var h zstd.Header
 	if err := h.Decode(data); err != nil {
-		return nil, fmt.Errorf("%w: lsm: block zstd: %v", ErrCorrupt, err)
+		return nil, fmt.Errorf("%w: lsm: zstd: %v", ErrCorrupt, err)
 	}
 	size := uint64(0)
 	if h.HasFCS {
 		if h.FrameContentSize > max {
-			return nil, fmt.Errorf("%w: lsm: block claims %d bytes, max %d", ErrCorrupt, h.FrameContentSize, max)
+			return nil, fmt.Errorf("%w: lsm: zstd frame claims %d bytes, max %d", ErrCorrupt, h.FrameContentSize, max)
 		}
 		size = h.FrameContentSize
 	}
 	out, err := blockDecoder.DecodeAll(data, make([]byte, 0, size))
 	if err != nil {
-		return nil, fmt.Errorf("%w: lsm: block zstd: %v", ErrCorrupt, err)
+		return nil, fmt.Errorf("%w: lsm: zstd: %v", ErrCorrupt, err)
 	}
 	if uint64(len(out)) > max {
-		return nil, fmt.Errorf("%w: lsm: block decoded to %d bytes, max %d", ErrCorrupt, len(out), max)
+		return nil, fmt.Errorf("%w: lsm: zstd frame decoded to %d bytes, max %d", ErrCorrupt, len(out), max)
 	}
 	return out, nil
 }
@@ -455,7 +456,7 @@ func decodeBlock(stored []byte, rawLen int64) (*Block, error) {
 	switch stored[4] {
 	case blockZstd:
 		var err error
-		if raw, err = decompressBounded(stored[5:], uint64(rawLen)); err != nil {
+		if raw, err = DecompressBounded(stored[5:], uint64(rawLen)); err != nil {
 			return nil, err
 		}
 	case blockStored:
