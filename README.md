@@ -54,7 +54,7 @@ Rebase holds when the only other writer adds level-0 files (`Flush`).
 | --- | --- |
 | block | crc32c u32, mode byte (0 zstd, 1 stored), payload; raw is uvarint(count), then per entry uvarint(len key) key, kind byte, uvarint(len value) value |
 | index | uvarint(blocks), then per block offset, length, raw length, first key, last key (all uvarint-framed) |
-| footer | 32 bytes: index offset u64, index length u64, entry count u64, crc32c(index) u32, magic `LSM1` (`DWL1` before v0.3.0, same layout, still read) |
+| footer | 32 bytes: index offset u64, index length u64, entry count u64, crc32c(index) u32, magic `LSM1` (`DWL1` through v0.3.0, same layout, still read) |
 
 Blocks close at 64 KiB raw (`DefaultBlockBytes`). A value of 4 KiB or more
 (`LargeValueBytes`) is a block of its own, so a point read decodes only that
@@ -67,13 +67,17 @@ own: a frame claiming or decoding to more than `max` bytes is refused.
 
 ## Concurrency and format
 
-A `Table` is safe for concurrent reads; an iterator is not.
+A `Table` is safe for concurrent reads; an iterator is not. `Compact` runs up
+to `Options.Workers` merges at once and calls your `Putter`, `Opener`,
+`Source.ReadAt` and `Merger` from all of them, so they must be safe for
+concurrent use, or set `Workers: 1`.
 
 `OpenTableAt` reads the index and the footer behind it in one range read and
 checks the magic, the footer's index position against the manifest, and the
 index crc32c. The magic is the format's version; while the module is v0 a
 format change bumps its minor version, and a reader keeps accepting the
-previous magic when the layout did not change.
+previous magic when the layout did not change. A magic it does not know is
+`lsm.ErrUnsupportedFormat`, not `ErrCorrupt`: bytes from a newer format.
 
 The manifest encoding is the json names on `Version`, `FileRef`, `TableMeta`
 and `SpaceRange`. They are stable: a manifest written by any earlier version

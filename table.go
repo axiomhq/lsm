@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"sort"
@@ -43,9 +44,17 @@ const (
 	MaxTableBytes = 64 << 20
 )
 
-// legacyMagic is the footer magic tables carried before v0.3.0; the layout
-// is the same, so a reader accepts both.
+// legacyMagic is the footer magic tables carried through v0.3.0; the
+// layout is the same, so a reader accepts both.
 const legacyMagic = "DWL1"
+
+// ErrUnsupportedFormat is a table whose footer magic is neither the
+// current nor the legacy one: bytes from a newer format, not corruption.
+var ErrUnsupportedFormat = errors.New("lsm: unsupported table format")
+
+// maxBlockRaw bounds a block's raw bytes so every table a writer finishes
+// is one a reader opens: a block is at most blockBytes plus one entry.
+const maxBlockRaw = MaxTableBytes / 2
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
@@ -84,7 +93,7 @@ func DecompressBounded(data []byte, max uint64) ([]byte, error) {
 	max = min(max, MaxTableBytes)
 	var h zstd.Header
 	if err := h.Decode(data); err != nil {
-		return nil, fmt.Errorf("%w: lsm: zstd: %v", ErrCorrupt, err)
+		return nil, fmt.Errorf("%w: lsm: zstd: %w", ErrCorrupt, err)
 	}
 	size := uint64(0)
 	if h.HasFCS {
@@ -95,7 +104,7 @@ func DecompressBounded(data []byte, max uint64) ([]byte, error) {
 	}
 	out, err := blockDecoder.DecodeAll(data, make([]byte, 0, size))
 	if err != nil {
-		return nil, fmt.Errorf("%w: lsm: zstd: %v", ErrCorrupt, err)
+		return nil, fmt.Errorf("%w: lsm: zstd: %w", ErrCorrupt, err)
 	}
 	if uint64(len(out)) > max {
 		return nil, fmt.Errorf("%w: lsm: zstd frame decoded to %d bytes, max %d", ErrCorrupt, len(out), max)
@@ -149,7 +158,7 @@ func NewTableWriter(blockBytes int) *TableWriter {
 	if blockBytes <= 0 {
 		blockBytes = DefaultBlockBytes
 	}
-	return &TableWriter{blockBytes: blockBytes}
+	return &TableWriter{blockBytes: min(blockBytes, maxBlockRaw)}
 }
 
 // Add appends e. Keys must be strictly increasing and non-empty.
@@ -162,6 +171,9 @@ func (w *TableWriter) Add(e Entry) error {
 	}
 	if e.Kind < KindPut || e.Kind > KindMerge {
 		return fmt.Errorf("lsm: bad kind %d", e.Kind)
+	}
+	if len(e.Key)+len(e.Value) > maxBlockRaw-2*binary.MaxVarintLen64 {
+		return fmt.Errorf("lsm: entry of %d bytes exceeds %d", len(e.Key)+len(e.Value), maxBlockRaw)
 	}
 	large := len(e.Value) >= LargeValueBytes
 	if w.n > 0 && (large || len(w.raw)+len(e.Value) > w.blockBytes) {
@@ -271,7 +283,10 @@ func BuildTable(entries []Entry, blockBytes int) ([]byte, TableMeta, error) {
 	return w.Finish()
 }
 
-// Source is where a table's bytes come from: an object read by range.
+// Source is where a table's bytes come from: an object read by range. A
+// Table is read from several goroutines at once (Compact runs
+// Options.Workers merges over the same inputs), so ReadAt must be safe for
+// concurrent use.
 type Source interface {
 	ReadAt(ctx context.Context, off, length int64) ([]byte, error)
 }
@@ -311,11 +326,14 @@ func OpenTableAt(ctx context.Context, src Source, meta TableMeta) (*Table, error
 		return nil, fmt.Errorf("%w: lsm: table index short read", ErrCorrupt)
 	}
 	idx, f := buf[:n], buf[n:]
-	if m := string(f[28:]); m != tableMagic && m != legacyMagic {
-		return nil, fmt.Errorf("%w: lsm: table magic %q", ErrCorrupt, m)
-	}
+	// The footer's index position and the magic's place are fixed across
+	// formats, so a footer that disagrees with the manifest is corruption or
+	// a wrong object, checked before the magic says which format this is.
 	if binary.BigEndian.Uint64(f[0:8]) != uint64(off) || binary.BigEndian.Uint64(f[8:16]) != uint64(n) {
 		return nil, fmt.Errorf("%w: lsm: table footer disagrees with the manifest", ErrCorrupt)
+	}
+	if m := string(f[28:]); m != tableMagic && m != legacyMagic {
+		return nil, fmt.Errorf("%w: magic %q", ErrUnsupportedFormat, m)
 	}
 	if crc32.Checksum(idx, castagnoli) != binary.BigEndian.Uint32(f[24:28]) {
 		return nil, fmt.Errorf("%w: lsm: table index checksum", ErrCorrupt)
@@ -323,7 +341,7 @@ func OpenTableAt(ctx context.Context, src Source, meta TableMeta) (*Table, error
 	t := &Table{src: src}
 	d := decoder{b: idx}
 	blocks := d.uvarint()
-	if blocks == 0 || blocks > uint64(n) {
+	if blocks == 0 || blocks > uint64(n)/7 { // an index entry is at least 7 bytes
 		return nil, fmt.Errorf("%w: lsm: table index blocks", ErrCorrupt)
 	}
 	t.index = make([]blockIndex, 0, blocks)
@@ -407,7 +425,7 @@ func decodeBlock(stored []byte, rawLen int64) (*Block, error) {
 		return nil, fmt.Errorf("%w: lsm: block raw length", ErrCorrupt)
 	}
 	n, at := binary.Uvarint(raw)
-	if at <= 0 || n == 0 || n > uint64(len(raw)) {
+	if at <= 0 || n == 0 || n > uint64(len(raw))/4 { // an entry is at least 4 bytes
 		return nil, fmt.Errorf("%w: lsm: block count", ErrCorrupt)
 	}
 	b := &Block{raw: raw, offs: make([]int32, 0, n)}

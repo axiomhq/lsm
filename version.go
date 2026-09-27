@@ -170,7 +170,9 @@ func (v Version) Rebase(base Version, e Edit) (Version, error) {
 type Opener func(ctx context.Context, f FileRef) (*Table, error)
 
 // Reader reads versions: Open opens a file's table and Merger folds merge
-// operands. Merger may be nil when no key uses KindMerge.
+// operands. Merger may be nil when no key uses KindMerge. Compact calls
+// both from up to Options.Workers goroutines at once, so they must be safe
+// for concurrent use, or Workers must be 1.
 type Reader struct {
 	Open   Opener
 	Merger Merger
@@ -184,9 +186,9 @@ func (r Reader) Iter(ctx context.Context, v Version, lo, hi []byte) (Iterator, e
 	for _, f := range files {
 		t, err := r.Open(ctx, f)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("lsm: open %s: %w", f.Key, err)
 		}
-		its = append(its, Bound(t.Iter(ctx), lo, hi))
+		its = append(its, Bound(named{f.Key, t}.iter(ctx), lo, hi))
 	}
 	return Resolve(NewMerge(its...), r.Merger, true), nil
 }
@@ -253,14 +255,14 @@ func (r Reader) Locate(ctx context.Context, v Version, key []byte) (l Located, o
 			}
 			t, err := r.Open(ctx, f)
 			if err != nil {
-				return Located{}, false, err
+				return Located{}, false, fmt.Errorf("lsm: open %s: %w", f.Key, err)
 			}
 			if off, length, ok := t.Single(key); ok {
 				return Located{Table: t, Off: off, Length: length}, true, nil
 			}
 			e, ok, err := t.Get(ctx, key)
 			if err != nil {
-				return Located{}, false, err
+				return Located{}, false, fmt.Errorf("lsm: %s: %w", f.Key, err)
 			}
 			if !ok {
 				continue

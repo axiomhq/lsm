@@ -100,13 +100,13 @@ func DecodeInto(dst *roaring.Bitmap, value []byte) error {
 	}
 	if dst.IsEmpty() {
 		if err := unmarshal(dst, value); err != nil {
-			return fmt.Errorf("%w: set value: %v", ErrCorrupt, err)
+			return fmt.Errorf("%w: set value: %w", ErrCorrupt, err)
 		}
 		return nil
 	}
 	tmp := roaring.New()
 	if err := unmarshal(tmp, value); err != nil {
-		return fmt.Errorf("%w: set value: %v", ErrCorrupt, err)
+		return fmt.Errorf("%w: set value: %w", ErrCorrupt, err)
 	}
 	dst.Or(tmp)
 	return nil
@@ -179,10 +179,9 @@ func unmarshal(dst *roaring.Bitmap, value []byte) error {
 	return dst.Validate()
 }
 
-// recoverCorrupt turns a panic in roaring into ErrCorrupt: a bitmap that
-// unmarshals cleanly can still hold a run past 65535, which the set
-// operations reject by panicking and Validate would only catch in time
-// quadratic in the runs.
+// recoverCorrupt turns a panic in roaring into ErrCorrupt: Validate does
+// not catch every malformed run, and the set operations reject those by
+// panicking.
 func recoverCorrupt(err *error) {
 	if r := recover(); r != nil {
 		*err = fmt.Errorf("%w: set operation: %v", ErrCorrupt, r)

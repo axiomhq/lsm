@@ -2,6 +2,7 @@ package lsm
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"sort"
 )
@@ -318,3 +319,24 @@ func (s *entriesIter) Key() []byte   { return s.entries[s.i].Key }
 func (s *entriesIter) Kind() Kind    { return s.entries[s.i].Kind }
 func (s *entriesIter) Value() []byte { return s.entries[s.i].Value }
 func (s *entriesIter) Err() error    { return nil }
+
+// named is an open table with its object key, so an error read through
+// its iterator names the object.
+type named struct {
+	key string
+	t   *Table
+}
+
+func (n named) iter(ctx context.Context) Iterator { return &namedIter{n.t.Iter(ctx), n.key} }
+
+type namedIter struct {
+	*TableIter
+	key string
+}
+
+func (it *namedIter) Err() error {
+	if err := it.TableIter.Err(); err != nil {
+		return fmt.Errorf("lsm: %s: %w", it.key, err)
+	}
+	return nil
+}

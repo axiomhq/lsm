@@ -50,14 +50,16 @@ func (o Options) withDefaults() Options {
 	if o.FileBytes <= 0 || o.FileBytes > MaxTableBytes {
 		o.FileBytes = d.FileBytes
 	}
-	if o.BlockBytes <= 0 {
+	if o.BlockBytes <= 0 || o.BlockBytes > maxBlockRaw {
 		o.BlockBytes = d.BlockBytes
 	}
 	return o
 }
 
 // Putter stores one table and returns its object key. seq names it
-// uniquely within the namespace.
+// uniquely within the namespace. Compact calls it from up to
+// Options.Workers goroutines at once, so it must be safe for concurrent
+// use, or Workers must be 1.
 type Putter func(ctx context.Context, level int, seq uint64, data []byte) (string, error)
 
 // Flush writes sorted, unique entries as one level-0 file and returns the
@@ -256,16 +258,16 @@ func (v Version) job(level int, inputs []FileRef, o Options) Job {
 // the files already published: orphans the caller may delete.
 func Compact(ctx context.Context, v Version, j Job, o Options, r Reader, put Putter) (Version, Edit, error) {
 	o = o.withDefaults()
-	inputs := make([]*Table, len(j.Inputs))
+	inputs := make([]named, len(j.Inputs))
 	for i, f := range j.Inputs {
 		t, err := r.Open(ctx, f)
 		if err != nil {
 			return Version{}, Edit{}, fmt.Errorf("lsm: open %s: %w", f.Key, err)
 		}
-		inputs[i] = t
+		inputs[i] = named{f.Key, t}
 	}
 	var touched []FileRef
-	overlaps := make([]*Table, len(j.Overlap))
+	overlaps := make([]*named, len(j.Overlap))
 	for i, f := range j.Overlap {
 		// A small file also takes its space's input keys in the gap after
 		// it, so a space's tail grows onto its last file until that file
@@ -285,7 +287,7 @@ func Compact(ctx context.Context, v Version, j Job, o Options, r Reader, put Put
 		if err != nil {
 			return Version{}, Edit{}, fmt.Errorf("lsm: open %s: %w", f.Key, err)
 		}
-		overlaps[i] = t
+		overlaps[i] = &named{f.Key, t}
 		touched = append(touched, f)
 	}
 	// The partitions, in key order, each a run of consecutive touched
@@ -355,7 +357,7 @@ func Compact(ctx context.Context, v Version, j Job, o Options, r Reader, put Put
 // touched overlap files in [lo, hi), written to its own output files.
 type partition struct {
 	lo, hi   []byte
-	overlaps []*Table
+	overlaps []*named
 }
 
 // compaction is the state Compact's partitions share.
@@ -364,7 +366,7 @@ type compaction struct {
 	j       Job
 	r       Reader
 	put     Putter
-	inputs  []*Table
+	inputs  []named
 	seq     atomic.Uint64
 	outputs [][]FileRef // per partition; only its own goroutine writes it
 }
@@ -373,10 +375,10 @@ type compaction struct {
 func (c *compaction) writePartition(ctx context.Context, pi int, p partition) error {
 	its := make([]Iterator, 0, len(c.inputs)+len(p.overlaps))
 	for _, t := range c.inputs {
-		its = append(its, Bound(t.Iter(ctx), nil, p.hi))
+		its = append(its, Bound(t.iter(ctx), nil, p.hi))
 	}
 	for _, t := range p.overlaps {
-		its = append(its, Bound(t.Iter(ctx), nil, p.hi))
+		its = append(its, Bound(t.iter(ctx), nil, p.hi))
 	}
 	in := Resolve(NewMerge(its...), c.r.Merger, c.j.Bottom)
 	var w *TableWriter

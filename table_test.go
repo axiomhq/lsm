@@ -169,7 +169,11 @@ func TestTableRejectsCorruption(t *testing.T) {
 	footer := meta.IndexOff + meta.IndexLen
 	corrupt("footer crc", func(d []byte) []byte { d[footer+24] ^= 1; return d }, false)
 	corrupt("footer index offset", func(d []byte) []byte { d[footer+7] ^= 1; return d }, false)
-	corrupt("magic", func(d []byte) []byte { d[len(d)-1] = 'x'; return d }, false)
+	unknown := bytes.Clone(data)
+	copy(unknown[len(unknown)-4:], "LSM9")
+	if _, err := OpenTableAt(ctx, BytesSource(unknown), meta); !errors.Is(err, ErrUnsupportedFormat) || errors.Is(err, ErrCorrupt) {
+		t.Fatalf("unknown magic: %v, want ErrUnsupportedFormat and not ErrCorrupt", err)
+	}
 	for name, bad := range map[string]func(m *TableMeta){
 		"zero index length":  func(m *TableMeta) { m.IndexLen = 0 },
 		"index offset past":  func(m *TableMeta) { m.IndexOff = math.MaxInt64 },
@@ -205,8 +209,8 @@ func footerFor(off int64, idx []byte, count int64) []byte {
 	return append(f, tableMagic...)
 }
 
-// TestLegacyMagicOpens: a table written before the magic changed to LSM1
-// has the same layout and still opens.
+// TestLegacyMagicOpens: a table written through v0.3.0, before the magic
+// changed to LSM1, has the same layout and still opens.
 func TestLegacyMagicOpens(t *testing.T) {
 	data, meta, err := BuildTable(putEntries(randKeys(rand.New(rand.NewPCG(9, 9)), 50, 'L')), 512)
 	if err != nil {
@@ -415,4 +419,31 @@ func FuzzDecodeBlock(f *testing.F) {
 			}
 		}
 	})
+}
+
+// TestLargeBlockBytesReopens: a writer asked for blocks past what a reader
+// accepts clamps them, so every table it finishes opens; an entry too big
+// for any block is refused up front.
+func TestLargeBlockBytesReopens(t *testing.T) {
+	w := NewTableWriter(1 << 30)
+	val := bytes.Repeat([]byte("x"), 1<<20) // compressible: the table stays small
+	for i := range 40 {
+		if err := w.Add(Entry{Key: fmt.Appendf(nil, "K%03d", i), Kind: KindPut, Value: val}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data, meta, err := w.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tb, err := OpenTableAt(context.Background(), BytesSource(data), meta)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if n := len(collect(t, tb.Iter(context.Background()))); n != 40 {
+		t.Fatalf("%d entries", n)
+	}
+	if err := NewTableWriter(0).Add(Entry{Key: []byte("k"), Kind: KindPut, Value: make([]byte, maxBlockRaw)}); err == nil {
+		t.Fatal("oversized entry accepted")
+	}
 }
