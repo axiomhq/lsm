@@ -51,11 +51,8 @@ func TestLargeValuesGetTheirOwnBlocks(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if blk.stored {
+		if data[bi.off+4] == blockStored {
 			stored++
-			if blk.Bytes() != 4*len(blk.offs) {
-				t.Fatalf("stored block charged %d bytes", blk.Bytes())
-			}
 		} else {
 			zstd++
 		}

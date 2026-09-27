@@ -72,15 +72,14 @@ func TestTableRoundTrip(t *testing.T) {
 	}
 	ctx := context.Background()
 	for name, open := range map[string]func() (*Table, error){
-		"footer": func() (*Table, error) { return OpenTable(ctx, BytesSource(data), int64(len(data))) },
-		"meta":   func() (*Table, error) { return OpenTableAt(ctx, BytesSource(data), meta) },
+		"meta": func() (*Table, error) { return OpenTableAt(ctx, BytesSource(data), meta) },
 	} {
 		tb, err := open()
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
-		if tb.Blocks() < 50 {
-			t.Fatalf("%s: %d blocks for 5000 entries at 1 KiB", name, tb.Blocks())
+		if len(tb.index) < 50 {
+			t.Fatalf("%s: %d blocks for 5000 entries at 1 KiB", name, len(tb.index))
 		}
 		if got := collect(t, tb.Iter(ctx)); !sameEntries(got, entries) {
 			t.Fatalf("%s: iteration differs (%d vs %d)", name, len(got), len(entries))
@@ -145,7 +144,7 @@ func TestTableRejectsCorruption(t *testing.T) {
 	corrupt := func(name string, mutate func([]byte) []byte, wantOpen bool) {
 		t.Helper()
 		d := mutate(bytes.Clone(data))
-		tb, err := OpenTable(ctx, BytesSource(d), int64(len(d)))
+		tb, err := OpenTableAt(ctx, BytesSource(d), meta)
 		if err != nil {
 			if wantOpen || !errors.Is(err, ErrCorrupt) {
 				t.Fatalf("%s: open: %v", name, err)
@@ -165,14 +164,16 @@ func TestTableRejectsCorruption(t *testing.T) {
 	corrupt("block byte", func(d []byte) []byte { d[meta.IndexOff/2] ^= 0x40; return d }, true)
 	corrupt("block crc", func(d []byte) []byte { d[0] ^= 1; return d }, true)
 	corrupt("index byte", func(d []byte) []byte { d[meta.IndexOff+3] ^= 1; return d }, false)
-	corrupt("truncated", func(d []byte) []byte { return d[:len(d)-1] }, false)
-	corrupt("magic", func(d []byte) []byte { d[len(d)-1] = 'x'; return d }, false)
-	corrupt("index length", func(d []byte) []byte {
-		binary.BigEndian.PutUint64(d[len(d)-24:], uint64(meta.IndexLen+1))
-		return d
-	}, false)
-	if _, err := OpenTable(ctx, BytesSource(data[:10]), 10); !errors.Is(err, ErrCorrupt) {
-		t.Fatalf("short table: %v", err)
+	corrupt("truncated index", func(d []byte) []byte { return d[:meta.IndexOff+meta.IndexLen-1] }, false)
+	bad := meta
+	bad.IndexCRC ^= 1
+	if _, err := OpenTableAt(ctx, BytesSource(data), bad); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("wrong index crc: %v", err)
+	}
+	bad = meta
+	bad.IndexLen = 0
+	if _, err := OpenTableAt(ctx, BytesSource(data), bad); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("zero index length: %v", err)
 	}
 }
 
@@ -203,18 +204,25 @@ func TestTableSpaces(t *testing.T) {
 	}
 }
 
+// FuzzOpenTable feeds the index decoder: the fuzzed bytes are the index of
+// a table whose blocks are the seed's, with the CRC recomputed so the
+// structural checks, not the checksum, are what is exercised.
 func FuzzOpenTable(f *testing.F) {
 	rng := rand.New(rand.NewPCG(7, 8))
-	data, _, err := BuildTable(putEntries(randKeys(rng, 200, 'F')), 512)
+	data, meta, err := BuildTable(putEntries(randKeys(rng, 200, 'F')), 512)
 	if err != nil {
 		f.Fatal(err)
 	}
-	f.Add(data)
-	f.Add(data[:len(data)/2])
-	f.Fuzz(func(t *testing.T, d []byte) {
+	blocks := data[:meta.IndexOff]
+	f.Add(data[meta.IndexOff : meta.IndexOff+meta.IndexLen])
+	f.Fuzz(func(t *testing.T, idx []byte) {
 		ctx := context.Background()
-		tb, err := OpenTable(ctx, BytesSource(d), int64(len(d)))
+		m := TableMeta{IndexOff: int64(len(blocks)), IndexLen: int64(len(idx)), IndexCRC: crc32.Checksum(idx, castagnoli)}
+		tb, err := OpenTableAt(ctx, BytesSource(slices.Concat(blocks, idx)), m)
 		if err != nil {
+			if !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("error %v does not wrap ErrCorrupt", err)
+			}
 			return
 		}
 		it := tb.Iter(ctx)
@@ -316,9 +324,8 @@ func TestSingleDeclinesAPackedBlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m, err := tb.BlockModes(context.Background())
-	if err != nil || tb.Blocks() != 1 || m.Stored != 1 || m.Zstd != 0 {
-		t.Fatalf("%d blocks, %d stored %d zstd (%v): want one stored block", tb.Blocks(), m.Stored, m.Zstd, err)
+	if len(tb.index) != 1 || data[tb.index[0].off+4] != blockStored {
+		t.Fatalf("%d blocks, mode %d: want one stored block", len(tb.index), data[tb.index[0].off+4])
 	}
 	for _, k := range keys {
 		if _, _, ok := tb.Single(k); ok {

@@ -124,7 +124,7 @@ func (m *memStore) open(ctx context.Context, f FileRef) (*Table, error) {
 	if !ok {
 		return nil, fmt.Errorf("missing object %s", f.Key)
 	}
-	return OpenTableAt(ctx, BytesSource(data), f.Meta())
+	return OpenTableAt(ctx, BytesSource(data), f.TableMeta)
 }
 
 func (m *memStore) reader() Reader { return Reader{Open: m.open, Merger: setmerge.Merger{}} }
@@ -321,7 +321,7 @@ func TestVersionMatchesModel(t *testing.T) {
 				}
 			}
 			var raw int
-			for _, f := range v.Files() {
+			for _, f := range slices.Concat(v.Levels...) {
 				tb, err := st.open(ctx, f)
 				if err != nil {
 					t.Fatal(err)
@@ -343,7 +343,7 @@ func TestVersionMatchesModel(t *testing.T) {
 func TestPickAndApplyInvariants(t *testing.T) {
 	o := Options{L0Trigger: 2, LevelRatio: 2, BaseBytes: 100, FileBytes: 1 << 20}
 	f := func(seq uint64, lo, hi string, n int64) FileRef {
-		return FileRef{Key: fmt.Sprint("f", seq), Seq: seq, Min: []byte(lo), Max: []byte(hi), Bytes: n}
+		return FileRef{Key: fmt.Sprint("f", seq), Seq: seq, TableMeta: TableMeta{Min: []byte(lo), Max: []byte(hi), Bytes: n}}
 	}
 	v, err := Version{}.Apply(Edit{Add: map[int][]FileRef{0: {f(1, "a", "m", 10)}}})
 	if err != nil || v.NextSeq != 2 {
@@ -549,7 +549,7 @@ func TestMalformedOperandIsCorrupt(t *testing.T) {
 // alone, one inside changes it, and no overlap at all is not ok.
 func TestVersionSignature(t *testing.T) {
 	f := func(seq uint64, lo, hi string) FileRef {
-		return FileRef{Key: fmt.Sprint("f", seq), Seq: seq, Min: []byte(lo), Max: []byte(hi)}
+		return FileRef{Key: fmt.Sprint("f", seq), Seq: seq, TableMeta: TableMeta{Min: []byte(lo), Max: []byte(hi)}}
 	}
 	r := [2][]byte{[]byte("b"), []byte("d")}
 	v, _ := Version{}.Apply(Edit{Add: map[int][]FileRef{1: {f(1, "a", "c")}}})

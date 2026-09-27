@@ -19,7 +19,7 @@ func build(ctx context.Context) (lsm.Version, lsm.Reader) {
 		return key, nil
 	}
 	open := func(ctx context.Context, f lsm.FileRef) (*lsm.Table, error) {
-		return lsm.OpenTableAt(ctx, lsm.BytesSource(objects[f.Key]), f.Meta())
+		return lsm.OpenTableAt(ctx, lsm.BytesSource(objects[f.Key]), f.TableMeta)
 	}
 	r := lsm.Reader{Open: open, Merger: setmerge.Merger{}}
 	o := lsm.DefaultOptions()

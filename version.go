@@ -10,23 +10,13 @@ import (
 	"slices"
 )
 
-// FileRef names one table in the manifest with what a reader needs to
-// prune and open it without touching it.
+// FileRef names one table in the manifest: its object key, its sequence
+// (allocation order; level-0 precedence) and what the writer learned about
+// it, which a reader prunes and opens by without touching the object.
 type FileRef struct {
-	Key      string       `json:"key"`
-	Seq      uint64       `json:"seq"` // allocation order; L0 precedence
-	Min      []byte       `json:"min"`
-	Max      []byte       `json:"max"`
-	Bytes    int64        `json:"bytes"`
-	Count    int64        `json:"count"`
-	IndexOff int64        `json:"index_off"`
-	IndexLen int64        `json:"index_len"`
-	Spaces   []SpaceRange `json:"spaces,omitempty"`
-}
-
-// Meta is the TableMeta a reader opens the table with.
-func (f FileRef) Meta() TableMeta {
-	return TableMeta{Min: f.Min, Max: f.Max, Count: f.Count, Bytes: f.Bytes, IndexOff: f.IndexOff, IndexLen: f.IndexLen, Spaces: f.Spaces}
+	Key string
+	Seq uint64
+	TableMeta
 }
 
 // Overlaps reports whether the file's key range meets [lo, hi); nil lo or
@@ -42,17 +32,8 @@ func (f FileRef) Overlaps(lo, hi []byte) bool {
 // newest first and its files overlap; every later level is sorted by Min
 // with disjoint ranges. NextSeq names the next file.
 type Version struct {
-	Levels  [][]FileRef `json:"levels,omitempty"`
-	NextSeq uint64      `json:"next_seq,omitempty"`
-}
-
-// Files is every file, level 0 first.
-func (v Version) Files() []FileRef {
-	var out []FileRef
-	for _, l := range v.Levels {
-		out = append(out, l...)
-	}
-	return out
+	Levels  [][]FileRef
+	NextSeq uint64
 }
 
 // Overlapping is the files whose range meets [lo, hi), newest first: level
@@ -181,20 +162,6 @@ func (v Version) Rebase(base Version, e Edit) (Version, error) {
 		}
 	}
 	return v.Apply(e)
-}
-
-// Equal reports whether two versions name the same files in the same
-// places.
-func (v Version) Equal(o Version) bool {
-	if v.NextSeq != o.NextSeq || len(v.Levels) != len(o.Levels) {
-		return false
-	}
-	for l := range v.Levels {
-		if !slices.EqualFunc(v.Levels[l], o.Levels[l], func(a, b FileRef) bool { return a.Key == b.Key && a.Seq == b.Seq }) {
-			return false
-		}
-	}
-	return true
 }
 
 // Opener opens a file's table.

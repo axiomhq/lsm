@@ -6,9 +6,8 @@ import (
 	"fmt"
 	"runtime"
 	"sort"
+	"sync"
 	"sync/atomic"
-
-	"golang.org/x/sync/errgroup"
 )
 
 // Options sizes the levels.
@@ -81,8 +80,7 @@ func publish(ctx context.Context, level int, seq uint64, data []byte, meta Table
 	if err != nil {
 		return FileRef{}, err
 	}
-	return FileRef{Key: key, Seq: seq, Min: meta.Min, Max: meta.Max, Bytes: meta.Bytes, Count: meta.Count,
-		IndexOff: meta.IndexOff, IndexLen: meta.IndexLen, Spaces: meta.Spaces}, nil
+	return FileRef{Key: key, Seq: seq, TableMeta: meta}, nil
 }
 
 // Job is one compaction: Inputs from Level merged with Overlap from
@@ -202,8 +200,8 @@ func (v Version) overlapIn(level int, lo, hi []byte) []FileRef {
 	return out
 }
 
+// job plans the compaction of inputs at level; o has its defaults filled.
 func (v Version) job(level int, inputs []FileRef, o Options) Job {
-	o = o.withDefaults()
 	lo, hi := keyRange(inputs)
 	hi = afterMax(hi)
 	j := Job{Level: level, Inputs: inputs, Overlap: v.overlapIn(level+1, lo, hi), Bottom: true}
@@ -320,69 +318,79 @@ func Compact(ctx context.Context, v Version, j Job, o Options, r Reader, put Put
 	seq := atomic.Uint64{}
 	seq.Store(v.NextSeq)
 	outputs := make([][]FileRef, len(parts))
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(o.workers())
+	// Partitions run o.workers() at a time; the first error cancels the rest.
+	gctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, o.workers())
 	for pi, p := range parts {
-		g.Go(func() error {
-			its := make([]Iterator, 0, len(inputs)+len(p.overlaps))
-			for _, t := range inputs {
-				its = append(its, Bound(t.Iter(gctx), nil, p.hi))
-			}
-			for _, t := range p.overlaps {
-				its = append(its, Bound(t.Iter(gctx), nil, p.hi))
-			}
-			in := Resolve(NewMerge(its...), r.Merger, j.Bottom)
-			var w *TableWriter
-			finish := func() error {
-				if w == nil {
+		sem <- struct{}{}
+		wg.Go(func() {
+			defer func() { <-sem }()
+			if err := func() error {
+				its := make([]Iterator, 0, len(inputs)+len(p.overlaps))
+				for _, t := range inputs {
+					its = append(its, Bound(t.Iter(gctx), nil, p.hi))
+				}
+				for _, t := range p.overlaps {
+					its = append(its, Bound(t.Iter(gctx), nil, p.hi))
+				}
+				in := Resolve(NewMerge(its...), r.Merger, j.Bottom)
+				var w *TableWriter
+				finish := func() error {
+					if w == nil {
+						return nil
+					}
+					data, meta, err := w.Finish()
+					if err != nil {
+						return err
+					}
+					f, err := publish(gctx, j.Level+1, seq.Add(1)-1, data, meta, put)
+					if err != nil {
+						return err
+					}
+					outputs[pi] = append(outputs[pi], f)
+					w = nil
 					return nil
 				}
-				data, meta, err := w.Finish()
-				if err != nil {
-					return err
-				}
-				f, err := publish(gctx, j.Level+1, seq.Add(1)-1, data, meta, put)
-				if err != nil {
-					return err
-				}
-				outputs[pi] = append(outputs[pi], f)
-				w = nil
-				return nil
-			}
-			var space byte
-			for ok := in.SeekGE(p.lo); ok; ok = in.Next() {
-				if err := gctx.Err(); err != nil {
-					return err
-				}
-				// A key space starts a file: the next round's untouched
-				// check (receives) can then leave a space no input writes
-				// to, where a file shared with a busy space is rewritten
-				// with it.
-				if w != nil && in.Key()[0] != space {
-					if err := finish(); err != nil {
+				var space byte
+				for ok := in.SeekGE(p.lo); ok; ok = in.Next() {
+					if err := gctx.Err(); err != nil {
 						return err
 					}
-				}
-				if w == nil {
-					w = NewTableWriter(o.BlockBytes)
-					space = in.Key()[0]
-				}
-				if err := w.Add(Entry{Key: in.Key(), Kind: in.Kind(), Value: in.Value()}); err != nil {
-					return err
-				}
-				if w.Bytes() >= o.FileBytes {
-					if err := finish(); err != nil {
+					// A key space starts a file: the next round's untouched
+					// check (receives) can then leave a space no input writes
+					// to, where a file shared with a busy space is rewritten
+					// with it.
+					if w != nil && in.Key()[0] != space {
+						if err := finish(); err != nil {
+							return err
+						}
+					}
+					if w == nil {
+						w = NewTableWriter(o.BlockBytes)
+						space = in.Key()[0]
+					}
+					if err := w.Add(Entry{Key: in.Key(), Kind: in.Kind(), Value: in.Value()}); err != nil {
 						return err
 					}
+					if w.Bytes() >= o.FileBytes {
+						if err := finish(); err != nil {
+							return err
+						}
+					}
 				}
+				if err := in.Err(); err != nil {
+					return err
+				}
+				return finish()
+			}(); err != nil {
+				cancel(err)
 			}
-			if err := in.Err(); err != nil {
-				return err
-			}
-			return finish()
 		})
 	}
-	if err := g.Wait(); err != nil {
+	wg.Wait()
+	if err := context.Cause(gctx); err != nil {
 		return Version{}, Edit{}, err
 	}
 	e := Edit{Add: map[int][]FileRef{}}

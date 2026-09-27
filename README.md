@@ -21,7 +21,7 @@ For bytes without levels, `data, meta, err := lsm.BuildTable(entries, lsm.Defaul
 
 ## Read
 
-1. Write an `Opener`: `func(ctx, f lsm.FileRef) (*lsm.Table, error)`. Inside, call `lsm.OpenTableAt(ctx, src, f.Meta())`.
+1. Write an `Opener`: `func(ctx, f lsm.FileRef) (*lsm.Table, error)`. Inside, call `lsm.OpenTableAt(ctx, src, f.TableMeta)`.
    `src` implements `ReadAt(ctx, off, length int64) ([]byte, error)`. Use `lsm.BytesSource(data)` for bytes in memory.
 2. Build a reader: `r := lsm.Reader{Open: open, Merger: setmerge.Merger{}}`.
 3. Point read: `value, ok, err := r.Get(ctx, v, key)`.
@@ -53,7 +53,7 @@ Rebase holds when the only other writer adds level-0 files (`Flush`).
 | --- | --- |
 | block | crc32c u32, mode byte (0 zstd, 1 stored), payload; raw is uvarint(count), then per entry uvarint(len key) key, kind byte, uvarint(len value) value |
 | index | uvarint(blocks), then per block offset, length, raw length, first key, last key (all uvarint-framed) |
-| footer | 32 bytes: index offset u64, index length u64, entry count u64, crc32c(index) u32, magic `LSM1` |
+| footer | 32 bytes: index offset u64, index length u64, entry count u64, crc32c(index) u32, magic `LSM1`. Written for identification; readers open through the manifest's `TableMeta`, which carries the index position and `IndexCRC` |
 
 Blocks close at 64 KiB raw (`DefaultBlockBytes`). A value of 4 KiB or more
 (`LargeValueBytes`) is a block of its own, so a point read decodes only that
