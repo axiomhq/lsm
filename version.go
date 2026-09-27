@@ -12,10 +12,12 @@ import (
 
 // FileRef names one table in the manifest: its object key, its sequence
 // (allocation order; level-0 precedence) and what the writer learned about
-// it, which a reader prunes and opens by without touching the object.
+// it, which a reader prunes and opens by without touching the object. The
+// json names are the manifest encoding and are stable; a manifest written
+// by any earlier version decodes.
 type FileRef struct {
-	Key string
-	Seq uint64
+	Key string `json:"key"`
+	Seq uint64 `json:"seq"`
 	TableMeta
 }
 
@@ -32,8 +34,8 @@ func (f FileRef) Overlaps(lo, hi []byte) bool {
 // newest first and its files overlap; every later level is sorted by Min
 // with disjoint ranges. NextSeq names the next file.
 type Version struct {
-	Levels  [][]FileRef
-	NextSeq uint64
+	Levels  [][]FileRef `json:"levels,omitempty"`
+	NextSeq uint64      `json:"next_seq,omitempty"`
 }
 
 // Overlapping is the files whose range meets [lo, hi), newest first: level
@@ -279,7 +281,11 @@ func (r Reader) Locate(ctx context.Context, v Version, key []byte) (l Located, o
 func (r Reader) getIn(ctx context.Context, f FileRef, key []byte) (Entry, bool, error) {
 	t, err := r.Open(ctx, f)
 	if err != nil {
-		return Entry{}, false, err
+		return Entry{}, false, fmt.Errorf("lsm: open %s: %w", f.Key, err)
 	}
-	return t.Get(ctx, key)
+	e, ok, err := t.Get(ctx, key)
+	if err != nil {
+		return Entry{}, false, fmt.Errorf("lsm: %s: %w", f.Key, err)
+	}
+	return e, ok, nil
 }

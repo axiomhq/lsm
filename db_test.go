@@ -3,10 +3,12 @@ package lsm
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand/v2"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 
@@ -612,5 +614,68 @@ func TestReaderLocate(t *testing.T) {
 	}
 	if _, _, err := r.Locate(ctx, v, []byte("op")); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("op: %v, want ErrCorrupt", err)
+	}
+}
+
+// TestManifestEncodingIsStable: a manifest written by v0.2.0, whose json
+// names are the encoding every later version promises, decodes with every
+// field in place.
+func TestManifestEncodingIsStable(t *testing.T) {
+	const old = `{"levels":[[{"key":"sst/0-000007","seq":7,"min":"YQ==","max":"eg==","bytes":1234,"count":9,
+		"index_off":1100,"index_len":102,"spaces":[{"space":97,"min":"YQ==","max":"eg=="}]}]],"next_seq":8}`
+	var v Version
+	if err := json.Unmarshal([]byte(old), &v); err != nil {
+		t.Fatal(err)
+	}
+	f := v.Levels[0][0]
+	if v.NextSeq != 8 || f.Key != "sst/0-000007" || f.Seq != 7 || f.IndexOff != 1100 || f.IndexLen != 102 || f.Count != 9 || f.Bytes != 1234 ||
+		string(f.Min) != "a" || len(f.Spaces) != 1 || f.Spaces[0].Space != 'a' {
+		t.Fatalf("decoded %+v", v)
+	}
+	out, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{`"key"`, `"seq"`, `"index_off"`, `"index_len"`, `"next_seq"`, `"spaces"`} {
+		if !bytes.Contains(out, []byte(name)) {
+			t.Fatalf("encoding lost %s: %s", name, out)
+		}
+	}
+}
+
+// TestCompactReportsOrphansOnFailure: a Putter that fails part way leaves
+// the files already published listed in the returned Edit, and the error
+// names the level and sequence that failed.
+func TestCompactReportsOrphansOnFailure(t *testing.T) {
+	ctx := context.Background()
+	st := newMemStore()
+	o := Options{L0Trigger: 2, LevelRatio: 3, BaseBytes: 20 << 10, FileBytes: 1 << 10, BlockBytes: 256, Workers: 1}
+	rng := rand.New(rand.NewPCG(5, 5))
+	m := model{}
+	var v Version
+	var err error
+	for range 6 {
+		if v, _, err = Flush(ctx, v, randBatch(rng, randKeys(rng, 200, 'K'), m), o, st.put); err != nil {
+			t.Fatal(err)
+		}
+	}
+	boom := errors.New("boom")
+	puts := 0
+	failing := func(ctx context.Context, level int, seq uint64, data []byte) (string, error) {
+		puts++
+		if puts == 2 {
+			return "", boom
+		}
+		return st.put(ctx, level, seq, data)
+	}
+	_, e, err := Compact(ctx, v, v.job(0, v.Levels[0], o), o, st.reader(), failing)
+	if !errors.Is(err, boom) || !strings.Contains(err.Error(), "put level 1 seq") {
+		t.Fatalf("error %v", err)
+	}
+	if len(e.Add[1]) != 1 || len(e.Del) != 0 {
+		t.Fatalf("edit after failure %+v, want the one published file and no deletes", e)
+	}
+	if _, ok := st.objects[e.Add[1][0].Key]; !ok {
+		t.Fatalf("orphan %s not in the store", e.Add[1][0].Key)
 	}
 }

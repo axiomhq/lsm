@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -78,7 +79,7 @@ func Flush(ctx context.Context, v Version, entries []Entry, o Options, put Putte
 func publish(ctx context.Context, level int, seq uint64, data []byte, meta TableMeta, put Putter) (FileRef, error) {
 	key, err := put(ctx, level, seq, data)
 	if err != nil {
-		return FileRef{}, err
+		return FileRef{}, fmt.Errorf("lsm: put level %d seq %d: %w", level, seq, err)
 	}
 	return FileRef{Key: key, Seq: seq, TableMeta: meta}, nil
 }
@@ -251,14 +252,15 @@ func (v Version) job(level int, inputs []FileRef, o Options) Job {
 // goes; the caller publishes the version, and a crash before that leaves
 // only orphan objects. The returned Edit is the change from v (inputs and
 // rewritten overlap deleted, outputs added), for a caller that publishes
-// it over a newer version (Version.Rebase).
+// it over a newer version (Version.Rebase). On error the Edit's Add lists
+// the files already published: orphans the caller may delete.
 func Compact(ctx context.Context, v Version, j Job, o Options, r Reader, put Putter) (Version, Edit, error) {
 	o = o.withDefaults()
 	inputs := make([]*Table, len(j.Inputs))
 	for i, f := range j.Inputs {
 		t, err := r.Open(ctx, f)
 		if err != nil {
-			return Version{}, Edit{}, err
+			return Version{}, Edit{}, fmt.Errorf("lsm: open %s: %w", f.Key, err)
 		}
 		inputs[i] = t
 	}
@@ -281,7 +283,7 @@ func Compact(ctx context.Context, v Version, j Job, o Options, r Reader, put Put
 		}
 		t, err := r.Open(ctx, f)
 		if err != nil {
-			return Version{}, Edit{}, err
+			return Version{}, Edit{}, fmt.Errorf("lsm: open %s: %w", f.Key, err)
 		}
 		overlaps[i] = t
 		touched = append(touched, f)
@@ -292,10 +294,6 @@ func Compact(ctx context.Context, v Version, j Job, o Options, r Reader, put Put
 	// wide, never so many that every round leaves a smaller file behind. An
 	// untouched file ends the partition before it and the next starts after
 	// it, so no output spans it.
-	type partition struct {
-		lo, hi   []byte
-		overlaps []*Table
-	}
 	var parts []partition
 	cur := partition{}
 	var curBytes int64
@@ -315,9 +313,8 @@ func Compact(ctx context.Context, v Version, j Job, o Options, r Reader, put Put
 		curBytes += f.Bytes
 	}
 	parts = append(parts, cur)
-	seq := atomic.Uint64{}
-	seq.Store(v.NextSeq)
-	outputs := make([][]FileRef, len(parts))
+	c := &compaction{o: o, j: j, r: r, put: put, inputs: inputs, outputs: make([][]FileRef, len(parts))}
+	c.seq.Store(v.NextSeq)
 	// Partitions run o.workers() at a time; the first error cancels the rest.
 	gctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
@@ -327,88 +324,106 @@ func Compact(ctx context.Context, v Version, j Job, o Options, r Reader, put Put
 		sem <- struct{}{}
 		wg.Go(func() {
 			defer func() { <-sem }()
-			if err := func() error {
-				its := make([]Iterator, 0, len(inputs)+len(p.overlaps))
-				for _, t := range inputs {
-					its = append(its, Bound(t.Iter(gctx), nil, p.hi))
-				}
-				for _, t := range p.overlaps {
-					its = append(its, Bound(t.Iter(gctx), nil, p.hi))
-				}
-				in := Resolve(NewMerge(its...), r.Merger, j.Bottom)
-				var w *TableWriter
-				finish := func() error {
-					if w == nil {
-						return nil
-					}
-					data, meta, err := w.Finish()
-					if err != nil {
-						return err
-					}
-					f, err := publish(gctx, j.Level+1, seq.Add(1)-1, data, meta, put)
-					if err != nil {
-						return err
-					}
-					outputs[pi] = append(outputs[pi], f)
-					w = nil
-					return nil
-				}
-				var space byte
-				for ok := in.SeekGE(p.lo); ok; ok = in.Next() {
-					if err := gctx.Err(); err != nil {
-						return err
-					}
-					// A key space starts a file: the next round's untouched
-					// check (receives) can then leave a space no input writes
-					// to, where a file shared with a busy space is rewritten
-					// with it.
-					if w != nil && in.Key()[0] != space {
-						if err := finish(); err != nil {
-							return err
-						}
-					}
-					if w == nil {
-						w = NewTableWriter(o.BlockBytes)
-						space = in.Key()[0]
-					}
-					if err := w.Add(Entry{Key: in.Key(), Kind: in.Kind(), Value: in.Value()}); err != nil {
-						return err
-					}
-					if w.Bytes() >= o.FileBytes {
-						if err := finish(); err != nil {
-							return err
-						}
-					}
-				}
-				if err := in.Err(); err != nil {
-					return err
-				}
-				return finish()
-			}(); err != nil {
+			if err := c.writePartition(gctx, pi, p); err != nil {
 				cancel(err)
 			}
 		})
 	}
 	wg.Wait()
+	published := Edit{Add: map[int][]FileRef{j.Level + 1: slices.Concat(c.outputs...)}}
 	if err := context.Cause(gctx); err != nil {
-		return Version{}, Edit{}, err
+		return Version{}, published, err
 	}
-	e := Edit{Add: map[int][]FileRef{}}
+	e := published
 	for _, f := range j.Inputs {
 		e.Del = append(e.Del, f.Key)
 	}
 	for _, f := range touched {
 		e.Del = append(e.Del, f.Key)
 	}
-	for _, out := range outputs {
-		e.Add[j.Level+1] = append(e.Add[j.Level+1], out...)
-	}
 	next, err := v.Apply(e)
 	if err != nil {
-		return Version{}, Edit{}, fmt.Errorf("lsm: compaction of level %d: %w", j.Level, err)
+		return Version{}, published, fmt.Errorf("lsm: compaction of level %d: %w", j.Level, err)
 	}
-	if next.NextSeq < seq.Load() {
-		next.NextSeq = seq.Load()
+	if next.NextSeq < c.seq.Load() {
+		next.NextSeq = c.seq.Load()
 	}
 	return next, e, nil
+}
+
+// partition is one independent merge of a compaction: the inputs and the
+// touched overlap files in [lo, hi), written to its own output files.
+type partition struct {
+	lo, hi   []byte
+	overlaps []*Table
+}
+
+// compaction is the state Compact's partitions share.
+type compaction struct {
+	o       Options
+	j       Job
+	r       Reader
+	put     Putter
+	inputs  []*Table
+	seq     atomic.Uint64
+	outputs [][]FileRef // per partition; only its own goroutine writes it
+}
+
+// writePartition merges partition pi and publishes its files as it goes.
+func (c *compaction) writePartition(ctx context.Context, pi int, p partition) error {
+	its := make([]Iterator, 0, len(c.inputs)+len(p.overlaps))
+	for _, t := range c.inputs {
+		its = append(its, Bound(t.Iter(ctx), nil, p.hi))
+	}
+	for _, t := range p.overlaps {
+		its = append(its, Bound(t.Iter(ctx), nil, p.hi))
+	}
+	in := Resolve(NewMerge(its...), c.r.Merger, c.j.Bottom)
+	var w *TableWriter
+	finish := func() error {
+		if w == nil {
+			return nil
+		}
+		data, meta, err := w.Finish()
+		if err != nil {
+			return err
+		}
+		f, err := publish(ctx, c.j.Level+1, c.seq.Add(1)-1, data, meta, c.put)
+		if err != nil {
+			return err
+		}
+		c.outputs[pi] = append(c.outputs[pi], f)
+		w = nil
+		return nil
+	}
+	var space byte
+	for ok := in.SeekGE(p.lo); ok; ok = in.Next() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		// A key space starts a file: the next round's untouched check
+		// (receives) can then leave a space no input writes to, where a
+		// file shared with a busy space is rewritten with it.
+		if w != nil && in.Key()[0] != space {
+			if err := finish(); err != nil {
+				return err
+			}
+		}
+		if w == nil {
+			w = NewTableWriter(c.o.BlockBytes)
+			space = in.Key()[0]
+		}
+		if err := w.Add(Entry{Key: in.Key(), Kind: in.Kind(), Value: in.Value()}); err != nil {
+			return err
+		}
+		if w.Bytes() >= c.o.FileBytes {
+			if err := finish(); err != nil {
+				return err
+			}
+		}
+	}
+	if err := in.Err(); err != nil {
+		return err
+	}
+	return finish()
 }

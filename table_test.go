@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"math"
 	"math/rand/v2"
 	"slices"
 	"testing"
@@ -164,16 +165,60 @@ func TestTableRejectsCorruption(t *testing.T) {
 	corrupt("block byte", func(d []byte) []byte { d[meta.IndexOff/2] ^= 0x40; return d }, true)
 	corrupt("block crc", func(d []byte) []byte { d[0] ^= 1; return d }, true)
 	corrupt("index byte", func(d []byte) []byte { d[meta.IndexOff+3] ^= 1; return d }, false)
-	corrupt("truncated index", func(d []byte) []byte { return d[:meta.IndexOff+meta.IndexLen-1] }, false)
-	bad := meta
-	bad.IndexCRC ^= 1
-	if _, err := OpenTableAt(ctx, BytesSource(data), bad); !errors.Is(err, ErrCorrupt) {
-		t.Fatalf("wrong index crc: %v", err)
+	corrupt("truncated", func(d []byte) []byte { return d[:len(d)-1] }, false)
+	footer := meta.IndexOff + meta.IndexLen
+	corrupt("footer crc", func(d []byte) []byte { d[footer+24] ^= 1; return d }, false)
+	corrupt("footer index offset", func(d []byte) []byte { d[footer+7] ^= 1; return d }, false)
+	corrupt("magic", func(d []byte) []byte { d[len(d)-1] = 'x'; return d }, false)
+	for name, bad := range map[string]func(m *TableMeta){
+		"zero index length":  func(m *TableMeta) { m.IndexLen = 0 },
+		"index offset past":  func(m *TableMeta) { m.IndexOff = math.MaxInt64 },
+		"index offset moved": func(m *TableMeta) { m.IndexOff-- },
+	} {
+		m := meta
+		bad(&m)
+		if _, err := OpenTableAt(ctx, BytesSource(data), m); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("%s: %v", name, err)
+		}
 	}
-	bad = meta
-	bad.IndexLen = 0
-	if _, err := OpenTableAt(ctx, BytesSource(data), bad); !errors.Is(err, ErrCorrupt) {
-		t.Fatalf("zero index length: %v", err)
+	// A block whose length would wrap the bounds sum is refused, not read.
+	idx := binary.AppendUvarint(nil, 1)
+	idx = binary.AppendUvarint(idx, 0)
+	idx = binary.AppendUvarint(idx, math.MaxInt64-3)
+	idx = binary.AppendUvarint(idx, 10)
+	idx = append(idx, 1, 'a', 1, 'a')
+	tbl := slices.Concat(make([]byte, 64), idx, footerFor(64, idx, 1))
+	if _, err := OpenTableAt(ctx, BytesSource(tbl), TableMeta{IndexOff: 64, IndexLen: int64(len(idx))}); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("overflowing block length: %v", err)
+	}
+	if _, err := BytesSource(tbl).ReadAt(ctx, math.MaxInt64, 1); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("overflowing range: %v", err)
+	}
+}
+
+// footerFor is the 32-byte footer of a table whose index idx sits at off.
+func footerFor(off int64, idx []byte, count int64) []byte {
+	f := binary.BigEndian.AppendUint64(nil, uint64(off))
+	f = binary.BigEndian.AppendUint64(f, uint64(len(idx)))
+	f = binary.BigEndian.AppendUint64(f, uint64(count))
+	f = binary.BigEndian.AppendUint32(f, crc32.Checksum(idx, castagnoli))
+	return append(f, tableMagic...)
+}
+
+// TestLegacyMagicOpens: a table written before the magic changed to LSM1
+// has the same layout and still opens.
+func TestLegacyMagicOpens(t *testing.T) {
+	data, meta, err := BuildTable(putEntries(randKeys(rand.New(rand.NewPCG(9, 9)), 50, 'L')), 512)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy(data[len(data)-4:], legacyMagic)
+	tb, err := OpenTableAt(context.Background(), BytesSource(data), meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(collect(t, tb.Iter(context.Background()))); n != 50 {
+		t.Fatalf("%d entries", n)
 	}
 }
 
@@ -205,7 +250,7 @@ func TestTableSpaces(t *testing.T) {
 }
 
 // FuzzOpenTable feeds the index decoder: the fuzzed bytes are the index of
-// a table whose blocks are the seed's, with the CRC recomputed so the
+// a table whose blocks are the seed's, with the footer rebuilt so the
 // structural checks, not the checksum, are what is exercised.
 func FuzzOpenTable(f *testing.F) {
 	rng := rand.New(rand.NewPCG(7, 8))
@@ -217,8 +262,8 @@ func FuzzOpenTable(f *testing.F) {
 	f.Add(data[meta.IndexOff : meta.IndexOff+meta.IndexLen])
 	f.Fuzz(func(t *testing.T, idx []byte) {
 		ctx := context.Background()
-		m := TableMeta{IndexOff: int64(len(blocks)), IndexLen: int64(len(idx)), IndexCRC: crc32.Checksum(idx, castagnoli)}
-		tb, err := OpenTableAt(ctx, BytesSource(slices.Concat(blocks, idx)), m)
+		m := TableMeta{IndexOff: int64(len(blocks)), IndexLen: int64(len(idx))}
+		tb, err := OpenTableAt(ctx, BytesSource(slices.Concat(blocks, idx, footerFor(m.IndexOff, idx, 200))), m)
 		if err != nil {
 			if !errors.Is(err, ErrCorrupt) {
 				t.Fatalf("error %v does not wrap ErrCorrupt", err)

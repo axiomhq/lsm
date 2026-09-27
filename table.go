@@ -38,41 +38,50 @@ const (
 
 	blockZstd   byte = 0
 	blockStored byte = 1
-	// MaxTableBytes bounds one table object.
+	// MaxTableBytes bounds one table object, and so one decoded block and
+	// one index, whatever the bytes claim.
 	MaxTableBytes = 64 << 20
-	// maxBlockBytes bounds one decoded block, whatever its index claims.
-	maxBlockBytes = 1 << 30
 )
+
+// legacyMagic is the footer magic tables carried before v0.3.0; the layout
+// is the same, so a reader accepts both.
+const legacyMagic = "DWL1"
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
 // blockEncoder compresses the blocks zstd still pays for at the fastest
 // level: a flush compresses every block it writes and a compaction every
 // block it rewrites, and the default level cost a write-heavy load an
-// eighth of its CPU for a few percent of size.
+// eighth of its CPU for a few percent of size. EncodeAll is safe for
+// concurrent use and runs up to GOMAXPROCS encodes at once, so
+// Options.Workers is the only bound on a compaction's parallelism.
 var blockEncoder = func() *zstd.Encoder {
-	e, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithEncoderConcurrency(1), zstd.WithZeroFrames(true))
+	e, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithZeroFrames(true))
 	if err != nil {
 		panic(err)
 	}
 	return e
 }()
 
-// blockDecoder decodes zstd blocks; its memory cap matches maxBlockBytes.
+// blockDecoder decodes zstd blocks, up to GOMAXPROCS at once (the library
+// default caps at four), never more than MaxTableBytes of output per call.
 var blockDecoder = func() *zstd.Decoder {
-	d, err := zstd.NewReader(nil, zstd.WithDecoderMaxMemory(maxBlockBytes))
+	d, err := zstd.NewReader(nil, zstd.WithDecoderMaxMemory(MaxTableBytes), zstd.WithDecoderConcurrency(0))
 	if err != nil {
 		panic(err)
 	}
 	return d
 }()
 
-// DecompressBounded decodes one zstd frame of at most max bytes. max is a
+// DecompressBounded decodes zstd frames to at most max bytes. max is a
 // ceiling, not a size the stream dictates: a frame whose header claims more
 // is refused before anything is allocated, and output past max is refused
-// after decoding. max is capped at 1 GiB. Every failure wraps ErrCorrupt.
+// after decoding. A frame without a content size, or trailing frames, can
+// allocate up to MaxTableBytes before that check: that, not max, is the
+// allocation bound. max is capped at MaxTableBytes. Every failure wraps
+// ErrCorrupt.
 func DecompressBounded(data []byte, max uint64) ([]byte, error) {
-	max = min(max, maxBlockBytes)
+	max = min(max, MaxTableBytes)
 	var h zstd.Header
 	if err := h.Decode(data); err != nil {
 		return nil, fmt.Errorf("%w: lsm: zstd: %v", ErrCorrupt, err)
@@ -103,19 +112,22 @@ type blockIndex struct {
 
 // SpaceRange is the key range a table holds in one key space.
 type SpaceRange struct {
-	Space    byte
-	Min, Max []byte
+	Space byte   `json:"space"`
+	Min   []byte `json:"min"`
+	Max   []byte `json:"max"`
 }
 
 // TableMeta is what the writer learned about the table; FileRef carries it
-// in the manifest so a reader opens the table with one range read.
+// in the manifest so a reader opens the table with one range read. The
+// json names are the manifest encoding and are stable.
 type TableMeta struct {
-	Min, Max           []byte
-	Count              int64
-	Bytes              int64
-	IndexOff, IndexLen int64
-	IndexCRC           uint32
-	Spaces             []SpaceRange
+	Min      []byte       `json:"min"`
+	Max      []byte       `json:"max"`
+	Count    int64        `json:"count"`
+	Bytes    int64        `json:"bytes"`
+	IndexOff int64        `json:"index_off"`
+	IndexLen int64        `json:"index_len"`
+	Spaces   []SpaceRange `json:"spaces,omitempty"`
 }
 
 // TableWriter builds one table in memory.
@@ -234,12 +246,12 @@ func (w *TableWriter) Finish() ([]byte, TableMeta, error) {
 		idx = binary.AppendUvarint(idx, uint64(len(b.last)))
 		idx = append(idx, b.last...)
 	}
-	w.meta.IndexOff, w.meta.IndexLen, w.meta.IndexCRC = int64(len(w.out)), int64(len(idx)), crc32.Checksum(idx, castagnoli)
+	w.meta.IndexOff, w.meta.IndexLen = int64(len(w.out)), int64(len(idx))
 	w.out = append(w.out, idx...)
 	w.out = binary.BigEndian.AppendUint64(w.out, uint64(w.meta.IndexOff))
 	w.out = binary.BigEndian.AppendUint64(w.out, uint64(w.meta.IndexLen))
 	w.out = binary.BigEndian.AppendUint64(w.out, uint64(w.meta.Count))
-	w.out = binary.BigEndian.AppendUint32(w.out, w.meta.IndexCRC)
+	w.out = binary.BigEndian.AppendUint32(w.out, crc32.Checksum(idx, castagnoli))
 	w.out = append(w.out, tableMagic...)
 	w.meta.Bytes = int64(len(w.out))
 	if w.meta.Bytes > MaxTableBytes {
@@ -268,7 +280,8 @@ type Source interface {
 type BytesSource []byte
 
 func (b BytesSource) ReadAt(_ context.Context, off, length int64) ([]byte, error) {
-	if off < 0 || length < 0 || off+length > int64(len(b)) {
+	// Subtraction, not a sum: off+length can wrap.
+	if off < 0 || length < 0 || off > int64(len(b)) || length > int64(len(b))-off {
 		return nil, fmt.Errorf("%w: lsm: range %d+%d beyond %d bytes", ErrCorrupt, off, length, len(b))
 	}
 	return b[off : off+length], nil
@@ -282,18 +295,29 @@ type Table struct {
 }
 
 // OpenTableAt opens a table from its manifest metadata with one range read
-// of the index, verified against meta.IndexCRC. The footer is written for
-// identification and never read.
+// of the index and the footer behind it. The footer's magic must be the
+// current or the legacy one, its index position must agree with meta, and
+// its crc32c must match the index.
 func OpenTableAt(ctx context.Context, src Source, meta TableMeta) (*Table, error) {
 	off, n := meta.IndexOff, meta.IndexLen
-	if n <= 0 || n > MaxTableBytes {
-		return nil, fmt.Errorf("%w: lsm: table index length %d", ErrCorrupt, n)
+	if off < 0 || off > MaxTableBytes || n <= 0 || n > MaxTableBytes {
+		return nil, fmt.Errorf("%w: lsm: table index at %d+%d", ErrCorrupt, off, n)
 	}
-	idx, err := src.ReadAt(ctx, off, n)
+	buf, err := src.ReadAt(ctx, off, n+footerBytes)
 	if err != nil {
 		return nil, err
 	}
-	if int64(len(idx)) != n || crc32.Checksum(idx, castagnoli) != meta.IndexCRC {
+	if int64(len(buf)) != n+footerBytes {
+		return nil, fmt.Errorf("%w: lsm: table index short read", ErrCorrupt)
+	}
+	idx, f := buf[:n], buf[n:]
+	if m := string(f[28:]); m != tableMagic && m != legacyMagic {
+		return nil, fmt.Errorf("%w: lsm: table magic %q", ErrCorrupt, m)
+	}
+	if binary.BigEndian.Uint64(f[0:8]) != uint64(off) || binary.BigEndian.Uint64(f[8:16]) != uint64(n) {
+		return nil, fmt.Errorf("%w: lsm: table footer disagrees with the manifest", ErrCorrupt)
+	}
+	if crc32.Checksum(idx, castagnoli) != binary.BigEndian.Uint32(f[24:28]) {
 		return nil, fmt.Errorf("%w: lsm: table index checksum", ErrCorrupt)
 	}
 	t := &Table{src: src}
@@ -312,7 +336,8 @@ func OpenTableAt(ctx context.Context, src Source, meta TableMeta) (*Table, error
 		if d.err != nil {
 			return nil, fmt.Errorf("%w: lsm: table index: %v", ErrCorrupt, d.err)
 		}
-		if b.off != prevEnd || b.length <= 4 || b.rawLen <= 0 || b.rawLen > MaxTableBytes || b.off+b.length > off ||
+		// b.length is bounded by subtraction: b.off+b.length can wrap.
+		if b.off != prevEnd || b.length <= 4 || b.rawLen <= 0 || b.rawLen > MaxTableBytes || b.length > off-b.off ||
 			len(b.first) == 0 || bytes.Compare(b.first, b.last) > 0 || (prevLast != nil && bytes.Compare(prevLast, b.first) >= 0) {
 			return nil, fmt.Errorf("%w: lsm: table index block", ErrCorrupt)
 		}
@@ -353,10 +378,13 @@ type Block struct {
 func (t *Table) readBlock(ctx context.Context, i int) (*Block, error) {
 	bi := t.index[i]
 	stored, err := t.src.ReadAt(ctx, bi.off, bi.length)
-	if err != nil {
-		return nil, err
+	if err == nil {
+		var b *Block
+		if b, err = decodeBlock(stored, bi.rawLen); err == nil {
+			return b, nil
+		}
 	}
-	return decodeBlock(stored, bi.rawLen)
+	return nil, fmt.Errorf("lsm: block %d at %d+%d: %w", i, bi.off, bi.length, err)
 }
 
 func decodeBlock(stored []byte, rawLen int64) (*Block, error) {

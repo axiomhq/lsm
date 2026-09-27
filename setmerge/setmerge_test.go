@@ -3,6 +3,7 @@ package setmerge_test
 import (
 	"errors"
 	"math"
+	"slices"
 	"testing"
 
 	"github.com/RoaringBitmap/roaring/v2"
@@ -85,5 +86,21 @@ func TestOverflowingRunIsCorrupt(t *testing.T) {
 	// does, it must come back as a result or ErrCorrupt, never a panic.
 	if _, _, err := (setmerge.Merger{}).Full(nil, [][]byte{op}); err != nil && !errors.Is(err, setmerge.ErrCorrupt) {
 		t.Fatalf("Full: %v", err)
+	}
+}
+
+// TestUnsortedKeysAreCorrupt: a bitmap whose container keys are out of
+// order unmarshals without error in roaring and then answers membership
+// wrongly; Decode validates and refuses it.
+func TestUnsortedKeysAreCorrupt(t *testing.T) {
+	b, err := roaring.BitmapOf(1, 70000).ToBytes() // two array containers, keys 0 and 1
+	if err != nil {
+		t.Fatal(err)
+	}
+	// cookie u32, size u32, then (key u16, card-1 u16) per container.
+	k0, k1 := b[8:12], b[12:16]
+	swapped := slices.Concat(b[:8], k1, k0, b[16:])
+	if _, err := setmerge.Decode(swapped); !errors.Is(err, setmerge.ErrCorrupt) {
+		t.Fatalf("unsorted keys: %v", err)
 	}
 }

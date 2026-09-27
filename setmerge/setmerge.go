@@ -99,13 +99,13 @@ func DecodeInto(dst *roaring.Bitmap, value []byte) error {
 		return nil
 	}
 	if dst.IsEmpty() {
-		if err := dst.UnmarshalBinary(value); err != nil {
+		if err := unmarshal(dst, value); err != nil {
 			return fmt.Errorf("%w: set value: %v", ErrCorrupt, err)
 		}
 		return nil
 	}
 	tmp := roaring.New()
-	if err := tmp.UnmarshalBinary(value); err != nil {
+	if err := unmarshal(tmp, value); err != nil {
 		return fmt.Errorf("%w: set value: %v", ErrCorrupt, err)
 	}
 	dst.Or(tmp)
@@ -166,6 +166,17 @@ func (Merger) Partial(operands [][]byte) (op []byte, err error) {
 		remove.AndNot(a)
 	}
 	return Operand(add, remove), nil
+}
+
+// unmarshal decodes a roaring bitmap and validates it: UnmarshalBinary
+// checks only that the bytes are long enough, and a bitmap with unsorted
+// keys or a wrong cardinality makes the set operations return wrong
+// members without an error.
+func unmarshal(dst *roaring.Bitmap, value []byte) error {
+	if err := dst.UnmarshalBinary(value); err != nil {
+		return err
+	}
+	return dst.Validate()
 }
 
 // recoverCorrupt turns a panic in roaring into ErrCorrupt: a bitmap that

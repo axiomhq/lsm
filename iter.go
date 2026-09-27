@@ -193,7 +193,7 @@ func (r *ResolveIter) Next() bool {
 			r.ops[i], r.ops[j] = r.ops[j], r.ops[i]
 		}
 		if !hasBase && !deleted && !r.bottom {
-			if r.value, r.err = partialMerge(r.merger, r.ops); r.err != nil {
+			if r.value, r.err = partialMerge(r.merger, r.key, r.ops); r.err != nil {
 				return false
 			}
 			r.kind = KindMerge
@@ -202,7 +202,7 @@ func (r *ResolveIter) Next() bool {
 		if !hasBase {
 			base = nil
 		}
-		v, keep, err := fullMerge(r.merger, base, r.ops)
+		v, keep, err := fullMerge(r.merger, r.key, base, r.ops)
 		if err != nil {
 			r.err = err
 			return false
@@ -234,26 +234,27 @@ func (r *ResolveIter) Value() []byte { return r.value }
 func (r *ResolveIter) Err() error    { return r.err }
 
 // fullMerge is Merger.Full with the read path's errors: ErrNoMerger
-// without a Merger, ErrCorrupt around the Merger's own.
-func fullMerge(m Merger, base []byte, operands [][]byte) ([]byte, bool, error) {
+// without a Merger; otherwise ErrCorrupt and the Merger's own error, both
+// in the chain, with the key.
+func fullMerge(m Merger, key, base []byte, operands [][]byte) ([]byte, bool, error) {
 	if m == nil {
 		return nil, false, ErrNoMerger
 	}
 	v, keep, err := m.Full(base, operands)
 	if err != nil {
-		return nil, false, fmt.Errorf("%w: lsm: merge: %v", ErrCorrupt, err)
+		return nil, false, fmt.Errorf("%w: lsm: merge %x: %w", ErrCorrupt, key, err)
 	}
 	return v, keep, nil
 }
 
 // partialMerge is Merger.Partial with fullMerge's errors.
-func partialMerge(m Merger, operands [][]byte) ([]byte, error) {
+func partialMerge(m Merger, key []byte, operands [][]byte) ([]byte, error) {
 	if m == nil {
 		return nil, ErrNoMerger
 	}
 	v, err := m.Partial(operands)
 	if err != nil {
-		return nil, fmt.Errorf("%w: lsm: merge: %v", ErrCorrupt, err)
+		return nil, fmt.Errorf("%w: lsm: merge %x: %w", ErrCorrupt, key, err)
 	}
 	return v, nil
 }
