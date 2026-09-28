@@ -22,4 +22,7 @@
 // The table layout is documented at the constants in table.go and in the
 // README. Corrupt bytes return an error wrapping ErrCorrupt. DecompressBounded, the size-capped zstd decode
 // behind every block read, is exported for other formats.
+//
+// Subpackages keyenc (order-preserving key components) and postings
+// (delta-varint docnum lists) build the keys and values stored in tables.
 package lsm

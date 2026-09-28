@@ -98,6 +98,11 @@ The manifest encoding is the json names on `Version`, `FileRef`, `TableMeta`
 and `SpaceRange`. They are stable: a manifest written by any earlier version
 decodes with every field in place.
 
+## Key components and postings
+
+1. `keyenc.AppendString` and `keyenc.AppendFloat64` build composite keys whose byte order is the value order. `keyenc.String` and `keyenc.Float64` read them back, and `keyenc.PrefixEnd(p)` is the exclusive upper bound of a scan over prefix `p`.
+2. `postings.Encode` and `postings.Decode` store (docnum, weight) lists sorted by docnum as delta varints. Corrupt bytes return an error wrapping `lsm.ErrCorrupt`.
+
 ## Test
 
 ```sh
