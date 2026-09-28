@@ -214,11 +214,8 @@ walk:
 			if !ok {
 				continue
 			}
-			if len(hits) == 0 && e.Kind == KindPut {
-				return e.Value, true, nil
-			}
-			if len(hits) == 0 && e.Kind == KindDelete {
-				return nil, false, nil
+			if len(hits) == 0 && e.Kind != KindMerge { // the newest version decides alone
+				return e.Value, e.Kind == KindPut, nil
 			}
 			hits = append(hits, e)
 			if e.Kind != KindMerge {

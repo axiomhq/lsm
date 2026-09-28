@@ -193,8 +193,14 @@ func (r *ResolveIter) Next() bool {
 		for i, j := 0, len(r.ops)-1; i < j; i, j = i+1, j-1 {
 			r.ops[i], r.ops[j] = r.ops[j], r.ops[i]
 		}
+		if r.merger == nil {
+			r.err = ErrNoMerger
+			return false
+		}
 		if !hasBase && !deleted && !r.bottom {
-			if r.value, r.err = partialMerge(r.merger, r.key, r.ops); r.err != nil {
+			var err error
+			r.value, err = r.merger.Partial(r.ops)
+			if r.err = mergeErr(r.merger, r.key, err); r.err != nil {
 				return false
 			}
 			r.kind = KindMerge
@@ -203,9 +209,8 @@ func (r *ResolveIter) Next() bool {
 		if !hasBase {
 			base = nil
 		}
-		v, keep, err := fullMerge(r.merger, r.key, base, r.ops)
-		if err != nil {
-			r.err = err
+		v, keep, err := r.merger.Full(base, r.ops)
+		if r.err = mergeErr(r.merger, r.key, err); r.err != nil {
 			return false
 		}
 		if keep {
@@ -234,30 +239,17 @@ func (r *ResolveIter) Kind() Kind    { return r.kind }
 func (r *ResolveIter) Value() []byte { return r.value }
 func (r *ResolveIter) Err() error    { return r.err }
 
-// fullMerge is Merger.Full with the read path's errors: ErrNoMerger
-// without a Merger; otherwise ErrCorrupt and the Merger's own error, both
-// in the chain, with the key.
-func fullMerge(m Merger, key, base []byte, operands [][]byte) ([]byte, bool, error) {
+// mergeErr is the read path's error for a merge: ErrNoMerger without a
+// Merger; otherwise ErrCorrupt and the Merger's own error, both in the
+// chain, with the key. nil for a nil err.
+func mergeErr(m Merger, key []byte, err error) error {
 	if m == nil {
-		return nil, false, ErrNoMerger
+		return ErrNoMerger
 	}
-	v, keep, err := m.Full(base, operands)
 	if err != nil {
-		return nil, false, fmt.Errorf("%w: lsm: merge %x: %w", ErrCorrupt, key, err)
+		return fmt.Errorf("%w: lsm: merge %x: %w", ErrCorrupt, key, err)
 	}
-	return v, keep, nil
-}
-
-// partialMerge is Merger.Partial with fullMerge's errors.
-func partialMerge(m Merger, key []byte, operands [][]byte) ([]byte, error) {
-	if m == nil {
-		return nil, ErrNoMerger
-	}
-	v, err := m.Partial(operands)
-	if err != nil {
-		return nil, fmt.Errorf("%w: lsm: merge %x: %w", ErrCorrupt, key, err)
-	}
-	return v, nil
+	return nil
 }
 
 // boundIter holds an iterator to [lo, hi); nil bounds are open. A seek
