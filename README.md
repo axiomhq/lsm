@@ -54,6 +54,17 @@ with add/remove operands (`setmerge.Value`, `setmerge.Operand`,
 Rebase holds when the only other writer adds level-0 files (`Flush`).
 `Options.Workers` caps the key-range partitions merged at once.
 
+`Options.MaxTableAge` bounds how long a delete or an overwrite waits above
+the bottom level, where the versions it supersedes are dropped. Every
+`FileRef` carries `Oldest`, the unix second of the oldest write it may still
+hold a superseded version of: the write time for a `Flush` and for a
+compaction into the bottom, else the oldest of the files merged into it.
+When no size rule fires, `Pick` compacts the shallowest file above the bottom
+level whose `Oldest` is past the age (level 0 whole), and the next picks
+carry it down. `Oldest` 0 (a manifest before v0.6.0) counts as the epoch. A
+key's superseded bytes are gone from the tables within about `MaxTableAge`
+plus one job per level, provided something calls `Pick` on an idle version.
+
 ## Table format
 
 | part | bytes |

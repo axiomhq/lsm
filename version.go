@@ -18,6 +18,12 @@ import (
 type FileRef struct {
 	Key string `json:"key"`
 	Seq uint64 `json:"seq"`
+	// Oldest is the unix second of the oldest write the file may still
+	// hold a shadowed version or a tombstone of: its write time for a
+	// Flush and for a compaction that dropped tombstones (Job.Bottom),
+	// otherwise the oldest of the files merged into it. Options.MaxTableAge
+	// compacts by it. 0, as from a manifest before v0.6.0, is the epoch.
+	Oldest int64 `json:"oldest,omitempty"`
 	TableMeta
 }
 

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/axiomhq/lsm/setmerge"
@@ -681,5 +682,105 @@ func TestCompactReportsOrphansOnFailure(t *testing.T) {
 	}
 	if _, ok := st.objects[e.Add[1][0].Key]; !ok {
 		t.Fatalf("orphan %s not in the store", e.Add[1][0].Key)
+	}
+}
+
+// TestPickByAge: with MaxTableAge set and no size rule firing, an aged file
+// above the bottom level is picked (level 0 whole); a young file and an aged
+// bottom-level file are not.
+func TestPickByAge(t *testing.T) {
+	o := Options{L0Trigger: 4, LevelRatio: 10, BaseBytes: 1 << 20, FileBytes: 1 << 20, MaxTableAge: time.Hour}
+	old, young := time.Now().Add(-2*time.Hour).Unix(), time.Now().Unix()
+	f := func(seq uint64, lo, hi string, oldest int64) FileRef {
+		return FileRef{Key: fmt.Sprint("f", seq), Seq: seq, Oldest: oldest, TableMeta: TableMeta{Min: []byte(lo), Max: []byte(hi), Bytes: 10}}
+	}
+	v, _ := Version{}.Apply(Edit{Add: map[int][]FileRef{0: {f(1, "a", "c", young)}, 1: {f(2, "a", "c", young), f(3, "d", "f", old)}, 2: {f(4, "a", "z", old)}}})
+	j, ok := Pick(v, o)
+	if !ok || j.Level != 1 || len(j.Inputs) != 1 || j.Inputs[0].Key != "f3" {
+		t.Fatalf("aged level-1 file not picked: %v %+v", ok, j)
+	}
+	v, _ = v.Apply(Edit{Add: map[int][]FileRef{0: {f(5, "x", "z", old)}}})
+	if j, ok = Pick(v, o); !ok || j.Level != 0 || len(j.Inputs) != 2 {
+		t.Fatalf("aged level-0 file did not take level 0 whole: %v %+v", ok, j)
+	}
+	v, _ = v.Apply(Edit{Del: []string{"f3", "f5"}})
+	if j, ok = Pick(v, o); ok {
+		t.Fatalf("young files and an aged bottom file picked: %+v", j)
+	}
+	o.MaxTableAge = 0
+	v, _ = v.Apply(Edit{Add: map[int][]FileRef{1: {f(6, "d", "f", old)}}})
+	if j, ok = Pick(v, o); ok {
+		t.Fatalf("picked by age with MaxTableAge 0: %+v", j)
+	}
+}
+
+// TestAgeCompactionPurgesDeletes: a tombstone in an aged level-0 file over a
+// key two levels down is carried to the bottom by consecutive age picks, and
+// the key is then in no table; every output of the last job is fresh. One
+// key space (first byte), so each level holds one file.
+func TestAgeCompactionPurgesDeletes(t *testing.T) {
+	ctx := context.Background()
+	st := newMemStore()
+	o := DefaultOptions()
+	o.MaxTableAge = time.Hour
+	old := time.Now().Add(-2 * time.Hour).Unix()
+	var seq uint64
+	mk := func(oldest int64, es ...Entry) FileRef {
+		_, f, err := Flush(ctx, Version{NextSeq: seq}, es, o, st.put)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seq++
+		f.Oldest = oldest
+		return f
+	}
+	put := func(k string) Entry { return Entry{Key: []byte(k), Kind: KindPut, Value: []byte("v")} }
+	v, err := Version{}.Apply(Edit{Add: map[int][]FileRef{
+		0: {mk(old, Entry{Key: []byte("ka"), Kind: KindDelete})},
+		1: {mk(time.Now().Unix(), put("ka"), put("kb"))},
+		2: {mk(time.Now().Unix(), put("ka"), put("kc"))},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := Pick(v, Options{MaxTableAge: 0}); ok {
+		t.Fatal("size rules fired; the test needs the age rule alone")
+	}
+	start := time.Now().Unix()
+	var last Edit
+	rounds := 0
+	for {
+		j, ok := Pick(v, o)
+		if !ok {
+			break
+		}
+		if rounds++; rounds > 3 {
+			t.Fatalf("age compaction did not settle: %+v", v.Levels)
+		}
+		if v, last, err = Compact(ctx, v, j, o, st.reader(), st.put); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if rounds != 2 {
+		t.Fatalf("%d rounds, want 2 (level 0 → 1 keeping the age, 1 → 2 dropping it)", rounds)
+	}
+	for _, f := range slices.Concat(v.Levels...) {
+		tb, err := st.open(ctx, f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok, err := tb.Get(ctx, []byte("ka")); err != nil || ok {
+			t.Fatalf("key ka still in %s: %v", f.Key, err)
+		}
+	}
+	for _, fs := range last.Add {
+		for _, f := range fs {
+			if f.Oldest < start {
+				t.Fatalf("bottom output %s is not fresh: oldest %d < %d", f.Key, f.Oldest, start)
+			}
+		}
+	}
+	if got, ok, _ := st.reader().Get(ctx, v, []byte("kb")); !ok || string(got) != "v" {
+		t.Fatal("key kb lost")
 	}
 }

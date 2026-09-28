@@ -9,6 +9,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Options sizes the levels.
@@ -22,6 +23,12 @@ type Options struct {
 	// is split by its overlap files' key ranges, and each range is an
 	// independent merge (0: half the CPUs, at least one).
 	Workers int
+	// MaxTableAge bounds how long a write stays above the bottom level:
+	// Pick compacts a file whose Oldest is older than this down a level
+	// even when no size rule fires, so a delete or an overwrite reaches
+	// the bottom, where the superseded versions are dropped, within about
+	// MaxTableAge (0: never by age).
+	MaxTableAge time.Duration
 }
 
 // DefaultOptions: 4 L0 files, ratio 10, 256 MiB L1, 48 MiB files.
@@ -75,7 +82,7 @@ func Flush(ctx context.Context, v Version, entries []Entry, o Options, put Putte
 	if err != nil {
 		return Version{}, FileRef{}, err
 	}
-	f, err := publish(ctx, 0, v.NextSeq, data, meta, put)
+	f, err := publish(ctx, 0, v.NextSeq, time.Now().Unix(), data, meta, put)
 	if err != nil {
 		return Version{}, FileRef{}, err
 	}
@@ -83,12 +90,12 @@ func Flush(ctx context.Context, v Version, entries []Entry, o Options, put Putte
 	return next, f, err
 }
 
-func publish(ctx context.Context, level int, seq uint64, data []byte, meta TableMeta, put Putter) (FileRef, error) {
+func publish(ctx context.Context, level int, seq uint64, oldest int64, data []byte, meta TableMeta, put Putter) (FileRef, error) {
 	key, err := put(ctx, level, seq, data)
 	if err != nil {
 		return FileRef{}, fmt.Errorf("lsm: put level %d seq %d: %w", level, seq, err)
 	}
-	return FileRef{Key: key, Seq: seq, TableMeta: meta}, nil
+	return FileRef{Key: key, Seq: seq, Oldest: oldest, TableMeta: meta}, nil
 }
 
 // Job is one compaction: Inputs from Level merged with Overlap from
@@ -168,7 +175,11 @@ func spaceEnd(key []byte) []byte {
 // Pick chooses the next compaction, or none. Level 0 compacts whole when it
 // reaches L0Trigger files; a level over its budget compacts the file with
 // the least overlap below it, so a compaction never rewrites more than it
-// must.
+// must. Failing both, with MaxTableAge set, the shallowest file above the
+// bottom level older than it compacts (level 0 whole, as its files
+// overlap): its output keeps the age until it lands where tombstones drop,
+// so the next picks carry it down. The bottom level is never picked by
+// age, as it holds no tombstone and no shadowed version.
 func Pick(v Version, o Options) (Job, bool) {
 	o = o.withDefaults()
 	if len(v.Levels) == 0 {
@@ -191,6 +202,21 @@ func Pick(v Version, o Options) (Job, bool) {
 			return v.job(l, []FileRef{best}, o), true
 		}
 		budget *= o.LevelRatio
+	}
+	if o.MaxTableAge <= 0 {
+		return Job{}, false
+	}
+	cutoff := time.Now().Add(-o.MaxTableAge).Unix()
+	for l := 0; l == 0 || l < len(v.Levels)-1; l++ {
+		for _, f := range v.Levels[l] {
+			if f.Oldest >= cutoff {
+				continue
+			}
+			if l == 0 {
+				return v.job(0, v.Levels[0], o), true
+			}
+			return v.job(l, []FileRef{f}, o), true
+		}
 	}
 	return Job{}, false
 }
@@ -323,7 +349,16 @@ func Compact(ctx context.Context, v Version, j Job, o Options, r Reader, put Put
 		curBytes += f.Bytes
 	}
 	parts = append(parts, cur)
-	c := &compaction{o: o, j: j, r: r, put: put, inputs: inputs, outputs: make([][]FileRef, len(parts))}
+	// The outputs' age: a bottom job drops every tombstone and shadowed
+	// version, so its outputs are as new as the job; any other keeps the
+	// oldest age it merged, for MaxTableAge to carry down.
+	oldest := time.Now().Unix()
+	if !j.Bottom {
+		for _, f := range slices.Concat(j.Inputs, touched) {
+			oldest = min(oldest, f.Oldest)
+		}
+	}
+	c := &compaction{o: o, j: j, r: r, put: put, inputs: inputs, oldest: oldest, outputs: make([][]FileRef, len(parts))}
 	c.seq.Store(v.NextSeq)
 	// Partitions run o.workers() at a time; the first error cancels the rest.
 	gctx, cancel := context.WithCancelCause(ctx)
@@ -372,6 +407,7 @@ type compaction struct {
 	r       Reader
 	put     Putter
 	inputs  []named
+	oldest  int64 // every output's FileRef.Oldest
 	seq     atomic.Uint64
 	outputs [][]FileRef // per partition; only its own goroutine writes it
 }
@@ -395,7 +431,7 @@ func (c *compaction) writePartition(ctx context.Context, pi int, p partition) er
 		if err != nil {
 			return err
 		}
-		f, err := publish(ctx, c.j.Level+1, c.seq.Add(1)-1, data, meta, c.put)
+		f, err := publish(ctx, c.j.Level+1, c.seq.Add(1)-1, c.oldest, data, meta, c.put)
 		if err != nil {
 			return err
 		}
