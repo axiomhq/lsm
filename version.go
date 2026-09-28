@@ -236,6 +236,7 @@ walk:
 // Located is the newest version of a key: the value's extent in a table
 // when Table.Single applies, otherwise the value itself.
 type Located struct {
+	File        FileRef // the file the answer came from: its Key names the object
 	Table       *Table
 	Off, Length int64
 	Value       []byte
@@ -257,7 +258,7 @@ func (r Reader) Locate(ctx context.Context, v Version, key []byte) (l Located, o
 				return Located{}, false, fmt.Errorf("lsm: open %s: %w", f.Key, err)
 			}
 			if off, length, ok := t.Single(key); ok {
-				return Located{Table: t, Off: off, Length: length}, true, nil
+				return Located{File: f, Table: t, Off: off, Length: length}, true, nil
 			}
 			e, ok, err := t.Get(ctx, key)
 			if err != nil {

@@ -430,6 +430,27 @@ func OpenTableAt(ctx context.Context, src Source, meta TableMeta) (*Table, error
 	return t, nil
 }
 
+// Span is the range of block indexes whose keys may fall in [lo, hi): the
+// first block whose last key is at or past lo, through the last block whose
+// first key is before hi (hi nil means the end of the table). ok is false
+// when no block can hold a key in the range. It reads only the in-memory
+// index, so a caller can derive a cache signature from which blocks of a
+// table a key range touches without reading a block.
+func (t *Table) Span(lo, hi []byte) (first, last int, ok bool) {
+	first = sort.Search(len(t.index), func(i int) bool { return bytes.Compare(t.index[i].last, lo) >= 0 })
+	if first == len(t.index) {
+		return 0, 0, false
+	}
+	if hi == nil {
+		return first, len(t.index) - 1, true
+	}
+	last = sort.Search(len(t.index), func(i int) bool { return bytes.Compare(t.index[i].first, hi) >= 0 }) - 1
+	if last < first {
+		return 0, 0, false
+	}
+	return first, last, true
+}
+
 // Block is one decoded block: entry start offsets into raw.
 type Block struct {
 	raw  []byte

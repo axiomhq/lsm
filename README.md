@@ -29,7 +29,12 @@ For bytes without levels, `data, meta, err := lsm.BuildTable(entries, lsm.Defaul
 
 For large put-only values, `l, ok, err := r.Locate(ctx, v, key)` returns the
 value's extent in its table (`Table.Single`) when it sits alone in a stored
-block, so you read just those bytes with `l.Table.ReadAt`.
+block, so you read just those bytes with `l.Table.ReadAt`. `l.File.Key` names the
+object it came from.
+
+`t.Span(lo, hi)` is the range of a table's block indexes that may hold keys
+in `[lo, hi)`, from the in-memory index alone: a cache signature can name the
+blocks a key range touches without reading one.
 
 `Merger` folds `KindMerge` operands onto the value beneath them; leave it nil
 when no key uses `KindMerge`. `setmerge.Merger` (import
