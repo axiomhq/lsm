@@ -255,7 +255,7 @@ func (v Version) job(level int, inputs []FileRef, o Options) Job {
 // is, unread and unwritten: a level-0 file spans every key space by its
 // bounds, but a space whose keys only grow gains keys only past its last
 // file, so bounds alone would rewrite them every round.
-// Output files are unique by sequence, so a partition publishes as it
+// Output files are unique by sequence within one compaction, so a partition publishes as it
 // goes; the caller publishes the version, and a crash before that leaves
 // only orphan objects. The returned Edit is the change from v (inputs and
 // rewritten overlap deleted, outputs added), for a caller that publishes

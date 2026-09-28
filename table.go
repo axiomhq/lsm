@@ -54,12 +54,14 @@ var ErrUnsupportedFormat = errors.New("lsm: unsupported table format")
 
 // MaxEntryBytes bounds one entry: its value plus three times its key (the
 // key is stored once in its block and twice, as first and last, in the
-// index) must fit a table of its own, so a compaction can always start a
-// file with it. Writers before v0.4.0 had no per-entry check, only
-// Finish's table check, so a table they wrote could hold a key larger
-// than about half MaxTableBytes when earlier keys shared its block; such
-// a table still reads, but a compaction over it fails with
-// ErrEntryTooLarge. No such key is known to exist.
+// index) is at most this, so the entry fits a table of its own and a
+// compaction can always start a file with it. Writers before v0.4.0 had
+// no per-entry check, only Finish's table check, so a table they wrote
+// could hold an entry past this limit: a key over about a third of
+// MaxTableBytes with a small value, or a value within about a hundred
+// bytes of MaxTableBytes, wherever it sat in its block. Such a table
+// still reads, but a compaction over it fails with ErrEntryTooLarge. No
+// such entry is known to exist.
 const MaxEntryBytes = MaxTableBytes - entryOverhead
 
 // entryOverhead is the most a table of one entry adds around it: footer,
@@ -203,7 +205,7 @@ func (w *TableWriter) Add(e Entry) error {
 	if e.Kind < KindPut || e.Kind > KindMerge {
 		return fmt.Errorf("lsm: bad kind %d", e.Kind)
 	}
-	if !(&TableWriter{}).fits(e, MaxTableBytes) {
+	if len(e.Value)+3*len(e.Key) > MaxEntryBytes {
 		return fmt.Errorf("%w: lsm: key %.32x: value %d, key %d, max value+3*key %d", ErrEntryTooLarge, e.Key, len(e.Value), len(e.Key), MaxEntryBytes)
 	}
 	large := len(e.Value) >= LargeValueBytes
@@ -236,10 +238,6 @@ func (w *TableWriter) Add(e Entry) error {
 	}
 	return nil
 }
-
-// Bytes is the data written so far plus the open block, for splitting
-// output files at a target size.
-func (w *TableWriter) Bytes() int64 { return int64(len(w.out) + len(w.raw)) }
 
 // bound is the finished table's size from above: the blocks written, the
 // open block as if stored raw, and the index and footer they will need.
