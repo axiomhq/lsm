@@ -447,9 +447,9 @@ func TestLargeBlockBytesReopens(t *testing.T) {
 		t.Fatalf("%d entries", n)
 	}
 	key := []byte("Kbig")
-	err = NewTableWriter(0).Add(Entry{Key: key, Kind: KindPut, Value: make([]byte, MaxTableBytes)})
+	err = NewTableWriter(0).Add(Entry{Key: key, Kind: KindPut, Value: make([]byte, MaxEntryBytes-3*len(key)+1)})
 	if !errors.Is(err, ErrEntryTooLarge) || !strings.Contains(err.Error(), "4b626967") {
-		t.Fatalf("oversized entry: %v", err)
+		t.Fatalf("entry one past the limit: %v", err)
 	}
 	// An entry at MaxEntryBytes fills a table alone: nothing else fits, the
 	// bound holds, and it reopens.

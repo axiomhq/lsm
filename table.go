@@ -58,8 +58,9 @@ var ErrUnsupportedFormat = errors.New("lsm: unsupported table format")
 // compaction can always start a file with it. Writers before v0.4.0 had
 // no per-entry check, only Finish's table check, so a table they wrote
 // could hold an entry past this limit: a key over about a third of
-// MaxTableBytes with a small value, or a value within about a hundred
-// bytes of MaxTableBytes, wherever it sat in its block. Such a table
+// MaxTableBytes with a small value, or a value plus three times its key
+// within about a hundred bytes of MaxTableBytes, wherever it sat in its
+// block. Such a table
 // still reads, but a compaction over it fails with ErrEntryTooLarge. No
 // such entry is known to exist.
 const MaxEntryBytes = MaxTableBytes - entryOverhead

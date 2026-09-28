@@ -88,8 +88,8 @@ past `lsm.MaxEntryBytes` (value plus three times the key, 128 bytes under
 `MaxTableBytes`), so a compaction can always start a file with any entry it
 reads. Writers before v0.4.0 checked only the finished table, so a table they
 wrote could hold an entry past that limit: a key over about a third of
-`MaxTableBytes` with a small value, or a value within about a hundred bytes of
-`MaxTableBytes`, wherever it sat in its block. It still reads, but a compaction
+`MaxTableBytes` with a small value, or a value plus three times its key within
+about a hundred bytes of `MaxTableBytes`, wherever it sat in its block. It still reads, but a compaction
 over it fails with `ErrEntryTooLarge`. A block's raw bytes never exceed `MaxTableBytes` whatever
 `BlockBytes` says, and a compaction closes an output file before the entry
 that would take it past `FileBytes`.
