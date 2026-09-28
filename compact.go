@@ -57,13 +57,14 @@ func (o Options) withDefaults() Options {
 }
 
 // Putter stores one table and returns its object key. seq is the file's
-// sequence in the version it joins: unique among that version's files, but
-// two writers starting from one version hand out the same seqs (a Flush
-// on head while a Compact runs on a snapshot; two Compacts of one job), so
-// a key must not be seq alone when writers race: add the level and a
-// writer id, or let the store name the object. Compact calls put from up
-// to Options.Workers goroutines at once; it must be safe for concurrent
-// use unless Workers is 1.
+// sequence: unique within one level of the version it joins, and no more.
+// Two writers starting from one version hand out the same seqs (a Flush
+// on head while a Compact runs on a snapshot, which Rebase then puts in
+// one version at different levels; two Compacts of one job), so a key
+// must not be seq alone when writers race: add the level and a writer
+// id, or let the store name the object. FileRef.Key is a file's identity.
+// Compact calls put from up to Options.Workers goroutines at once; it
+// must be safe for concurrent use unless Workers is 1.
 type Putter func(ctx context.Context, level int, seq uint64, data []byte) (string, error)
 
 // Flush writes sorted, unique entries as one level-0 file and returns the
@@ -260,9 +261,9 @@ func (v Version) job(level int, inputs []FileRef, o Options) Job {
 // rewritten overlap deleted, outputs added), for a caller that publishes
 // it over a newer version (Version.Rebase). On error the Edit's Add lists
 // the files already published, orphans the caller may delete, and its
-// NextSeq is the first sequence no output used: a retry from the same
-// version reuses the orphans' seqs unless it applies that Edit first or
-// deletes them.
+// NextSeq is the first sequence no output used. A retry reuses those
+// seqs unless the version it starts from is past them: apply
+// Edit{NextSeq: edit.NextSeq} to it first, never the failed Edit's Add.
 func Compact(ctx context.Context, v Version, j Job, o Options, r Reader, put Putter) (Version, Edit, error) {
 	o = o.withDefaults()
 	inputs := make([]named, len(j.Inputs))
@@ -354,9 +355,6 @@ func Compact(ctx context.Context, v Version, j Job, o Options, r Reader, put Put
 	if err != nil {
 		return Version{}, published, fmt.Errorf("lsm: compaction of level %d: %w", j.Level, err)
 	}
-	if next.NextSeq < c.seq.Load() {
-		next.NextSeq = c.seq.Load()
-	}
 	return next, e, nil
 }
 
@@ -414,9 +412,9 @@ func (c *compaction) writePartition(ctx context.Context, pi int, p partition) er
 		// (receives) can then leave a space no input writes to, where a
 		// file shared with a busy space is rewritten with it.
 		// A file closes before the entry that would take it past FileBytes
-		// or past what a table may hold.
+		// (at most MaxTableBytes); every entry fits a file of its own.
 		e := Entry{Key: in.Key(), Kind: in.Kind(), Value: in.Value()}
-		if w != nil && (e.Key[0] != space || w.Bytes()+entryRaw(e) > c.o.FileBytes || !w.fits(e)) {
+		if w != nil && (e.Key[0] != space || !w.fits(e, c.o.FileBytes)) {
 			if err := finish(); err != nil {
 				return err
 			}

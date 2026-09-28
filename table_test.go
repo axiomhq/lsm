@@ -451,38 +451,29 @@ func TestLargeBlockBytesReopens(t *testing.T) {
 	if !errors.Is(err, ErrEntryTooLarge) || !strings.Contains(err.Error(), "4b626967") {
 		t.Fatalf("oversized entry: %v", err)
 	}
-	// Add takes an entry at MaxEntryBytes; whether its table fits is
-	// Finish's call, and here it does not.
-	w = NewTableWriter(0)
-	if err := w.Add(Entry{Key: key, Kind: KindPut, Value: make([]byte, MaxEntryBytes-len(key))}); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := w.Finish(); err == nil {
-		t.Fatal("a table over MaxTableBytes finished")
-	}
-	// A value just under a table fills it alone: nothing else fits, the
+	// An entry at MaxEntryBytes fills a table alone: nothing else fits, the
 	// bound holds, and it reopens.
 	w = NewTableWriter(0)
-	if err := w.Add(Entry{Key: key, Kind: KindPut, Value: make([]byte, MaxTableBytes-80)}); err != nil {
+	if err := w.Add(Entry{Key: key, Kind: KindPut, Value: make([]byte, MaxEntryBytes-3*len(key))}); err != nil {
 		t.Fatal(err)
 	}
-	if w.fits(Entry{Key: []byte("Kc"), Kind: KindPut, Value: []byte("v")}) {
-		t.Fatal("a small entry after a near-maximal one should not fit the table")
+	if w.fits(Entry{Key: []byte("Kc"), Kind: KindPut, Value: []byte("v")}, MaxTableBytes) {
+		t.Fatal("a small entry after a maximal one should not fit the table")
 	}
 	bound := w.bound()
 	data, meta, err = w.Finish()
 	if err != nil || int64(len(data)) > MaxTableBytes || int64(len(data)) > bound {
-		t.Fatalf("near-max entry: %d bytes (bound %d), %v", len(data), bound, err)
+		t.Fatalf("max entry: %d bytes (bound %d), %v", len(data), bound, err)
 	}
 	if _, err := OpenTableAt(context.Background(), BytesSource(data), meta); err != nil {
-		t.Fatalf("reopen near-max entry: %v", err)
+		t.Fatalf("reopen max entry: %v", err)
 	}
 }
 
-// TestFitsSplitsBeforeOverflow: Bytes bounds the finished size from above
-// and tightly, so a writer that finishes whenever fits says no never
-// exceeds MaxTableBytes, and small entries fill a file to its limit rather
-// than a fraction of it.
+// TestFitsSplitsBeforeOverflow: bound is the finished size from above and
+// tightly, so a writer that finishes whenever fits says no never exceeds
+// MaxTableBytes, and small entries fill a file to its limit rather than a
+// fraction of it.
 func TestFitsSplitsBeforeOverflow(t *testing.T) {
 	rng := rand.New(rand.NewPCG(11, 12))
 	w := NewTableWriter(0)
@@ -493,7 +484,7 @@ func TestFitsSplitsBeforeOverflow(t *testing.T) {
 	small := make([]byte, 1<<10)
 	var finished int
 	add := func(e Entry) {
-		if !w.fits(e) {
+		if !w.fits(e, MaxTableBytes) {
 			bound := w.bound()
 			data, _, err := w.Finish()
 			if err != nil || int64(len(data)) > MaxTableBytes || int64(len(data)) > bound {

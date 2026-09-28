@@ -200,7 +200,7 @@ func (r *ResolveIter) Next() bool {
 		if !hasBase && !deleted && !r.bottom {
 			var err error
 			r.value, err = r.merger.Partial(r.ops)
-			if r.err = mergeErr(r.merger, r.key, err); r.err != nil {
+			if r.err = mergeErr(r.key, err); r.err != nil {
 				return false
 			}
 			r.kind = KindMerge
@@ -210,7 +210,7 @@ func (r *ResolveIter) Next() bool {
 			base = nil
 		}
 		v, keep, err := r.merger.Full(base, r.ops)
-		if r.err = mergeErr(r.merger, r.key, err); r.err != nil {
+		if r.err = mergeErr(r.key, err); r.err != nil {
 			return false
 		}
 		if keep {
@@ -239,13 +239,9 @@ func (r *ResolveIter) Kind() Kind    { return r.kind }
 func (r *ResolveIter) Value() []byte { return r.value }
 func (r *ResolveIter) Err() error    { return r.err }
 
-// mergeErr is the read path's error for a merge: ErrNoMerger without a
-// Merger; otherwise ErrCorrupt and the Merger's own error, both in the
-// chain, with the key. nil for a nil err.
-func mergeErr(m Merger, key []byte, err error) error {
-	if m == nil {
-		return ErrNoMerger
-	}
+// mergeErr is the read path's error for a Merger failure: ErrCorrupt and
+// the Merger's own error, both in the chain, with the key. nil for nil.
+func mergeErr(key []byte, err error) error {
 	if err != nil {
 		return fmt.Errorf("%w: lsm: merge %x: %w", ErrCorrupt, key, err)
 	}

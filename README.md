@@ -42,8 +42,8 @@ with add/remove operands (`setmerge.Value`, `setmerge.Operand`,
 1. Pick a job: `job, ok := lsm.Pick(v, opts)`. `ok` is false when every level is in shape.
 2. Run it: `next, edit, err := lsm.Compact(ctx, v, job, opts, r, put)`, with `r` the `Reader` from Read.
 3. Save `next` with a conditional write. Delete the inputs' objects only after that write succeeds.
-   On error, `edit.Add` lists the output files already stored, orphans you may delete, and `edit.NextSeq` is the first sequence no output used: apply that edit (or delete the orphans) before retrying from the same version.
-   `seq` is unique within a version, not across writers that start from one: name objects by more than `seq` when writers race.
+   On error, `edit.Add` lists the output files already stored, orphans you may delete, and `edit.NextSeq` is the first sequence no output used. Before retrying, apply `lsm.Edit{NextSeq: edit.NextSeq}` to the version you retry from, never the failed edit's `Add`.
+   `seq` is unique within one level of a version, not across writers that start from one: name objects by more than `seq` when writers race, and identify files by `Key`.
 4. Lost the write to a newer version `head`? Rebase: `next, err = head.Rebase(v, edit)`, then write again. `lsm.ErrStale` means another compaction changed the same files: delete the outputs and pick again.
 
 Rebase holds when the only other writer adds level-0 files (`Flush`).
@@ -83,14 +83,15 @@ corruption. The magic is the format's version; while the module is v0 a
 format change bumps its minor version, and a reader keeps accepting the
 previous magic when the layout did not change.
 
-An entry must fit one block: `Add` returns `lsm.ErrEntryTooLarge` when its
-key, value and framing exceed `MaxTableBytes`, and any key and value within
-`lsm.MaxEntryBytes` fit. That is exactly what a reader decodes, so every entry
-in a table any version wrote is one a compaction rewrites. A block's raw
-bytes never exceed `MaxTableBytes` whatever `BlockBytes` says; a table is
-refused at `Finish` past `MaxTableBytes`, as before, and a compaction closes
-an output file before the entry that would take it past `FileBytes` or that
-limit.
+An entry must fit a table of its own: `Add` returns `lsm.ErrEntryTooLarge`
+past `lsm.MaxEntryBytes` (value plus three times the key, 128 bytes under
+`MaxTableBytes`), so a compaction can always start a file with any entry it
+reads. Writers before v0.4.0 checked only the finished table, so a table they
+wrote could hold a key over about half `MaxTableBytes` when earlier keys shared
+its block; it still reads, but a compaction over it fails with
+`ErrEntryTooLarge`. A block's raw bytes never exceed `MaxTableBytes` whatever
+`BlockBytes` says, and a compaction closes an output file before the entry
+that would take it past `FileBytes`.
 
 The manifest encoding is the json names on `Version`, `FileRef`, `TableMeta`
 and `SpaceRange`. They are stable: a manifest written by any earlier version

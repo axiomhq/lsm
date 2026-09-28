@@ -52,24 +52,34 @@ const legacyMagic = "DWL1"
 // current nor the legacy one: bytes from a newer format, not corruption.
 var ErrUnsupportedFormat = errors.New("lsm: unsupported table format")
 
-// MaxEntryBytes is a key and value size that always fits one block: Add
-// accepts every entry whose encoded block (key, value and at most 22 bytes
-// of framing) is within MaxTableBytes, which is exactly what a reader
-// decodes, so every entry in a table any version wrote is one Add takes.
-// Whether a table holding the entry fits MaxTableBytes is Finish's check,
-// as it always was.
-const MaxEntryBytes = MaxTableBytes - 2 - 2*binary.MaxVarintLen64
+// MaxEntryBytes bounds one entry: its value plus three times its key (the
+// key is stored once in its block and twice, as first and last, in the
+// index) must fit a table of its own, so a compaction can always start a
+// file with it. Writers before v0.4.0 had no per-entry check, only
+// Finish's table check, so a table they wrote could hold a key larger
+// than about half MaxTableBytes when earlier keys shared its block; such
+// a table still reads, but a compaction over it fails with
+// ErrEntryTooLarge. No such key is known to exist.
+const MaxEntryBytes = MaxTableBytes - entryOverhead
 
-// ErrEntryTooLarge is Add's refusal of an entry no block can hold.
+// entryOverhead is the most a table of one entry adds around it: footer,
+// index count, block crc, mode and count, the entry's varints and kind,
+// and an index entry naming the key twice.
+const entryOverhead = footerBytes + binary.MaxVarintLen64 + blockOverhead + 2*binary.MaxVarintLen64 + 1 + 5*binary.MaxVarintLen64
+
+// blockOverhead is a block's crc, mode byte and count varint.
+const blockOverhead = 5 + binary.MaxVarintLen64
+
+// ErrEntryTooLarge is Add's refusal of an entry over MaxEntryBytes.
 var ErrEntryTooLarge = errors.New("lsm: entry too large")
 
 // entryRaw is an entry's encoded size in a block: length varints, key,
-// kind and value. The block's count varint adds at most one more.
+// kind and value.
 func entryRaw(e Entry) int64 {
 	return int64(uvarintLen(uint64(len(e.Key))) + len(e.Key) + 1 + uvarintLen(uint64(len(e.Value))) + len(e.Value))
 }
 
-// indexEntry is the index bytes a block with these keys costs.
+// indexEntry bounds the index bytes of a block with these keys.
 func indexEntry(first, last []byte) int64 {
 	return int64(3*binary.MaxVarintLen64 + uvarintLen(uint64(len(first))) + len(first) + uvarintLen(uint64(len(last))) + len(last))
 }
@@ -181,7 +191,7 @@ func NewTableWriter(blockBytes int) *TableWriter {
 }
 
 // Add appends e. Keys must be strictly increasing and non-empty, and the
-// entry must fit one block (ErrEntryTooLarge; MaxEntryBytes always does).
+// entry must fit a table of its own (ErrEntryTooLarge; see MaxEntryBytes).
 // A block's raw bytes never exceed MaxTableBytes, whatever blockBytes says.
 func (w *TableWriter) Add(e Entry) error {
 	if len(e.Key) == 0 {
@@ -193,12 +203,11 @@ func (w *TableWriter) Add(e Entry) error {
 	if e.Kind < KindPut || e.Kind > KindMerge {
 		return fmt.Errorf("lsm: bad kind %d", e.Kind)
 	}
-	size := entryRaw(e)
-	if size+binary.MaxVarintLen64 > MaxTableBytes {
-		return fmt.Errorf("%w: lsm: key %.32x: %d bytes, max %d", ErrEntryTooLarge, e.Key, len(e.Key)+len(e.Value), MaxEntryBytes)
+	if !(&TableWriter{}).fits(e, MaxTableBytes) {
+		return fmt.Errorf("%w: lsm: key %.32x: value %d, key %d, max value+3*key %d", ErrEntryTooLarge, e.Key, len(e.Value), len(e.Key), MaxEntryBytes)
 	}
 	large := len(e.Value) >= LargeValueBytes
-	if w.n > 0 && (large || len(w.raw)+len(e.Value) > w.blockBytes || int64(len(w.raw))+size+binary.MaxVarintLen64 > MaxTableBytes) {
+	if w.n > 0 && !w.joins(e) {
 		w.flushBlock()
 	}
 	if w.n == 0 {
@@ -237,17 +246,30 @@ func (w *TableWriter) Bytes() int64 { return int64(len(w.out) + len(w.raw)) }
 func (w *TableWriter) bound() int64 {
 	n := int64(len(w.out)) + w.idx + footerBytes + binary.MaxVarintLen64
 	if w.n > 0 {
-		n += 5 + binary.MaxVarintLen64 + int64(len(w.raw)) + indexEntry(w.first, w.last)
+		n += blockOverhead + int64(len(w.raw)) + indexEntry(w.first, w.last)
 	}
 	return n
 }
 
-// fits reports whether the table can take e and still finish within
-// MaxTableBytes, so a table Finish refuses is never built.
-func (w *TableWriter) fits(e Entry) bool {
-	// e either joins the open block (its key replaces last in the index) or
-	// starts a new one (header, count and an index entry naming it twice).
-	return w.bound()+entryRaw(e)+5+binary.MaxVarintLen64+indexEntry(e.Key, e.Key) <= MaxTableBytes
+// joins reports whether Add would put e in the open block rather than
+// close it first: the value is small, the block has room for it, and its
+// raw bytes stay within MaxTableBytes.
+func (w *TableWriter) joins(e Entry) bool {
+	return w.n > 0 && len(e.Value) < LargeValueBytes && len(w.raw)+len(e.Value) <= w.blockBytes &&
+		int64(len(w.raw))+entryRaw(e)+int64(uvarintLen(uint64(w.n+1))) <= MaxTableBytes
+}
+
+// fits reports whether the table can take e, placed as Add would place it,
+// and still finish within limit (at most MaxTableBytes). Splitting output
+// files on it means a table Finish refuses is never built.
+func (w *TableWriter) fits(e Entry, limit int64) bool {
+	cost := entryRaw(e)
+	if w.joins(e) {
+		cost += indexEntry(w.first, e.Key) - indexEntry(w.first, w.last) // e becomes the block's last
+	} else {
+		cost += blockOverhead + indexEntry(e.Key, e.Key) // a block of its own, until more arrive
+	}
+	return w.bound()+cost <= min(limit, MaxTableBytes)
 }
 
 func (w *TableWriter) flushBlock() {
