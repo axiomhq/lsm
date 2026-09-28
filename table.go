@@ -364,11 +364,23 @@ func (b BytesSource) ReadAt(_ context.Context, off, length int64) ([]byte, error
 	return b[off : off+length], nil
 }
 
+// BlockCache keeps decoded blocks across reads of one table, so a point
+// lookup or a reread decodes a block once. Get and Put take the table's
+// Name and the block's stored extent, so a cache keyed by object ranges can
+// hang the decode on the bytes it holds.
+type BlockCache interface {
+	Get(name string, off, length int64) (*Block, bool)
+	Put(name string, off, length int64, b *Block)
+}
+
 // Table is an open table: its index in memory, its blocks read on demand.
-// A Table is safe for concurrent reads; a TableIter is not.
+// A Table is safe for concurrent reads; a TableIter is not. Name and Cache
+// are optional; the opener sets them when blocks should be cached.
 type Table struct {
 	src   Source
 	index []blockIndex
+	Name  string
+	Cache BlockCache
 }
 
 // OpenTableAt opens a table from its manifest metadata with one range read
@@ -455,14 +467,33 @@ func (t *Table) Span(lo, hi []byte) (first, last int, ok bool) {
 type Block struct {
 	raw  []byte
 	offs []int32
+	// stored says raw aliases the table bytes a cache already holds, so
+	// the block's own charge is its offsets.
+	stored bool
+}
+
+// Bytes is the block's memory, for cache accounting.
+func (b *Block) Bytes() int {
+	if b.stored {
+		return 4 * len(b.offs)
+	}
+	return len(b.raw) + 4*len(b.offs)
 }
 
 func (t *Table) readBlock(ctx context.Context, i int) (*Block, error) {
 	bi := t.index[i]
+	if t.Cache != nil {
+		if b, ok := t.Cache.Get(t.Name, bi.off, bi.length); ok {
+			return b, nil
+		}
+	}
 	stored, err := t.src.ReadAt(ctx, bi.off, bi.length)
 	if err == nil {
 		var b *Block
 		if b, err = decodeBlock(stored, bi.rawLen); err == nil {
+			if t.Cache != nil {
+				t.Cache.Put(t.Name, bi.off, bi.length, b)
+			}
 			return b, nil
 		}
 	}
@@ -474,6 +505,7 @@ func decodeBlock(stored []byte, rawLen int64) (*Block, error) {
 		return nil, fmt.Errorf("%w: lsm: block checksum", ErrCorrupt)
 	}
 	var raw []byte
+	aliased := false
 	switch stored[4] {
 	case blockZstd:
 		var err error
@@ -481,7 +513,7 @@ func decodeBlock(stored []byte, rawLen int64) (*Block, error) {
 			return nil, err
 		}
 	case blockStored:
-		raw = stored[5:]
+		raw, aliased = stored[5:], true
 	default:
 		return nil, fmt.Errorf("%w: lsm: block mode %d", ErrCorrupt, stored[4])
 	}
@@ -492,7 +524,7 @@ func decodeBlock(stored []byte, rawLen int64) (*Block, error) {
 	if at <= 0 || n == 0 || n > uint64(len(raw))/4 { // an entry is at least 4 bytes
 		return nil, fmt.Errorf("%w: lsm: block count", ErrCorrupt)
 	}
-	b := &Block{raw: raw, offs: make([]int32, 0, n)}
+	b := &Block{raw: raw, offs: make([]int32, 0, n), stored: aliased}
 	// One pass proves every entry is in bounds, in order and of a known
 	// kind, so entry() and key() need no checks of their own.
 	var prev []byte
