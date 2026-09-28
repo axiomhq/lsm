@@ -57,6 +57,11 @@ checks the checksums, and corrupt bytes return an error wrapping
 `lsm.DecompressBounded(data, max)` is that size-capped zstd decode on its
 own: a frame claiming or decoding to more than `max` bytes is refused.
 
+## Key components and postings
+
+1. `keyenc.AppendString` and `keyenc.AppendFloat64` build composite keys whose byte order is the value order. `keyenc.String` and `keyenc.Float64` read them back, and `keyenc.PrefixEnd(p)` is the exclusive upper bound of a scan over prefix `p`.
+2. `postings.Encode` and `postings.Decode` store (docnum, weight) lists sorted by docnum as delta varints. Corrupt bytes return an error wrapping `lsm.ErrCorrupt`.
+
 ## Test
 
 ```sh

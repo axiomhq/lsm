@@ -22,4 +22,7 @@
 // the entry count, crc32c(index) and the magic. Corrupt bytes return an
 // error wrapping ErrCorrupt. DecompressBounded, the size-capped zstd decode
 // behind every block read, is exported for other formats.
+//
+// Subpackages keyenc (order-preserving key components) and postings
+// (delta-varint docnum lists) build the keys and values stored in tables.
 package lsm
