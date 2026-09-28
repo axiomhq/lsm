@@ -424,8 +424,9 @@ func FuzzDecodeBlock(f *testing.F) {
 
 // TestLargeBlockBytesReopens: a writer asked for blocks past what a reader
 // accepts closes them at MaxTableBytes regardless, so every table it
-// finishes opens; an entry over MaxEntryBytes is ErrEntryTooLarge with its
-// key, and one at the limit finishes into a table a reader accepts.
+// finishes opens; an entry no block can hold is ErrEntryTooLarge with its
+// key, and one at MaxEntryBytes is accepted and finishes into a table a
+// reader accepts.
 func TestLargeBlockBytesReopens(t *testing.T) {
 	w := NewTableWriter(1 << 30)
 	val := bytes.Repeat([]byte("x"), 1<<20) // compressible: the table stays small
@@ -446,30 +447,42 @@ func TestLargeBlockBytesReopens(t *testing.T) {
 		t.Fatalf("%d entries", n)
 	}
 	key := []byte("Kbig")
-	err = NewTableWriter(0).Add(Entry{Key: key, Kind: KindPut, Value: make([]byte, MaxEntryBytes-3*len(key)+1)})
+	err = NewTableWriter(0).Add(Entry{Key: key, Kind: KindPut, Value: make([]byte, MaxTableBytes)})
 	if !errors.Is(err, ErrEntryTooLarge) || !strings.Contains(err.Error(), "4b626967") {
 		t.Fatalf("oversized entry: %v", err)
 	}
+	// Add takes an entry at MaxEntryBytes; whether its table fits is
+	// Finish's call, and here it does not.
 	w = NewTableWriter(0)
-	if err := w.Add(Entry{Key: key, Kind: KindPut, Value: make([]byte, MaxEntryBytes-3*len(key))}); err != nil {
+	if err := w.Add(Entry{Key: key, Kind: KindPut, Value: make([]byte, MaxEntryBytes-len(key))}); err != nil {
 		t.Fatal(err)
 	}
-	if w.Fits(Entry{Key: []byte("Kc"), Kind: KindPut, Value: []byte("v")}) {
-		t.Fatal("a small entry after a large one should not fit a full table")
+	if _, _, err := w.Finish(); err == nil {
+		t.Fatal("a table over MaxTableBytes finished")
 	}
+	// A value just under a table fills it alone: nothing else fits, the
+	// bound holds, and it reopens.
+	w = NewTableWriter(0)
+	if err := w.Add(Entry{Key: key, Kind: KindPut, Value: make([]byte, MaxTableBytes-80)}); err != nil {
+		t.Fatal(err)
+	}
+	if w.fits(Entry{Key: []byte("Kc"), Kind: KindPut, Value: []byte("v")}) {
+		t.Fatal("a small entry after a near-maximal one should not fit the table")
+	}
+	bound := w.bound()
 	data, meta, err = w.Finish()
-	if err != nil || int64(len(data)) > MaxTableBytes {
-		t.Fatalf("max entry: %d bytes, %v", len(data), err)
+	if err != nil || int64(len(data)) > MaxTableBytes || int64(len(data)) > bound {
+		t.Fatalf("near-max entry: %d bytes (bound %d), %v", len(data), bound, err)
 	}
 	if _, err := OpenTableAt(context.Background(), BytesSource(data), meta); err != nil {
-		t.Fatalf("reopen max entry: %v", err)
+		t.Fatalf("reopen near-max entry: %v", err)
 	}
 }
 
-// TestFitsSplitsBeforeOverflow: Fits is an upper bound on the finished size,
-// so a writer that finishes whenever Fits says no never exceeds
-// MaxTableBytes; Bytes alone would let the index and a large final entry
-// push it over.
+// TestFitsSplitsBeforeOverflow: Bytes bounds the finished size from above
+// and tightly, so a writer that finishes whenever fits says no never
+// exceeds MaxTableBytes, and small entries fill a file to its limit rather
+// than a fraction of it.
 func TestFitsSplitsBeforeOverflow(t *testing.T) {
 	rng := rand.New(rand.NewPCG(11, 12))
 	w := NewTableWriter(0)
@@ -478,15 +491,13 @@ func TestFitsSplitsBeforeOverflow(t *testing.T) {
 		big[i] = byte(rng.IntN(256))
 	}
 	small := make([]byte, 1<<10)
-	for i := range small {
-		small[i] = byte(rng.IntN(256))
-	}
 	var finished int
 	add := func(e Entry) {
-		if !w.Fits(e) {
+		if !w.fits(e) {
+			bound := w.bound()
 			data, _, err := w.Finish()
-			if err != nil || int64(len(data)) > MaxTableBytes {
-				t.Fatalf("finish: %d bytes, %v", len(data), err)
+			if err != nil || int64(len(data)) > MaxTableBytes || int64(len(data)) > bound {
+				t.Fatalf("finish: %d bytes (bound %d), %v", len(data), bound, err)
 			}
 			finished++
 			w = NewTableWriter(0)
@@ -495,11 +506,26 @@ func TestFitsSplitsBeforeOverflow(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for i := range 46 << 10 { // ~46 MiB of incompressible 1 KiB values
+	for i := range 46 << 10 { // ~46 MiB of 1 KiB values, each random so no block compresses
+		for j := range small {
+			small[j] = byte(rng.IntN(256))
+		}
 		add(Entry{Key: fmt.Appendf(nil, "a%06d", i), Kind: KindPut, Value: small})
 	}
 	add(Entry{Key: []byte("a\xff"), Kind: KindPut, Value: big})
 	if finished != 1 {
 		t.Fatalf("%d files finished, want the large entry to start a second", finished)
+	}
+	// Small entries: the bound tracks the real size closely enough that a
+	// 1 MiB limit holds at least 90% of a MiB of 16-byte entries.
+	w = NewTableWriter(0)
+	n := 0
+	for ; w.bound()+64 <= 1<<20; n++ {
+		if err := w.Add(Entry{Key: fmt.Appendf(nil, "k%07d", n), Kind: KindPut, Value: make([]byte, 8)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if data, _, err := w.Finish(); err != nil || len(data) < 9<<16 || len(data) > 1<<20 {
+		t.Fatalf("%d small entries finished into %d bytes (%v), want within 90%% of 1 MiB", n, len(data), err)
 	}
 }

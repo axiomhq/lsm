@@ -76,8 +76,9 @@ func (v Version) Signature(ranges ...[2][]byte) (sig uint64, ok bool) {
 
 // Edit is one change: files removed by key and files added to a level.
 type Edit struct {
-	Del []string
-	Add map[int][]FileRef
+	Del     []string
+	Add     map[int][]FileRef
+	NextSeq uint64 // a floor for the version's NextSeq: sequences consumed by files not in Add
 }
 
 // Apply returns the version after e. Levels grow as needed; ordering
@@ -87,7 +88,7 @@ func (v Version) Apply(e Edit) (Version, error) {
 	for _, k := range e.Del {
 		del[k] = true
 	}
-	out := Version{NextSeq: v.NextSeq}
+	out := Version{NextSeq: max(v.NextSeq, e.NextSeq)}
 	depth := len(v.Levels)
 	for l := range e.Add {
 		depth = max(depth, l+1)

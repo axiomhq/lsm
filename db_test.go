@@ -672,8 +672,12 @@ func TestCompactReportsOrphansOnFailure(t *testing.T) {
 	if !errors.Is(err, boom) || !strings.Contains(err.Error(), "put level 1 seq") {
 		t.Fatalf("error %v", err)
 	}
-	if len(e.Add[1]) != 1 || len(e.Del) != 0 {
-		t.Fatalf("edit after failure %+v, want the one published file and no deletes", e)
+	if len(e.Add[1]) != 1 || len(e.Del) != 0 || e.NextSeq != e.Add[1][0].Seq+2 {
+		t.Fatalf("edit after failure %+v, want the one published file, no deletes, and NextSeq past the failed put", e)
+	}
+	// Applying the failed edit's floor makes a retry skip the consumed seqs.
+	if next, err := v.Apply(Edit{NextSeq: e.NextSeq}); err != nil || next.NextSeq != e.NextSeq {
+		t.Fatalf("NextSeq floor: %+v %v", next, err)
 	}
 	if _, ok := st.objects[e.Add[1][0].Key]; !ok {
 		t.Fatalf("orphan %s not in the store", e.Add[1][0].Key)

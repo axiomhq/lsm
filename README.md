@@ -42,7 +42,8 @@ with add/remove operands (`setmerge.Value`, `setmerge.Operand`,
 1. Pick a job: `job, ok := lsm.Pick(v, opts)`. `ok` is false when every level is in shape.
 2. Run it: `next, edit, err := lsm.Compact(ctx, v, job, opts, r, put)`, with `r` the `Reader` from Read.
 3. Save `next` with a conditional write. Delete the inputs' objects only after that write succeeds.
-   On error, `edit.Add` lists the output files already stored: orphans you may delete.
+   On error, `edit.Add` lists the output files already stored, orphans you may delete, and `edit.NextSeq` is the first sequence no output used: apply that edit (or delete the orphans) before retrying from the same version.
+   `seq` is unique within a version, not across writers that start from one: name objects by more than `seq` when writers race.
 4. Lost the write to a newer version `head`? Rebase: `next, err = head.Rebase(v, edit)`, then write again. `lsm.ErrStale` means another compaction changed the same files: delete the outputs and pick again.
 
 Rebase holds when the only other writer adds level-0 files (`Flush`).
@@ -82,10 +83,14 @@ corruption. The magic is the format's version; while the module is v0 a
 format change bumps its minor version, and a reader keeps accepting the
 previous magic when the layout did not change.
 
-An entry is at most `lsm.MaxEntryBytes` (its value plus three times its key,
-a little under 64 MiB); `Add` returns `lsm.ErrEntryTooLarge` past that. A
-block's raw bytes never exceed `MaxTableBytes` whatever `BlockBytes` says,
-and a compaction output file never exceeds it either.
+An entry must fit one block: `Add` returns `lsm.ErrEntryTooLarge` when its
+key, value and framing exceed `MaxTableBytes`, and any key and value within
+`lsm.MaxEntryBytes` fit. That is exactly what a reader decodes, so every entry
+in a table any version wrote is one a compaction rewrites. A block's raw
+bytes never exceed `MaxTableBytes` whatever `BlockBytes` says; a table is
+refused at `Finish` past `MaxTableBytes`, as before, and a compaction closes
+an output file before the entry that would take it past `FileBytes` or that
+limit.
 
 The manifest encoding is the json names on `Version`, `FileRef`, `TableMeta`
 and `SpaceRange`. They are stable: a manifest written by any earlier version
