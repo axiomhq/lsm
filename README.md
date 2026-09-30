@@ -51,6 +51,8 @@ with add/remove operands (`setmerge.Value`, `setmerge.Operand`,
    `seq` is unique within one level of a version, not across writers that start from one: name objects by more than `seq` when writers race, and identify files by `Key`.
 4. Lost the write to a newer version `head`? Rebase: `next, err = head.Rebase(v, edit)`, then write again. `lsm.ErrStale` means another compaction changed the same files: delete the outputs and pick again.
 
+`Pick` drains first: a level over its budget (`BaseBytes` × `LevelRatio`^(n-1)) moves the contiguous run of files with the least overlap below per byte, at least its excess and at most `BaseBytes`; the level furthest over goes first. Level 0 compacts at `L0Trigger` files only when every deeper level is within budget, so each level-0 job is followed by the deeper work it causes and level 1 stays near `BaseBytes`. A level-0 job takes the oldest file's key space (first key byte) and every level-0 file overlapping it: write level-0 tables one space each and a job rewrites only that space's share of level 1. A writer that must bound level 0 while deeper levels drain holds its flushes back itself.
+
 Rebase holds when the only other writer adds level-0 files (`Flush`).
 `Options.Workers` caps the key-range partitions merged at once.
 `Options.ReadAheadBytes` (1 MiB) is the window a merge reads its inputs in: one range read per window, not per block, with the next window read while the merge walks this one.

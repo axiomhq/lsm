@@ -360,6 +360,85 @@ func TestVersionMatchesModel(t *testing.T) {
 	}
 }
 
+func TestPickLevel0ByKeySpace(t *testing.T) {
+	o := Options{L0Trigger: 2, LevelRatio: 10, BaseBytes: 1 << 20, FileBytes: 1 << 20}
+	f := func(seq uint64, lo, hi string) FileRef {
+		return FileRef{Key: fmt.Sprint("f", seq), Seq: seq, TableMeta: TableMeta{Min: []byte(lo), Max: []byte(hi), Bytes: 10}}
+	}
+	v, err := Version{}.Apply(Edit{Add: map[int][]FileRef{
+		0: {f(1, "A1", "A5"), f(2, "B1", "B5"), f(3, "A3", "A9"), f(4, "B0", "B9")},
+		1: {f(5, "A0", "A9"), f(6, "B0", "B9")},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The oldest file (f1) is in space A: A's files go, newest first, and
+	// only A's level-1 file is rewritten.
+	j, ok := Pick(v, o)
+	if !ok || j.Level != 0 || len(j.Inputs) != 2 || j.Inputs[0].Key != "f3" || j.Inputs[1].Key != "f1" || len(j.Overlap) != 1 || j.Overlap[0].Key != "f5" {
+		t.Fatalf("space A job %+v", j)
+	}
+	// B's files stay behind at the trigger, and go next.
+	v, _ = v.Apply(Edit{Del: []string{"f1", "f3", "f5"}, Add: map[int][]FileRef{1: {f(7, "A0", "A9")}}})
+	j, ok = Pick(v, o)
+	if !ok || j.Level != 0 || len(j.Inputs) != 2 || j.Inputs[0].Key != "f4" || len(j.Overlap) != 1 || j.Overlap[0].Key != "f6" {
+		t.Fatalf("space B job %+v", j)
+	}
+	// A file spanning spaces A and B takes both spaces' files: leaving f4
+	// behind would put the straddler's newer B keys beneath it.
+	v, _ = v.Apply(Edit{Add: map[int][]FileRef{0: {f(8, "A5", "B2")}}})
+	v, _ = v.Apply(Edit{Add: map[int][]FileRef{0: {f(9, "A6", "A7")}}})
+	j, _ = Pick(v, o)
+	if len(j.Inputs) != 4 || len(j.Overlap) != 2 {
+		t.Fatalf("straddling job %+v", j)
+	}
+}
+
+func TestPickDrainsARun(t *testing.T) {
+	o := Options{L0Trigger: 1, LevelRatio: 10, BaseBytes: 60, FileBytes: 16}
+	f := func(seq uint64, lo, hi string, n int64) FileRef {
+		return FileRef{Key: fmt.Sprint("f", seq), Seq: seq, TableMeta: TableMeta{Min: []byte(lo), Max: []byte(hi), Bytes: n}}
+	}
+	var l1 []FileRef
+	for i := range 10 {
+		k := fmt.Sprint("a", i)
+		l1 = append(l1, f(uint64(10+i), k, k, 10))
+	}
+	// Level 2 is heavy under a0..a5 and light under a8..a9.
+	v, err := Version{}.Apply(Edit{Add: map[int][]FileRef{
+		0: {f(1, "a", "z", 1)},
+		1: l1,
+		2: {f(30, "a0", "a5", 300), f(31, "a8", "a9", 8)},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 100 bytes over a budget of 60: a run of 4 files (40 bytes) moves,
+	// the one with the least overlap per byte (a6..a9), level 0 waiting.
+	j, ok := Pick(v, o)
+	if !ok || j.Level != 1 || len(j.Inputs) != 4 || j.Inputs[0].Key != "f16" || len(j.Overlap) != 1 || j.Overlap[0].Key != "f31" {
+		t.Fatalf("drain %+v", j)
+	}
+	// Far over budget, a run is capped at BaseBytes (6 files).
+	var more []FileRef
+	for i := range 10 {
+		k := fmt.Sprint("b", i)
+		more = append(more, f(uint64(40+i), k, k, 10))
+	}
+	v, _ = v.Apply(Edit{Add: map[int][]FileRef{1: more}})
+	if j, _ = Pick(v, o); j.Level != 1 || len(j.Inputs) != 6 {
+		t.Fatalf("capped drain %+v", j)
+	}
+	// A deeper level over budget holds level 0 back too.
+	v, err = Version{}.Apply(Edit{Add: map[int][]FileRef{0: {f(1, "a", "z", 1)}, 2: {f(2, "a", "b", 601)}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j, _ = Pick(v, o); j.Level != 2 {
+		t.Fatalf("level 2 over budget, job %+v", j)
+	}
+}
+
 func TestPickAndApplyInvariants(t *testing.T) {
 	o := Options{L0Trigger: 2, LevelRatio: 2, BaseBytes: 100, FileBytes: 1 << 20}
 	f := func(seq uint64, lo, hi string, n int64) FileRef {
@@ -376,17 +455,19 @@ func TestPickAndApplyInvariants(t *testing.T) {
 	if v.Levels[0][0].Seq != 2 {
 		t.Fatal("L0 not newest first")
 	}
+	// Level 1 (135 bytes over a budget of 100) drains before level 0 goes,
+	// though level 0 is at its trigger: of the runs of at least its 35
+	// bytes of excess, f4 ("d".."f") has the least overlap below per byte.
 	j, ok := Pick(v, o)
-	if !ok || j.Level != 0 || len(j.Inputs) != 2 || len(j.Overlap) != 3 || j.Bottom {
-		t.Fatalf("L0 job %+v", j)
-	}
-	// Without L0 pressure, level 1 (135 bytes over a budget of 100) picks
-	// the file with the least overlap below: f5 ("x".."z") overlaps nothing
-	// in level 2, so it is the bottom for its range.
-	v2, _ := v.Apply(Edit{Del: []string{"f1", "f2"}})
-	j, ok = Pick(v2, o)
-	if !ok || j.Level != 1 || len(j.Inputs) != 1 || j.Inputs[0].Key != "f5" || len(j.Overlap) != 0 || !j.Bottom {
+	if !ok || j.Level != 1 || len(j.Inputs) != 1 || j.Inputs[0].Key != "f4" || len(j.Overlap) != 1 || !j.Bottom {
 		t.Fatalf("L1 job %+v", j)
+	}
+	// Level 1 within budget: level 0 goes. The oldest file's space ("a")
+	// takes f1, whose range reaches f2, so both go.
+	v2, _ := v.Apply(Edit{Del: []string{"f4"}})
+	j, ok = Pick(v2, o)
+	if !ok || j.Level != 0 || len(j.Inputs) != 2 || len(j.Overlap) != 2 || j.Bottom {
+		t.Fatalf("L0 job %+v", j)
 	}
 	if _, err := v.Apply(Edit{Add: map[int][]FileRef{1: {f(7, "b", "b", 1)}}}); err == nil {
 		t.Fatal("overlapping level-1 files accepted")

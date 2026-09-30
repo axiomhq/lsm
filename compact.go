@@ -193,36 +193,41 @@ func spaceEnd(key []byte) []byte {
 	return []byte{key[0] + 1}
 }
 
-// Pick chooses the next compaction, or none. Level 0 compacts whole when it
-// reaches L0Trigger files; a level over its budget compacts the file with
-// the least overlap below it, so a compaction never rewrites more than it
-// must. Failing both, with MaxTableAge set, the shallowest file above the
-// bottom level older than it compacts (level 0 whole, as its files
-// overlap): its output keeps the age until it lands where tombstones drop,
-// so the next picks carry it down. The bottom level is never picked by
-// age, as it holds no tombstone and no shadowed version.
+// Pick chooses the next compaction, or none. A level over its budget
+// goes first, the one furthest over (bytes / budget): it moves the
+// contiguous run of files with the least overlap below per byte, at least
+// its excess (at least one file, at most BaseBytes), so a drain costs a
+// few jobs and a level never grows past its budget by more than one job's
+// push. Level 0 compacts when it holds L0Trigger files and every deeper
+// level is within budget: each level-0 job then owes, before the next one,
+// the deeper work its bytes cause, and level 1 holds about BaseBytes plus
+// one level-0 job. Level 0 goes one key space at a time: the files of the
+// oldest file's space (its first key byte), and every level-0 file whose
+// range meets them, to closure, so no file left behind overlaps what moves
+// down and the job rewrites only that space's share of level 1. Failing
+// both, with MaxTableAge set, the shallowest file above the bottom level
+// older than it compacts (level 0 whole, as its files overlap): its output
+// keeps the age until it lands where tombstones drop, so the next picks
+// carry it down. The bottom level is never picked by age, as it holds no
+// tombstone and no shadowed version.
 func Pick(v Version, o Options) (Job, bool) {
 	o = o.withDefaults()
 	if len(v.Levels) == 0 {
 		return Job{}, false
 	}
-	if len(v.Levels[0]) >= o.L0Trigger {
-		return v.job(0, v.Levels[0], o), true
-	}
-	budget := o.BaseBytes
+	over, excess, worst, budget := 0, int64(0), 1.0, o.BaseBytes
 	for l := 1; l < len(v.Levels); l++ {
-		if levelBytes(v.Levels[l]) > budget {
-			var best FileRef
-			bestOverlap := int64(-1)
-			for _, f := range v.Levels[l] {
-				over := levelBytes(v.overlapIn(l+1, f.Min, afterMax(f.Max)))
-				if bestOverlap < 0 || over < bestOverlap {
-					best, bestOverlap = f, over
-				}
-			}
-			return v.job(l, []FileRef{best}, o), true
+		n := levelBytes(v.Levels[l])
+		if s := float64(n) / float64(budget); s > worst {
+			over, excess, worst = l, n-budget, s
 		}
 		budget *= o.LevelRatio
+	}
+	if over > 0 {
+		return v.job(over, v.drain(over, min(excess, o.BaseBytes)), o), true
+	}
+	if len(v.Levels[0]) >= o.L0Trigger {
+		return v.job(0, v.spaceOfOldest(), o), true
 	}
 	if o.MaxTableAge <= 0 {
 		return Job{}, false
@@ -240,6 +245,77 @@ func Pick(v Version, o Options) (Job, bool) {
 		}
 	}
 	return Job{}, false
+}
+
+// drain is the run of consecutive files of level l (1 or deeper) holding
+// at least want bytes (one file at least) whose overlap in level l+1 is
+// the fewest bytes per input byte; the first such run on a tie.
+func (v Version) drain(l int, want int64) []FileRef {
+	files := v.Levels[l]
+	var below []FileRef
+	if l+1 < len(v.Levels) {
+		below = v.Levels[l+1]
+	}
+	sum := make([]int64, len(below)+1) // sum[i]: bytes of below[:i]
+	for i, f := range below {
+		sum[i+1] = sum[i] + f.Bytes
+	}
+	bi, bj, best := 0, len(files), -1.0
+	var in int64
+	j := 0 // files[i:j] is the run from i
+	for i := range files {
+		for j < len(files) && (j == i || in < want) {
+			in += files[j].Bytes
+			j++
+		}
+		if in < want && i > 0 {
+			break // no later run reaches want
+		}
+		lo, hi := files[i].Min, afterMax(files[j-1].Max)
+		a := firstReaching(below, lo)
+		b := sort.Search(len(below), func(k int) bool { return bytes.Compare(below[k].Min, hi) >= 0 })
+		if r := float64(sum[max(a, b)]-sum[a]) / float64(max(in, 1)); best < 0 || r < best {
+			bi, bj, best = i, j, r
+		}
+		in -= files[i].Bytes
+	}
+	return files[bi:bj]
+}
+
+// spaceOfOldest is the level-0 files a level-0 job takes: the oldest
+// file's key space and every file that meets the range taken so far,
+// newest first. A file spanning spaces widens the range, so the job may
+// take more than one space, and all of level 0 at worst.
+func (v Version) spaceOfOldest() []FileRef {
+	files := v.Levels[0]
+	seed := files[len(files)-1].Min
+	if len(seed) == 0 {
+		return files
+	}
+	lo, hi := []byte{seed[0]}, spaceEnd(seed)
+	in := make([]bool, len(files))
+	for grew := true; grew; {
+		grew = false
+		for i, f := range files {
+			if in[i] || !f.Overlaps(lo, hi) {
+				continue
+			}
+			in[i], grew = true, true
+			if bytes.Compare(f.Min, lo) < 0 {
+				lo = f.Min
+			}
+			if hi != nil && bytes.Compare(f.Max, hi) >= 0 {
+				hi = afterMax(f.Max)
+			}
+		}
+	}
+	var out []FileRef
+	for i, f := range files {
+		if in[i] {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 func (v Version) overlapIn(level int, lo, hi []byte) []FileRef {
@@ -465,8 +541,11 @@ func (c *compaction) writePartition(ctx context.Context, pi int, p partition) er
 		scans = append(scans, s)
 		its = append(its, Bound(s, nil, p.hi))
 	}
-	for _, t := range c.inputs {
-		scan(t)
+	for i, t := range c.inputs {
+		// An input past the partition would still read a block to seek.
+		if c.j.Inputs[i].Overlaps(p.lo, p.hi) {
+			scan(t)
+		}
 	}
 	for _, t := range p.overlaps {
 		scan(*t)
