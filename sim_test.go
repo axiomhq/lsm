@@ -19,7 +19,8 @@ import (
 // at 270 MB/s read+written, and a fold waits while level 0 holds more than
 // 2 GiB at its trigger. A job's output is its inputs' and overlap's bytes,
 // cut into FileBytes files per space. It reports compaction bytes per
-// ingested byte and the level-0 stalls. LSM_SIM_FOLDS sets the folds (300).
+// ingested byte and the level-0 stalls, for the tiered and the leveled
+// picker. LSM_SIM_FOLDS sets the folds (300).
 func TestFoldPatternWriteAmp(t *testing.T) {
 	if testing.Short() {
 		t.Skip("simulation")
@@ -28,6 +29,20 @@ func TestFoldPatternWriteAmp(t *testing.T) {
 	if s := os.Getenv("LSM_SIM_FOLDS"); s != "" {
 		folds, _ = strconv.Atoi(s)
 	}
+	for _, leveled := range []bool{false, true} {
+		name := "tiered"
+		if leveled {
+			name = "leveled"
+		}
+		t.Run(name, func(t *testing.T) {
+			o := lsm.DefaultOptions()
+			o.Leveled = leveled
+			foldWriteAmp(t, o, folds)
+		})
+	}
+}
+
+func foldWriteAmp(t *testing.T, o lsm.Options, folds int) {
 	const (
 		spaces     = 12
 		perSpace   = 2
@@ -36,7 +51,6 @@ func TestFoldPatternWriteAmp(t *testing.T) {
 		rate       = 270e6
 		stallBytes = 2 << 30
 	)
-	o := lsm.DefaultOptions()
 	rng := rand.New(rand.NewPCG(1, 2))
 	var v lsm.Version
 	var seq uint64
@@ -130,6 +144,7 @@ func TestFoldPatternWriteAmp(t *testing.T) {
 	}
 	// Leveled at ratio 10 over four or five levels is under 30x; v0.8.1,
 	// which always picked level 0 first, wrote 64x here and growing.
+	// Tiered merges a byte about log2(space bytes / level-0 bytes) times.
 	if wa := written / ingested; wa > 30 {
 		t.Errorf("compaction wrote %.1fx the ingested bytes", wa)
 	}
@@ -209,6 +224,13 @@ func simCompact(v lsm.Version, j lsm.Job, o lsm.Options, file func(byte, uint64,
 			}
 		}
 		emit(cuts[len(cuts)-1] - 1)
+	}
+	if j.NewRun {
+		del, moved := lsm.Shift(v)
+		e.Del = append(e.Del, del...)
+		for l, fs := range moved {
+			e.Add[l] = fs
+		}
 	}
 	if _, err := v.Apply(e); err != nil {
 		panic(err)

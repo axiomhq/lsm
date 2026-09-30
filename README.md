@@ -51,7 +51,16 @@ with add/remove operands (`setmerge.Value`, `setmerge.Operand`,
    `seq` is unique within one level of a version, not across writers that start from one: name objects by more than `seq` when writers race, and identify files by `Key`.
 4. Lost the write to a newer version `head`? Rebase: `next, err = head.Rebase(v, edit)`, then write again. `lsm.ErrStale` means another compaction changed the same files: delete the outputs and pick again.
 
-`Pick` drains first: a level over its budget (`BaseBytes` × `LevelRatio`^(n-1)) moves the contiguous run of files with the least overlap below per byte, at least its excess and at most `BaseBytes`; the level furthest over goes first. Level 0 compacts at `L0Trigger` files only when every deeper level is within budget, so each level-0 job is followed by the deeper work it causes and level 1 stays near `BaseBytes`. A level-0 job takes the oldest file's key space (first key byte) and every level-0 file overlapping it: write level-0 tables one space each and a job rewrites only that space's share of level 1. A writer that must bound level 0 while deeper levels drain holds its flushes back itself.
+`Pick` tiers by default (`docs/tiered.md`), because it rewrites a byte fewer times than leveled when level 0 fills faster than jobs finish: on one ingest-heavy workload it took 4,355 docs/s against leveled's 3,596, and in simulation it reads and writes 9.5x the ingested bytes against 25x.
+
+- Every level below 0 is a sorted run, newest first, and each key space has its own stack of runs.
+- Level 0 becomes a new run.
+- A space's runs merge by size: equal runs pair up like the bits of a binary counter.
+- A space merges by count past `Options.MaxRuns` (8).
+
+A byte is rewritten about log2(space bytes / level-0 bytes) times, not once per level-0 job. A new-run job (`Job.NewRun`) moves the runs it displaces one level deeper. Its `Edit` lists moved files in `Del` and in `Add` below level 1 under their own keys, so `Add[Level+1]` is still exactly the new outputs.
+
+`Options.Leveled: true` picks by level budgets instead (the v0.9.0 picker), and drains first: a level over its budget (`BaseBytes` × `LevelRatio`^(n-1)) moves the contiguous run of files with the least overlap below per byte, at least its excess and at most `BaseBytes`; the level furthest over goes first. Level 0 compacts at `L0Trigger` files only when every deeper level is within budget, so each level-0 job is followed by the deeper work it causes and level 1 stays near `BaseBytes`. A level-0 job takes the oldest file's key space (first key byte) and every level-0 file overlapping it: write level-0 tables one space each and a job rewrites only that space's share of level 1. A writer that must bound level 0 while deeper levels drain holds its flushes back itself.
 
 Rebase holds when the only other writer adds level-0 files (`Flush`).
 `Options.Workers` caps the key-range partitions merged at once.

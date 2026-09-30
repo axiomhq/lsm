@@ -261,107 +261,110 @@ func checkModel(t *testing.T, ctx context.Context, v Version, st *memStore, m mo
 // bounded ranges; a final compaction to the bottom leaves no tombstone or
 // operand behind.
 func TestVersionMatchesModel(t *testing.T) {
-	for seed := uint64(1); seed <= 12; seed++ {
-		t.Run(fmt.Sprint(seed), func(t *testing.T) {
-			rng := rand.New(rand.NewPCG(seed, 99))
-			ctx := context.Background()
-			st := newMemStore()
-			m := model{}
-			universe := randKeys(rng, 300, 'K')
-			o := Options{L0Trigger: 2 + rng.IntN(3), LevelRatio: 3, BaseBytes: 20 << 10, FileBytes: 8 << 10, BlockBytes: 512}
-			var v Version
-			for batch := 0; batch < 30; batch++ {
-				n := 20 + rng.IntN(60)
-				byKey := map[string]Entry{}
-				for range n {
-					k := universe[rng.IntN(len(universe))]
-					var e Entry
-					switch rng.IntN(10) {
-					case 0, 1:
-						e = Entry{Key: k, Kind: KindPut, Value: setmerge.Value(set(uint32(rng.IntN(50)), uint32(rng.IntN(50))))}
-					case 2:
-						e = Entry{Key: k, Kind: KindDelete}
-					default:
-						var add, remove *roaring.Bitmap
-						if rng.IntN(2) == 0 {
-							add = set(uint32(rng.IntN(50)))
+	for _, leveled := range []bool{false, true} {
+		for seed := uint64(1); seed <= 12; seed++ {
+			t.Run(fmt.Sprintf("%d/leveled=%v", seed, leveled), func(t *testing.T) {
+				rng := rand.New(rand.NewPCG(seed, 99))
+				ctx := context.Background()
+				st := newMemStore()
+				m := model{}
+				universe := slices.Concat(randKeys(rng, 100, 'J'), randKeys(rng, 100, 'K'), randKeys(rng, 100, 'L'))
+				o := Options{L0Trigger: 2 + rng.IntN(3), LevelRatio: 3, BaseBytes: 20 << 10, FileBytes: 8 << 10, BlockBytes: 512}
+				o.Leveled = leveled
+				var v Version
+				for batch := 0; batch < 30; batch++ {
+					n := 20 + rng.IntN(60)
+					byKey := map[string]Entry{}
+					for range n {
+						k := universe[rng.IntN(len(universe))]
+						var e Entry
+						switch rng.IntN(10) {
+						case 0, 1:
+							e = Entry{Key: k, Kind: KindPut, Value: setmerge.Value(set(uint32(rng.IntN(50)), uint32(rng.IntN(50))))}
+						case 2:
+							e = Entry{Key: k, Kind: KindDelete}
+						default:
+							var add, remove *roaring.Bitmap
+							if rng.IntN(2) == 0 {
+								add = set(uint32(rng.IntN(50)))
+							}
+							if rng.IntN(2) == 0 {
+								remove = set(uint32(rng.IntN(50)))
+							}
+							e = Entry{Key: k, Kind: KindMerge, Value: setmerge.Operand(add, remove)}
 						}
-						if rng.IntN(2) == 0 {
-							remove = set(uint32(rng.IntN(50)))
-						}
-						e = Entry{Key: k, Kind: KindMerge, Value: setmerge.Operand(add, remove)}
+						byKey[string(k)] = e // one version per key per flush, last wins
 					}
-					byKey[string(k)] = e // one version per key per flush, last wins
-				}
-				var entries []Entry
-				for _, e := range byKey {
-					entries = append(entries, e)
-				}
-				slices.SortFunc(entries, func(a, b Entry) int { return bytes.Compare(a.Key, b.Key) })
-				for _, e := range entries {
-					m.apply(e)
-				}
-				next, _, err := Flush(ctx, v, entries, o, st.put)
-				if err != nil {
-					t.Fatal(err)
-				}
-				v = next
-				checkModel(t, ctx, v, st, m, rng, universe)
-				steps := rng.IntN(3)
-				for s := 0; s < steps; s++ {
-					j, ok := Pick(v, o)
-					if !ok {
-						break
+					var entries []Entry
+					for _, e := range byKey {
+						entries = append(entries, e)
 					}
-					if v, _, err = Compact(ctx, v, j, o, st.reader(), st.put); err != nil {
+					slices.SortFunc(entries, func(a, b Entry) int { return bytes.Compare(a.Key, b.Key) })
+					for _, e := range entries {
+						m.apply(e)
+					}
+					next, _, err := Flush(ctx, v, entries, o, st.put)
+					if err != nil {
 						t.Fatal(err)
 					}
+					v = next
+					checkModel(t, ctx, v, st, m, rng, universe)
+					steps := rng.IntN(3)
+					for s := 0; s < steps; s++ {
+						j, ok := Pick(v, o)
+						if !ok {
+							break
+						}
+						if v, _, err = Compact(ctx, v, j, o, st.reader(), st.put); err != nil {
+							t.Fatal(err)
+						}
+						checkModel(t, ctx, v, st, m, rng, universe)
+					}
+				}
+				// Everything to the bottom: compact each level into the next,
+				// down to the deepest level that exists now (a compaction of
+				// the deepest would only open another one).
+				depth := len(v.Levels)
+				for l := 0; l < depth-1; l++ {
+					if len(v.Levels[l]) == 0 {
+						continue
+					}
+					j := v.job(l, v.Levels[l], o)
+					next, _, err := Compact(ctx, v, j, o, st.reader(), st.put)
+					if err != nil {
+						t.Fatal(err)
+					}
+					v = next
 					checkModel(t, ctx, v, st, m, rng, universe)
 				}
-			}
-			// Everything to the bottom: compact each level into the next,
-			// down to the deepest level that exists now (a compaction of
-			// the deepest would only open another one).
-			depth := len(v.Levels)
-			for l := 0; l < depth-1; l++ {
-				if len(v.Levels[l]) == 0 {
-					continue
-				}
-				j := v.job(l, v.Levels[l], o)
-				next, _, err := Compact(ctx, v, j, o, st.reader(), st.put)
-				if err != nil {
-					t.Fatal(err)
-				}
-				v = next
-				checkModel(t, ctx, v, st, m, rng, universe)
-			}
-			for l, files := range v.Levels {
-				if l != len(v.Levels)-1 && len(files) != 0 {
-					t.Fatalf("level %d still holds %d files", l, len(files))
-				}
-			}
-			var raw int
-			for _, f := range slices.Concat(v.Levels...) {
-				tb, err := st.open(ctx, f)
-				if err != nil {
-					t.Fatal(err)
-				}
-				for _, e := range collect(t, tb.Iter(ctx)) {
-					if e.Kind != KindPut {
-						t.Fatalf("bottom level holds kind %d for %x", e.Kind, e.Key)
+				for l, files := range v.Levels {
+					if l != len(v.Levels)-1 && len(files) != 0 {
+						t.Fatalf("level %d still holds %d files", l, len(files))
 					}
-					raw++
 				}
-			}
-			if raw != len(m) {
-				t.Fatalf("bottom holds %d entries, model %d", raw, len(m))
-			}
-		})
+				var raw int
+				for _, f := range slices.Concat(v.Levels...) {
+					tb, err := st.open(ctx, f)
+					if err != nil {
+						t.Fatal(err)
+					}
+					for _, e := range collect(t, tb.Iter(ctx)) {
+						if e.Kind != KindPut {
+							t.Fatalf("bottom level holds kind %d for %x", e.Kind, e.Key)
+						}
+						raw++
+					}
+				}
+				if raw != len(m) {
+					t.Fatalf("bottom holds %d entries, model %d", raw, len(m))
+				}
+			})
+		}
 	}
 }
 
 func TestPickLevel0ByKeySpace(t *testing.T) {
-	o := Options{L0Trigger: 2, LevelRatio: 10, BaseBytes: 1 << 20, FileBytes: 1 << 20}
+	o := Options{Leveled: true, L0Trigger: 2, LevelRatio: 10, BaseBytes: 1 << 20, FileBytes: 1 << 20}
 	f := func(seq uint64, lo, hi string) FileRef {
 		return FileRef{Key: fmt.Sprint("f", seq), Seq: seq, TableMeta: TableMeta{Min: []byte(lo), Max: []byte(hi), Bytes: 10}}
 	}
@@ -395,7 +398,7 @@ func TestPickLevel0ByKeySpace(t *testing.T) {
 }
 
 func TestPickDrainsARun(t *testing.T) {
-	o := Options{L0Trigger: 1, LevelRatio: 10, BaseBytes: 60, FileBytes: 16}
+	o := Options{Leveled: true, L0Trigger: 1, LevelRatio: 10, BaseBytes: 60, FileBytes: 16}
 	f := func(seq uint64, lo, hi string, n int64) FileRef {
 		return FileRef{Key: fmt.Sprint("f", seq), Seq: seq, TableMeta: TableMeta{Min: []byte(lo), Max: []byte(hi), Bytes: n}}
 	}
@@ -440,7 +443,7 @@ func TestPickDrainsARun(t *testing.T) {
 }
 
 func TestPickAndApplyInvariants(t *testing.T) {
-	o := Options{L0Trigger: 2, LevelRatio: 2, BaseBytes: 100, FileBytes: 1 << 20}
+	o := Options{Leveled: true, L0Trigger: 2, LevelRatio: 2, BaseBytes: 100, FileBytes: 1 << 20}
 	f := func(seq uint64, lo, hi string, n int64) FileRef {
 		return FileRef{Key: fmt.Sprint("f", seq), Seq: seq, TableMeta: TableMeta{Min: []byte(lo), Max: []byte(hi), Bytes: n}}
 	}
@@ -787,7 +790,7 @@ func TestCompactReportsOrphansOnFailure(t *testing.T) {
 // above the bottom level is picked (level 0 whole); a young file and an aged
 // bottom-level file are not.
 func TestPickByAge(t *testing.T) {
-	o := Options{L0Trigger: 4, LevelRatio: 10, BaseBytes: 1 << 20, FileBytes: 1 << 20, MaxTableAge: time.Hour}
+	o := Options{Leveled: true, L0Trigger: 4, LevelRatio: 10, BaseBytes: 1 << 20, FileBytes: 1 << 20, MaxTableAge: time.Hour}
 	old, young := time.Now().Add(-2*time.Hour).Unix(), time.Now().Unix()
 	f := func(seq uint64, lo, hi string, oldest int64) FileRef {
 		return FileRef{Key: fmt.Sprint("f", seq), Seq: seq, Oldest: oldest, TableMeta: TableMeta{Min: []byte(lo), Max: []byte(hi), Bytes: 10}}
@@ -820,6 +823,7 @@ func TestAgeCompactionPurgesDeletes(t *testing.T) {
 	ctx := context.Background()
 	st := newMemStore()
 	o := DefaultOptions()
+	o.Leveled = true
 	o.MaxTableAge = time.Hour
 	old := time.Now().Add(-2 * time.Hour).Unix()
 	var seq uint64
@@ -841,7 +845,7 @@ func TestAgeCompactionPurgesDeletes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := Pick(v, Options{MaxTableAge: 0}); ok {
+	if _, ok := Pick(v, Options{Leveled: true}); ok {
 		t.Fatal("size rules fired; the test needs the age rule alone")
 	}
 	start := time.Now().Unix()

@@ -14,9 +14,21 @@ import (
 
 // Options sizes the levels.
 type Options struct {
-	L0Trigger  int   // L0 files that start an L0→L1 compaction
-	LevelRatio int64 // level n+1 holds LevelRatio × level n
-	BaseBytes  int64 // level 1 target bytes
+	L0Trigger int // L0 files that start a compaction of level 0
+	// Leveled picks leveled compaction (the default through v0.9.0, and
+	// v0.9.0's picker): levels 1 and deeper are budgeted, LevelRatio
+	// apart, a level over budget drains a run of files into the level
+	// below before level 0 goes, and level 0 goes a key space at a time.
+	// The default is tiered: every level below 0 is one sorted run,
+	// newest first, and runs merge with each other by size (Pick), so a
+	// byte is rewritten about log2 of the data over level 0's size times,
+	// where a leveled level-0 job rewrites its spaces' share of level 1.
+	Leveled    bool
+	LevelRatio int64 // leveled: level n+1 holds LevelRatio × level n
+	BaseBytes  int64 // leveled: level 1 target bytes
+	// MaxRuns bounds a key space's sorted runs when tiered (0: 8): past it,
+	// the adjacent runs with the fewest bytes merge.
+	MaxRuns    int
 	FileBytes  int64 // output file target
 	BlockBytes int   // raw bytes a block closes at (DefaultBlockBytes when 0); a block never exceeds MaxTableBytes
 	// Workers bounds the partitions one compaction merges at once: a job
@@ -45,9 +57,10 @@ type Options struct {
 	Uploads int
 }
 
-// DefaultOptions: 4 L0 files, ratio 10, 256 MiB L1, 48 MiB files.
+// DefaultOptions: tiered, 4 L0 files, 8 runs, 48 MiB files (leveled:
+// ratio 10, 256 MiB L1).
 func DefaultOptions() Options {
-	return Options{L0Trigger: 4, LevelRatio: 10, BaseBytes: 256 << 20, FileBytes: 48 << 20, BlockBytes: DefaultBlockBytes}
+	return Options{L0Trigger: 4, MaxRuns: 8, LevelRatio: 10, BaseBytes: 256 << 20, FileBytes: 48 << 20, BlockBytes: DefaultBlockBytes}
 }
 
 func (o Options) workers() int {
@@ -61,6 +74,9 @@ func (o Options) withDefaults() Options {
 	d := DefaultOptions()
 	if o.L0Trigger <= 0 {
 		o.L0Trigger = d.L0Trigger
+	}
+	if o.MaxRuns <= 0 {
+		o.MaxRuns = d.MaxRuns
 	}
 	if o.LevelRatio <= 1 {
 		o.LevelRatio = d.LevelRatio
@@ -119,14 +135,21 @@ func publish(ctx context.Context, level int, seq uint64, oldest int64, data []by
 	return FileRef{Key: key, Seq: seq, Oldest: oldest, TableMeta: meta}, nil
 }
 
-// Job is one compaction: Inputs from Level merged with Overlap from
-// Level+1, written to Level+1. Bottom means no deeper level holds any of
-// the inputs' key range, so tombstones can be dropped.
+// Job is one compaction: Inputs merged with Overlap from Level+1, written
+// to Level+1. Inputs are newest first: level 0, or the files of Level,
+// or (tiered) the files of the runs above Level+1 being merged into it.
+// Bottom means no deeper level holds any of the inputs' key range, so
+// tombstones can be dropped. NewRun (tiered, Level 0, no Overlap) makes
+// the outputs a run of their own: each key space level 1 holds moves a
+// level deeper, down to its first level without the space, so level 1 is
+// free for them. The moved files are in the Edit's Del and in its Add
+// below level 1 under their own keys; Add[Level+1] is the outputs alone.
 type Job struct {
 	Level   int
 	Inputs  []FileRef
 	Overlap []FileRef
 	Bottom  bool
+	NewRun  bool
 }
 
 func levelBytes(files []FileRef) int64 {
@@ -193,7 +216,20 @@ func spaceEnd(key []byte) []byte {
 	return []byte{key[0] + 1}
 }
 
-// Pick chooses the next compaction, or none. A level over its budget
+// Pick chooses the next compaction, or none: pickTiered unless
+// Options.Leveled.
+func Pick(v Version, o Options) (Job, bool) {
+	o = o.withDefaults()
+	if len(v.Levels) == 0 {
+		return Job{}, false
+	}
+	if o.Leveled {
+		return v.pickLeveled(o)
+	}
+	return v.pickTiered(o)
+}
+
+// pickLeveled is the leveled picker (v0.9.0). A level over its budget
 // goes first, the one furthest over (bytes / budget): it moves the
 // contiguous run of files with the least overlap below per byte, at least
 // its excess (at least one file, at most BaseBytes), so a drain costs a
@@ -210,11 +246,7 @@ func spaceEnd(key []byte) []byte {
 // keeps the age until it lands where tombstones drop, so the next picks
 // carry it down. The bottom level is never picked by age, as it holds no
 // tombstone and no shadowed version.
-func Pick(v Version, o Options) (Job, bool) {
-	o = o.withDefaults()
-	if len(v.Levels) == 0 {
-		return Job{}, false
-	}
+func (v Version) pickLeveled(o Options) (Job, bool) {
 	over, excess, worst, budget := 0, int64(0), 1.0, o.BaseBytes
 	for l := 1; l < len(v.Levels); l++ {
 		n := levelBytes(v.Levels[l])
@@ -318,6 +350,191 @@ func (v Version) spaceOfOldest() []FileRef {
 	return out
 }
 
+// pickTiered treats each level below 0 as a sorted run, newest first, and
+// each key space as its own stack of runs: a file below level 0 holds one
+// space (compaction has always started a file per space, and only
+// compaction writes below level 0), so the runs of one space
+// merge without touching another's, and a job is bounded by a space's
+// bytes, not the version's. A level may hold a space or not: a merge
+// leaves the space empty in the levels of its newer runs.
+//
+//  1. Level 0 at L0Trigger files becomes a new run (Job.NewRun): it never
+//     merges with a run, so a level-0 job costs level 0's bytes alone.
+//  2. Size: in a space, the newest window of adjacent runs in which every
+//     run is no bigger than the runs before it in the window put together
+//     merges into its oldest run. Runs of equal size pair up like the bits
+//     of a binary counter: a byte is merged about log2(space bytes /
+//     level-0 bytes of the space) times, and a space holds about as many
+//     runs.
+//  3. Count: past MaxRuns runs in a space, the adjacent window of
+//     runs-MaxRuns+1 of them with the fewest bytes merges.
+//  4. Age (MaxTableAge): an aged file in any run of a space but the oldest
+//     merges its run and every older one into the oldest; an aged level-0
+//     file (an idle version: an active one makes level 0 a new run first)
+//     merges level 0 and every level into the deepest. Either way the
+//     tombstones and shadowed versions it holds drop in one job.
+//
+// Of the merges rules 2 and 3 owe, the one with the fewest bytes runs
+// first. A merge's Overlap is its oldest run's files, which partition it
+// (Compact); the files of that run no newer key falls in stay where they
+// are.
+func (v Version) pickTiered(o Options) (Job, bool) {
+	if len(v.Levels[0]) >= o.L0Trigger {
+		return v.newRun(), true
+	}
+	type run struct {
+		level int
+		bytes int64
+	}
+	var spaces [256][]run // per space, the levels holding it, newest first
+	for l := 1; l < len(v.Levels); l++ {
+		for _, f := range v.Levels[l] {
+			rs := spaces[f.Min[0]]
+			if n := len(rs); n > 0 && rs[n-1].level == l {
+				rs[n-1].bytes += f.Bytes
+			} else {
+				rs = append(rs, run{l, f.Bytes})
+			}
+			spaces[f.Min[0]] = rs
+		}
+	}
+	best, bestBytes := Job{}, int64(-1)
+	owe := func(space int, rs []run) {
+		var n int64
+		levels := make([]int, len(rs))
+		for i, r := range rs {
+			n += r.bytes
+			levels[i] = r.level
+		}
+		if bestBytes < 0 || n < bestBytes {
+			best, bestBytes = v.mergeRuns(byte(space), levels, o), n
+		}
+	}
+	for s, rs := range spaces {
+		for i := range rs {
+			sum, k := rs[i].bytes, i
+			for k+1 < len(rs) && rs[k+1].bytes <= sum {
+				k++
+				sum += rs[k].bytes
+			}
+			if k > i {
+				owe(s, rs[i:k+1])
+				break
+			}
+		}
+	}
+	if bestBytes < 0 {
+		for s, rs := range spaces {
+			if len(rs) <= o.MaxRuns {
+				continue
+			}
+			w := len(rs) - o.MaxRuns + 1
+			win, winBytes := 0, int64(-1)
+			for i := 0; i+w <= len(rs); i++ {
+				var n int64
+				for _, r := range rs[i : i+w] {
+					n += r.bytes
+				}
+				if winBytes < 0 || n < winBytes {
+					win, winBytes = i, n
+				}
+			}
+			owe(s, rs[win:win+w])
+		}
+	}
+	if bestBytes >= 0 {
+		return best, true
+	}
+	if o.MaxTableAge <= 0 {
+		return Job{}, false
+	}
+	cutoff := time.Now().Add(-o.MaxTableAge).Unix()
+	if slices.ContainsFunc(v.Levels[0], func(f FileRef) bool { return f.Oldest < cutoff }) {
+		return v.toBottom(o), true
+	}
+	for s, rs := range spaces {
+		for i := 0; i+1 < len(rs); i++ {
+			aged := slices.ContainsFunc(v.Levels[rs[i].level], func(f FileRef) bool { return f.Min[0] == byte(s) && f.Oldest < cutoff })
+			if aged {
+				levels := make([]int, 0, len(rs)-i)
+				for _, r := range rs[i:] {
+					levels = append(levels, r.level)
+				}
+				return v.mergeRuns(byte(s), levels, o), true
+			}
+		}
+	}
+	return Job{}, false
+}
+
+// toBottom is the job merging level 0 and every level but the deepest
+// into the deepest, whole: a level-0 file is not one space's, and only
+// whole levels keep a key's versions in order when they move.
+func (v Version) toBottom(o Options) Job {
+	d := len(v.Levels) - 1
+	if d == 0 {
+		return v.newRun()
+	}
+	return v.job(d-1, slices.Concat(v.Levels[:d]...), o)
+}
+
+// newRun is the job making level 0 a new run above every level.
+func (v Version) newRun() Job {
+	j := Job{Level: 0, Inputs: v.Levels[0], Bottom: true, NewRun: true}
+	lo, hi := keyRange(j.Inputs)
+	for l := 1; l < len(v.Levels); l++ {
+		if len(v.overlapIn(l, lo, afterMax(hi))) > 0 {
+			j.Bottom = false
+			break
+		}
+	}
+	return j
+}
+
+// mergeRuns is the job merging space's runs at levels (ascending, adjacent
+// runs of the space) into the last of them.
+func (v Version) mergeRuns(space byte, levels []int, o Options) Job {
+	var inputs []FileRef
+	for _, l := range levels[:len(levels)-1] {
+		for _, f := range v.Levels[l] {
+			if f.Min[0] == space {
+				inputs = append(inputs, f)
+			}
+		}
+	}
+	return v.job(levels[len(levels)-1]-1, inputs, o)
+}
+
+// shift is the Edit part of a NewRun job over v: every space level 1
+// holds moves a level deeper, from level 1 down to the first level
+// without that space, so level 1 is empty and each space's runs keep
+// their order.
+func (v Version) shift() (del []string, add map[int][]FileRef) {
+	add = map[int][]FileRef{}
+	var moving [256]bool
+	for l := 1; l < len(v.Levels); l++ {
+		var held [256]bool
+		for _, f := range v.Levels[l] {
+			held[f.Min[0]] = true
+		}
+		any := false
+		for s := range moving {
+			moving[s] = held[s] && (l == 1 || moving[s])
+			any = any || moving[s]
+		}
+		if !any {
+			break
+		}
+		for _, f := range v.Levels[l] {
+			if moving[f.Min[0]] {
+				del = append(del, f.Key)
+				add[l+1] = append(add[l+1], f)
+			}
+		}
+	}
+	return del, add
+}
+
 func (v Version) overlapIn(level int, lo, hi []byte) []FileRef {
 	if level >= len(v.Levels) {
 		return nil
@@ -370,7 +587,8 @@ func (v Version) job(level int, inputs []FileRef, o Options) Job {
 
 // Compact runs j: its inputs merged with its overlap, resolved, written as
 // files of about FileBytes into Level+1, and returns the version with the
-// inputs replaced. The merge is partitioned by the overlap files' key
+// inputs replaced (and, for a NewRun job, the levels it displaces moved a
+// level deeper). The merge is partitioned by the overlap files' key
 // ranges (and the gaps around them, which hold input keys alone), one
 // independent merge per range run Workers at a time: a level-0 job whose
 // files span every key space would otherwise rewrite all of level 1 in
@@ -400,18 +618,7 @@ func Compact(ctx context.Context, v Version, j Job, o Options, r Reader, put Put
 	var touched []FileRef
 	overlaps := make([]*named, len(j.Overlap))
 	for i, f := range j.Overlap {
-		// A small file also takes its space's input keys in the gap after
-		// it, so a space's tail grows onto its last file until that file
-		// is half a file's size, instead of leaving one small file per
-		// round.
-		hi, incl := f.Max, true
-		if f.Bytes < o.FileBytes/2 {
-			hi, incl = spaceEnd(f.Max), false
-			if i+1 < len(j.Overlap) && (hi == nil || bytes.Compare(j.Overlap[i+1].Min, hi) < 0) {
-				hi = j.Overlap[i+1].Min
-			}
-		}
-		if !receives(j.Inputs, f.Min, hi, incl) {
+		if !j.touches(i, o) {
 			continue
 		}
 		t, err := r.Open(ctx, f)
@@ -446,6 +653,9 @@ func Compact(ctx context.Context, v Version, j Job, o Options, r Reader, put Put
 		curBytes += f.Bytes
 	}
 	parts = append(parts, cur)
+	if len(j.Overlap) == 0 {
+		parts = spaceParts(j.Inputs)
+	}
 	// The outputs' age: a bottom job drops every tombstone and shadowed
 	// version, so its outputs are as new as the job; any other keeps the
 	// oldest age it merged, for MaxTableAge to carry down.
@@ -489,18 +699,70 @@ func Compact(ctx context.Context, v Version, j Job, o Options, r Reader, put Put
 	if err := context.Cause(gctx); err != nil {
 		return Version{}, published, err
 	}
-	e := published
+	e := Edit{Add: map[int][]FileRef{j.Level + 1: added}, NextSeq: published.NextSeq}
 	for _, f := range j.Inputs {
 		e.Del = append(e.Del, f.Key)
 	}
 	for _, f := range touched {
 		e.Del = append(e.Del, f.Key)
 	}
+	if j.NewRun {
+		del, add := v.shift()
+		e.Del = append(e.Del, del...)
+		for l, fs := range add {
+			e.Add[l] = fs
+		}
+	}
 	next, err := v.Apply(e)
 	if err != nil {
 		return Version{}, published, fmt.Errorf("lsm: compaction of level %d: %w", j.Level, err)
 	}
 	return next, e, nil
+}
+
+// touches reports whether an input may write into overlap file i, by the
+// inputs' key-space ranges (receives): a file no input key falls in stays
+// where it is. A small file also takes its space's input keys in the gap
+// after it, so a space's tail grows onto its last file until that file is
+// half a file's size, instead of leaving one small file per round.
+func (j Job) touches(i int, o Options) bool {
+	f := j.Overlap[i]
+	hi, incl := f.Max, true
+	if f.Bytes < o.FileBytes/2 {
+		hi, incl = spaceEnd(f.Max), false
+		if i+1 < len(j.Overlap) && (hi == nil || bytes.Compare(j.Overlap[i+1].Min, hi) < 0) {
+			hi = j.Overlap[i+1].Min
+		}
+	}
+	return receives(j.Inputs, f.Min, hi, incl)
+}
+
+// spaceParts is the partitions of a job with no overlap: one per key
+// space the inputs hold, so a new run is written as wide as its spaces.
+func spaceParts(inputs []FileRef) []partition {
+	var spaces []byte
+	for _, f := range inputs {
+		if len(f.Spaces) == 0 {
+			for b := int(f.Min[0]); b <= int(f.Max[0]); b++ {
+				spaces = append(spaces, byte(b))
+			}
+		}
+		for _, sp := range f.Spaces {
+			spaces = append(spaces, sp.Space)
+		}
+	}
+	slices.Sort(spaces)
+	spaces = slices.Compact(spaces)
+	parts := make([]partition, len(spaces))
+	for i, b := range spaces {
+		if i > 0 {
+			parts[i].lo = []byte{b}
+		}
+		if i+1 < len(spaces) {
+			parts[i].hi = []byte{spaces[i+1]}
+		}
+	}
+	return parts
 }
 
 // partition is one independent merge of a compaction: the inputs and the

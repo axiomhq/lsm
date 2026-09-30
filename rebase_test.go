@@ -52,47 +52,50 @@ func randBatch(rng *rand.Rand, universe [][]byte, m model) []Entry {
 // and rebased over the flushes published while it ran reads back exactly
 // like the model, at every step and after everything is compacted.
 func TestRebaseOverFlushesMatchesModel(t *testing.T) {
-	for seed := uint64(1); seed <= 12; seed++ {
-		t.Run(fmt.Sprint(seed), func(t *testing.T) {
-			rng := rand.New(rand.NewPCG(seed, 7))
-			ctx := context.Background()
-			st := newMemStore()
-			m := model{}
-			universe := randKeys(rng, 300, 'K')
-			o := Options{L0Trigger: 2 + rng.IntN(3), LevelRatio: 3, BaseBytes: 20 << 10, FileBytes: 8 << 10, BlockBytes: 512}
-			var v Version
-			rebased := 0
-			for batch := 0; batch < 40; batch++ {
-				next, _, err := Flush(ctx, v, randBatch(rng, universe, m), o, st.put)
-				if err != nil {
-					t.Fatal(err)
-				}
-				v = next
-				j, ok := Pick(v, o)
-				if !ok {
-					continue
-				}
-				snap := v
-				_, e, err := Compact(ctx, snap, j, o, st.reader(), st.put)
-				if err != nil {
-					t.Fatal(err)
-				}
-				// Flushes publish while the compaction runs.
-				for range rng.IntN(3) {
-					if v, _, err = Flush(ctx, v, randBatch(rng, universe, m), o, st.put); err != nil {
+	for _, leveled := range []bool{false, true} {
+		for seed := uint64(1); seed <= 12; seed++ {
+			t.Run(fmt.Sprintf("%d/leveled=%v", seed, leveled), func(t *testing.T) {
+				rng := rand.New(rand.NewPCG(seed, 7))
+				ctx := context.Background()
+				st := newMemStore()
+				m := model{}
+				universe := slices.Concat(randKeys(rng, 100, 'J'), randKeys(rng, 100, 'K'), randKeys(rng, 100, 'L'))
+				o := Options{L0Trigger: 2 + rng.IntN(3), LevelRatio: 3, BaseBytes: 20 << 10, FileBytes: 8 << 10, BlockBytes: 512}
+				o.Leveled = leveled
+				var v Version
+				rebased := 0
+				for batch := 0; batch < 40; batch++ {
+					next, _, err := Flush(ctx, v, randBatch(rng, universe, m), o, st.put)
+					if err != nil {
 						t.Fatal(err)
 					}
+					v = next
+					j, ok := Pick(v, o)
+					if !ok {
+						continue
+					}
+					snap := v
+					_, e, err := Compact(ctx, snap, j, o, st.reader(), st.put)
+					if err != nil {
+						t.Fatal(err)
+					}
+					// Flushes publish while the compaction runs.
+					for range rng.IntN(3) {
+						if v, _, err = Flush(ctx, v, randBatch(rng, universe, m), o, st.put); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if v, err = v.Rebase(snap, e); err != nil {
+						t.Fatalf("batch %d: %v", batch, err)
+					}
+					rebased++
+					checkModel(t, ctx, v, st, m, rng, universe)
 				}
-				if v, err = v.Rebase(snap, e); err != nil {
-					t.Fatalf("batch %d: %v", batch, err)
+				if rebased == 0 {
+					t.Fatal("no compaction ran")
 				}
-				rebased++
-				checkModel(t, ctx, v, st, m, rng, universe)
-			}
-			if rebased == 0 {
-				t.Fatal("no compaction ran")
-			}
-		})
+			})
+		}
 	}
 }
 
@@ -164,43 +167,46 @@ func TestRebaseRefusesAConcurrentCompaction(t *testing.T) {
 // binary search; overwrites, tombstones and operands spread across the
 // levels still read back like the model.
 func TestManyFilesPerLevelMatchesModel(t *testing.T) {
-	for seed := uint64(1); seed <= 8; seed++ {
-		t.Run(fmt.Sprint(seed), func(t *testing.T) {
-			rng := rand.New(rand.NewPCG(seed, 11))
-			ctx := context.Background()
-			st := newMemStore()
-			m := model{}
-			universe := randKeys(rng, 600, 'K')
-			o := Options{L0Trigger: 3, LevelRatio: 4, BaseBytes: 4 << 10, FileBytes: 1 << 10, BlockBytes: 256}
-			var v Version
-			most := 0
-			for batch := 0; batch < 60; batch++ {
-				next, _, err := Flush(ctx, v, randBatch(rng, universe, m), o, st.put)
-				if err != nil {
-					t.Fatal(err)
-				}
-				v = next
-				for {
-					j, ok := Pick(v, o)
-					if !ok {
-						break
-					}
-					if v, _, err = Compact(ctx, v, j, o, st.reader(), st.put); err != nil {
+	for _, leveled := range []bool{false, true} {
+		for seed := uint64(1); seed <= 8; seed++ {
+			t.Run(fmt.Sprintf("%d/leveled=%v", seed, leveled), func(t *testing.T) {
+				rng := rand.New(rand.NewPCG(seed, 11))
+				ctx := context.Background()
+				st := newMemStore()
+				m := model{}
+				universe := randKeys(rng, 600, 'K')
+				o := Options{L0Trigger: 3, LevelRatio: 4, BaseBytes: 4 << 10, FileBytes: 1 << 10, BlockBytes: 256}
+				o.Leveled = leveled
+				var v Version
+				most := 0
+				for batch := 0; batch < 60; batch++ {
+					next, _, err := Flush(ctx, v, randBatch(rng, universe, m), o, st.put)
+					if err != nil {
 						t.Fatal(err)
 					}
-				}
-				checkModel(t, ctx, v, st, m, rng, universe)
-				deep := 0
-				for l := 1; l < len(v.Levels); l++ {
-					if len(v.Levels[l]) >= 4 {
-						deep++
+					v = next
+					for {
+						j, ok := Pick(v, o)
+						if !ok {
+							break
+						}
+						if v, _, err = Compact(ctx, v, j, o, st.reader(), st.put); err != nil {
+							t.Fatal(err)
+						}
 					}
+					checkModel(t, ctx, v, st, m, rng, universe)
+					deep := 0
+					for l := 1; l < len(v.Levels); l++ {
+						if len(v.Levels[l]) >= 4 {
+							deep++
+						}
+					}
+					most = max(most, deep)
 				}
-				most = max(most, deep)
-			}
-			if most < 2 {
-				t.Fatalf("at most %d levels held 4+ files", most)
-			}
-		})
+				if most < 2 {
+					t.Fatalf("at most %d levels held 4+ files", most)
+				}
+			})
+		}
 	}
 }
