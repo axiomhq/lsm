@@ -80,7 +80,9 @@ Blocks close at 64 KiB raw (`DefaultBlockBytes`). A value of 4 KiB or more
 block. A block zstd cannot shrink by an eighth is stored raw. The key
 filter is a bloom filter at 10 bits per key (about 1% false positives): a
 point lookup of a key a table does not hold reads no block of it, so a key
-written once costs one block read whatever the level-0 depth. Every read
+written once costs one block read whatever the level-0 depth. A point
+lookup binary-searches each level below 0 for its one candidate file, so
+its cost grows with the level count, not the file count. Every read
 checks the checksums, and corrupt bytes return an error wrapping
 `lsm.ErrCorrupt`.
 

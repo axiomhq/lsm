@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"slices"
+	"sort"
 )
 
 // FileRef names one table in the manifest: its object key, its sequence
@@ -49,14 +50,37 @@ type Version struct {
 // precedence.
 func (v Version) Overlapping(lo, hi []byte) []FileRef {
 	var out []FileRef
-	for _, l := range v.Levels {
-		for _, f := range l {
+	for l, files := range v.Levels {
+		if l > 0 && lo != nil {
+			files = files[firstReaching(files, lo):]
+		}
+		for _, f := range files {
 			if f.Overlaps(lo, hi) {
 				out = append(out, f)
+			} else if l > 0 {
+				break // every later file starts at or past hi
 			}
 		}
 	}
 	return out
+}
+
+// firstReaching is the index of the first file of a sorted level (1 and
+// deeper: ordered by Min, disjoint) whose Max is at or past key: the only
+// file of the level that may hold key, and the first that may meet a range
+// from key.
+func firstReaching(files []FileRef, key []byte) int {
+	return sort.Search(len(files), func(i int) bool { return bytes.Compare(files[i].Max, key) >= 0 })
+}
+
+// candidates is the files of level l that may hold key: all of level 0,
+// whose files overlap, and at most one of a later level.
+func candidates(l int, files []FileRef, key []byte) []FileRef {
+	if l == 0 {
+		return files
+	}
+	i := firstReaching(files, key)
+	return files[i:min(i+1, len(files))]
 }
 
 // Signature identifies what a read of the given key ranges sees in v: a
@@ -209,8 +233,8 @@ func (r Reader) Get(ctx context.Context, v Version, key []byte) ([]byte, bool, e
 	// The files newest first, without materialising the overlapping list:
 	// a point lookup is the hottest read.
 walk:
-	for _, l := range v.Levels {
-		for _, f := range l {
+	for l, files := range v.Levels {
+		for _, f := range candidates(l, files, key) {
 			if !f.Overlaps(key, nil) || bytes.Compare(f.Min, key) > 0 {
 				continue
 			}
@@ -256,8 +280,8 @@ type Located struct {
 // is an error: Locate does not resolve merges.
 func (r Reader) Locate(ctx context.Context, v Version, key []byte) (l Located, ok bool, err error) {
 	h := keyHash(key)
-	for _, level := range v.Levels {
-		for _, f := range level {
+	for l, files := range v.Levels {
+		for _, f := range candidates(l, files, key) {
 			if !f.Overlaps(key, nil) || bytes.Compare(f.Min, key) > 0 {
 				continue
 			}

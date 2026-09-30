@@ -192,8 +192,16 @@ func checkModel(t *testing.T, ctx context.Context, v Version, st *memStore, m mo
 	if err := it.Err(); err != nil || i != len(keys) {
 		t.Fatalf("scan ended at %d of %d: %v", i, len(keys), err)
 	}
-	for range 64 {
-		k := universe[rng.IntN(len(universe))]
+	// Levels 1 and deeper are sorted by Min and disjoint: Get and
+	// Overlapping binary-search them.
+	for l := 1; l < len(v.Levels); l++ {
+		for i := 1; i < len(v.Levels[l]); i++ {
+			if a, b := v.Levels[l][i-1], v.Levels[l][i]; bytes.Compare(a.Max, b.Min) >= 0 {
+				t.Fatalf("level %d: %s [%x, %x] and %s [%x, %x] out of order or overlapping", l, a.Key, a.Min, a.Max, b.Key, b.Min, b.Max)
+			}
+		}
+	}
+	for _, k := range universe {
 		val, ok, err := st.reader().Get(ctx, v, k)
 		if err != nil {
 			t.Fatal(err)
@@ -214,6 +222,15 @@ func checkModel(t *testing.T, ctx context.Context, v Version, st *memStore, m mo
 		lo, hi := universe[rng.IntN(len(universe))], universe[rng.IntN(len(universe))]
 		if bytes.Compare(lo, hi) > 0 {
 			lo, hi = hi, lo
+		}
+		var walk []FileRef
+		for _, f := range slices.Concat(v.Levels...) {
+			if f.Overlaps(lo, hi) {
+				walk = append(walk, f)
+			}
+		}
+		if got := v.Overlapping(lo, hi); !slices.EqualFunc(got, walk, func(a, b FileRef) bool { return a.Key == b.Key }) {
+			t.Fatalf("overlapping [%x, %x): %d files, the walk %d", lo, hi, len(got), len(walk))
 		}
 		it, err := st.reader().Iter(ctx, v, lo, hi)
 		if err != nil {

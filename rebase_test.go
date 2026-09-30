@@ -158,3 +158,49 @@ func TestRebaseRefusesAConcurrentCompaction(t *testing.T) {
 	}
 	checkModel(t, ctx, head, st, m, rng, universe)
 }
+
+// TestManyFilesPerLevelMatchesModel: with small files every level below 0
+// holds many, so a point get and a range pick one file per level by
+// binary search; overwrites, tombstones and operands spread across the
+// levels still read back like the model.
+func TestManyFilesPerLevelMatchesModel(t *testing.T) {
+	for seed := uint64(1); seed <= 8; seed++ {
+		t.Run(fmt.Sprint(seed), func(t *testing.T) {
+			rng := rand.New(rand.NewPCG(seed, 11))
+			ctx := context.Background()
+			st := newMemStore()
+			m := model{}
+			universe := randKeys(rng, 600, 'K')
+			o := Options{L0Trigger: 3, LevelRatio: 4, BaseBytes: 4 << 10, FileBytes: 1 << 10, BlockBytes: 256}
+			var v Version
+			most := 0
+			for batch := 0; batch < 60; batch++ {
+				next, _, err := Flush(ctx, v, randBatch(rng, universe, m), o, st.put)
+				if err != nil {
+					t.Fatal(err)
+				}
+				v = next
+				for {
+					j, ok := Pick(v, o)
+					if !ok {
+						break
+					}
+					if v, _, err = Compact(ctx, v, j, o, st.reader(), st.put); err != nil {
+						t.Fatal(err)
+					}
+				}
+				checkModel(t, ctx, v, st, m, rng, universe)
+				deep := 0
+				for l := 1; l < len(v.Levels); l++ {
+					if len(v.Levels[l]) >= 4 {
+						deep++
+					}
+				}
+				most = max(most, deep)
+			}
+			if most < 2 {
+				t.Fatalf("at most %d levels held 4+ files", most)
+			}
+		})
+	}
+}

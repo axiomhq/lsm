@@ -232,3 +232,53 @@ func BenchmarkCompactLatency(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkGet is a point lookup in a four-level version of 1 + 8 + 100 +
+// 300 small in-memory tables, each level a full-keyspace run holding every
+// fourth key of the level below; every lookup finds its key at the bottom.
+func BenchmarkGet(b *testing.B) {
+	const keys = 300 * 16
+	ctx := context.Background()
+	key := func(i int) []byte { return binary.BigEndian.AppendUint32([]byte{'K'}, uint32(i)) }
+	tables := map[string]*Table{}
+	add := map[int][]FileRef{}
+	seq := uint64(1)
+	for l, files := range []int{1, 8, 100, 300} {
+		stride := 1 << (2 * (3 - l)) // 64, 16, 4, 1
+		for f := range files {
+			w := NewTableWriter(DefaultBlockBytes)
+			for i := f * keys / files; i < (f+1)*keys/files; i += stride {
+				if err := w.Add(Entry{Key: key(i), Kind: KindPut, Value: []byte{byte(l)}}); err != nil {
+					b.Fatal(err)
+				}
+			}
+			data, meta, err := w.Finish()
+			if err != nil {
+				b.Fatal(err)
+			}
+			ref := FileRef{Key: fmt.Sprint("f", seq), Seq: seq, TableMeta: meta}
+			seq++
+			if tables[ref.Key], err = OpenTableAt(ctx, BytesSource(data), meta); err != nil {
+				b.Fatal(err)
+			}
+			add[l] = append(add[l], ref)
+		}
+	}
+	v, err := Version{}.Apply(Edit{Add: add})
+	if err != nil {
+		b.Fatal(err)
+	}
+	r := Reader{Open: func(_ context.Context, f FileRef) (*Table, error) { return tables[f.Key], nil }}
+	rng := rand.New(rand.NewPCG(1, 2))
+	lookups := make([][]byte, 1024)
+	for i := range lookups {
+		lookups[i] = key(rng.IntN(keys))
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := range b.N {
+		if _, ok, err := r.Get(ctx, v, lookups[i%len(lookups)]); !ok || err != nil {
+			b.Fatalf("get: %v %v", ok, err)
+		}
+	}
+}
