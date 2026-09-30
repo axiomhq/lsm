@@ -29,6 +29,20 @@ type Options struct {
 	// the bottom, where the superseded versions are dropped, within about
 	// MaxTableAge (0: never by age).
 	MaxTableAge time.Duration
+	// ReadAheadBytes is the window a compaction reads its input tables in:
+	// a block miss reads the consecutive blocks up to this many bytes in
+	// one Source.ReadAt, and the window after it is read while the merge
+	// walks this one, so each input a merge reads holds up to two windows,
+	// three at a window's edge (0: 1 MiB; negative: one block per read,
+	// through Table.Cache).
+	ReadAheadBytes int64
+	// Uploads bounds the output files one compaction puts at once: a
+	// merge hands a finished file to put and goes on with the next, and
+	// waits only when Uploads puts are in flight, so a compaction holds up
+	// to Workers files being written and Uploads being put. Compact returns
+	// once every put has (0: Workers; negative: each merge waits for its
+	// own put).
+	Uploads int
 }
 
 // DefaultOptions: 4 L0 files, ratio 10, 256 MiB L1, 48 MiB files.
@@ -60,6 +74,12 @@ func (o Options) withDefaults() Options {
 	if o.BlockBytes <= 0 {
 		o.BlockBytes = d.BlockBytes
 	}
+	if o.ReadAheadBytes == 0 {
+		o.ReadAheadBytes = 1 << 20
+	}
+	if o.Uploads == 0 {
+		o.Uploads = o.workers()
+	}
 	return o
 }
 
@@ -70,8 +90,9 @@ func (o Options) withDefaults() Options {
 // one version at different levels; two Compacts of one job), so a key
 // must not be seq alone when writers race: add the level and a writer
 // id, or let the store name the object. FileRef.Key is a file's identity.
-// Compact calls put from up to Options.Workers goroutines at once; it
-// must be safe for concurrent use unless Workers is 1.
+// Compact calls put from up to Options.Uploads goroutines at once
+// (Workers when Uploads is negative); it must be safe for concurrent use
+// unless that is 1.
 type Putter func(ctx context.Context, level int, seq uint64, data []byte) (string, error)
 
 // Flush writes sorted, unique entries as one level-0 file and returns the
@@ -358,11 +379,15 @@ func Compact(ctx context.Context, v Version, j Job, o Options, r Reader, put Put
 			oldest = min(oldest, f.Oldest)
 		}
 	}
-	c := &compaction{o: o, j: j, r: r, put: put, inputs: inputs, oldest: oldest, outputs: make([][]FileRef, len(parts))}
-	c.seq.Store(v.NextSeq)
-	// Partitions run o.workers() at a time; the first error cancels the rest.
+	// Partitions run o.workers() at a time, their puts o.Uploads at a time;
+	// the first error cancels the rest.
 	gctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
+	c := &compaction{o: o, j: j, r: r, put: put, inputs: inputs, oldest: oldest, outputs: make([][]*FileRef, len(parts)), cancel: cancel}
+	if o.Uploads > 0 {
+		c.uploads = make(chan struct{}, o.Uploads)
+	}
+	c.seq.Store(v.NextSeq)
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, o.workers())
 	for pi, p := range parts {
@@ -375,7 +400,16 @@ func Compact(ctx context.Context, v Version, j Job, o Options, r Reader, put Put
 		})
 	}
 	wg.Wait()
-	published := Edit{Add: map[int][]FileRef{j.Level + 1: slices.Concat(c.outputs...)}, NextSeq: c.seq.Load()}
+	c.puts.Wait()
+	var added []FileRef
+	for _, fs := range c.outputs {
+		for _, f := range fs {
+			if f.Key != "" { // "": its put failed or never ran
+				added = append(added, *f)
+			}
+		}
+	}
+	published := Edit{Add: map[int][]FileRef{j.Level + 1: added}, NextSeq: c.seq.Load()}
 	if err := context.Cause(gctx); err != nil {
 		return Version{}, published, err
 	}
@@ -409,17 +443,33 @@ type compaction struct {
 	inputs  []named
 	oldest  int64 // every output's FileRef.Oldest
 	seq     atomic.Uint64
-	outputs [][]FileRef // per partition; only its own goroutine writes it
+	outputs [][]*FileRef // per partition; only its own goroutine appends, its puts fill them
+	cancel  context.CancelCauseFunc
+	uploads chan struct{} // a slot per put in flight; nil: a merge puts its own files
+	puts    sync.WaitGroup
 }
 
-// writePartition merges partition pi and publishes its files as it goes.
+// writePartition merges partition pi and hands its files to put as it goes.
 func (c *compaction) writePartition(ctx context.Context, pi int, p partition) error {
 	its := make([]Iterator, 0, len(c.inputs)+len(p.overlaps))
+	scans := make([]*namedIter, 0, cap(its))
+	// A partition that fails part way returns only once its scans' reads
+	// have: Compact never returns with a Source read still running.
+	defer func() {
+		for _, s := range scans {
+			s.settle()
+		}
+	}()
+	scan := func(t named) {
+		s := t.scan(ctx, c.o.ReadAheadBytes, p.hi)
+		scans = append(scans, s)
+		its = append(its, Bound(s, nil, p.hi))
+	}
 	for _, t := range c.inputs {
-		its = append(its, Bound(t.iter(ctx), nil, p.hi))
+		scan(t)
 	}
 	for _, t := range p.overlaps {
-		its = append(its, Bound(t.iter(ctx), nil, p.hi))
+		scan(*t)
 	}
 	in := Resolve(NewMerge(its...), c.r.Merger, c.j.Bottom)
 	var w *TableWriter
@@ -431,12 +481,36 @@ func (c *compaction) writePartition(ctx context.Context, pi int, p partition) er
 		if err != nil {
 			return err
 		}
-		f, err := publish(ctx, c.j.Level+1, c.seq.Add(1)-1, c.oldest, data, meta, c.put)
-		if err != nil {
+		w = nil
+		if c.uploads != nil {
+			select {
+			case c.uploads <- struct{}{}:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			// A failed put cancels before it frees its slot: no put starts
+			// after one failed.
+			if err := ctx.Err(); err != nil {
+				<-c.uploads
+				return err
+			}
+		}
+		f := new(FileRef)
+		c.outputs[pi] = append(c.outputs[pi], f)
+		seq := c.seq.Add(1) - 1
+		up := func() (err error) {
+			*f, err = publish(ctx, c.j.Level+1, seq, c.oldest, data, meta, c.put)
 			return err
 		}
-		c.outputs[pi] = append(c.outputs[pi], f)
-		w = nil
+		if c.uploads == nil {
+			return up()
+		}
+		c.puts.Go(func() {
+			defer func() { <-c.uploads }()
+			if err := up(); err != nil {
+				c.cancel(err)
+			}
+		})
 		return nil
 	}
 	var space byte

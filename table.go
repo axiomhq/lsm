@@ -362,8 +362,9 @@ func BuildTable(entries []Entry, blockBytes int) ([]byte, TableMeta, error) {
 
 // Source is where a table's bytes come from: an object read by range. A
 // Table is read from several goroutines at once (Compact runs
-// Options.Workers merges over the same inputs), so ReadAt must be safe for
-// concurrent use.
+// Options.Workers merges over the same inputs, each with up to two reads
+// of a table in flight: its window and the one after it), so ReadAt must
+// be safe for concurrent use.
 type Source interface {
 	ReadAt(ctx context.Context, off, length int64) ([]byte, error)
 }
@@ -693,16 +694,113 @@ func (t *Table) Iter(ctx context.Context) *TableIter {
 	return &TableIter{ctx: ctx, t: t, bi: -1}
 }
 
+// scan is Iter for a forward pass over the table's keys below hi (nil:
+// to the end), as a compaction makes: a block miss reads the consecutive
+// blocks up to window bytes in one ReadAt, and the window after it is read
+// while the cursor walks this one, so a pass waits for about one round
+// trip per window rather than one per block, and holds up to two windows
+// (three at a window's edge, while the cursor's block aliases the last).
+// A window stops at the first block hi rules out (one block when the miss
+// is past it). Its blocks bypass Cache: they are read once, and would
+// evict what point reads share.
+func (t *Table) scan(ctx context.Context, window int64, hi []byte) *TableIter {
+	stop := len(t.index)
+	if hi != nil {
+		stop = sort.Search(len(t.index), func(i int) bool { return bytes.Compare(t.index[i].first, hi) >= 0 })
+	}
+	return &TableIter{ctx: ctx, t: t, bi: -1, ra: &readAhead{t: t, max: window, stop: stop}}
+}
+
 // TableIter iterates one table in key order. It stores its context
 // because Next reads blocks and the Iterator interface takes no context.
 type TableIter struct {
 	ctx context.Context
 	t   *Table
+	ra  *readAhead // nil: a block per read, through Cache
 	bi  int
 	blk *Block
 	ei  int
 	cur Entry
 	err error
+}
+
+// readAhead is a scan's windows: cur holds the block the cursor is in,
+// next is the window after it, in flight.
+type readAhead struct {
+	t         *Table
+	max       int64
+	stop      int
+	cur, next *window
+}
+
+// window is blocks [lo, hi) of a table, read in one ReadAt; buf and err
+// are set before done closes.
+type window struct {
+	lo, hi int
+	buf    []byte
+	err    error
+	done   chan struct{}
+}
+
+// fetch starts reading the window that begins at block lo.
+func (r *readAhead) fetch(ctx context.Context, lo int) *window {
+	idx := r.t.index
+	off := idx[lo].off
+	hi := lo + 1
+	for hi < r.stop && idx[hi].off+idx[hi].length-off <= r.max {
+		hi++
+	}
+	n := idx[hi-1].off + idx[hi-1].length - off
+	w := &window{lo: lo, hi: hi, done: make(chan struct{})}
+	go func() {
+		defer close(w.done)
+		w.buf, w.err = r.t.src.ReadAt(ctx, off, n)
+		if w.err == nil && int64(len(w.buf)) != n {
+			w.err = fmt.Errorf("%w: lsm: short read of %d bytes, want %d", ErrCorrupt, len(w.buf), n)
+		}
+	}()
+	return w
+}
+
+// settle waits for the scan's window reads, the one ahead of the cursor
+// included, so its caller can return knowing none still runs.
+func (it *TableIter) settle() {
+	if it.ra != nil && it.ra.next != nil {
+		<-it.ra.next.done
+	}
+}
+
+// block decodes block i, reading its window first when the cursor left
+// the last one.
+func (r *readAhead) block(ctx context.Context, i int) (*Block, error) {
+	if w := r.cur; w == nil || i < w.lo || i >= w.hi {
+		stale := r.next
+		if stale != nil && i >= stale.lo && i < stale.hi {
+			r.cur, stale = stale, nil
+		} else {
+			r.cur = r.fetch(ctx, i)
+		}
+		r.next = nil
+		if r.cur.hi < r.stop {
+			r.next = r.fetch(ctx, r.cur.hi)
+		}
+		// A window the cursor skipped is waited for, not left reading:
+		// every read a scan starts ends before settle returns.
+		if stale != nil {
+			<-stale.done
+		}
+		<-r.cur.done
+	}
+	w, bi := r.cur, r.t.index[i]
+	err := w.err
+	if err == nil {
+		at := bi.off - r.t.index[w.lo].off
+		var b *Block
+		if b, err = decodeBlock(w.buf[at:at+bi.length], bi.rawLen); err == nil {
+			return b, nil
+		}
+	}
+	return nil, fmt.Errorf("lsm: block %d at %d+%d: %w", i, bi.off, bi.length, err)
 }
 
 // SeekGE positions at the first entry with key >= target (nil: the first
@@ -737,7 +835,13 @@ func (it *TableIter) load(bi int) bool {
 	if bi == it.bi && it.blk != nil {
 		return true
 	}
-	blk, err := it.t.readBlock(it.ctx, bi)
+	var blk *Block
+	var err error
+	if it.ra != nil {
+		blk, err = it.ra.block(it.ctx, bi)
+	} else {
+		blk, err = it.t.readBlock(it.ctx, bi)
+	}
 	if err != nil {
 		it.err, it.blk = err, nil
 		return false

@@ -3,8 +3,11 @@ package lsm
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"math/rand/v2"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/axiomhq/lsm/setmerge"
 )
@@ -134,5 +137,98 @@ func BenchmarkBuildTable(b *testing.B) {
 		if _, _, err := BuildTable(entries, 0); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// latencySource is an object store's range read: every request waits a
+// fixed round trip, whatever its size.
+type latencySource struct {
+	BytesSource
+	rtt time.Duration
+}
+
+func (s latencySource) ReadAt(ctx context.Context, off, length int64) ([]byte, error) {
+	time.Sleep(s.rtt)
+	return s.BytesSource.ReadAt(ctx, off, length)
+}
+
+// BenchmarkCompactLatency is a level-0 job of about 110 MB of tables (225
+// MB of entries) against a store whose every read takes a 2 ms round trip
+// and every put that plus 100 MB/s for its bytes (a 48 MiB file in half a
+// second): four level-0 files of updates spread over the key range, over
+// sixteen level-1 files. It runs the job block by block with each merge
+// waiting for its puts, with read-ahead alone, and with read-ahead and
+// concurrent puts.
+func BenchmarkCompactLatency(b *testing.B) {
+	const rtt = 2 * time.Millisecond
+	const putNsPerByte = 10 * time.Nanosecond // 100 MB/s per put stream
+	const keys, l1Files, l0Files = 1_600_000, 16, 4
+	rng := rand.New(rand.NewPCG(3, 3))
+	entry := func(i int) Entry {
+		v := make([]byte, 100) // half random, half zeros: about 2:1 under zstd
+		for j := range 50 {
+			v[j] = byte(rng.IntN(256))
+		}
+		return Entry{Key: binary.BigEndian.AppendUint64([]byte{'V'}, uint64(i)), Kind: KindPut, Value: v}
+	}
+	objects := map[string][]byte{}
+	var v Version
+	var inBytes int64
+	add := func(level int, entries []Entry) {
+		data, meta, err := BuildTable(entries, 0)
+		if err != nil {
+			b.Fatal(err)
+		}
+		key := fmt.Sprintf("sst/%d-%d", level, v.NextSeq)
+		objects[key] = data
+		inBytes += meta.Bytes
+		if v, err = v.Apply(Edit{Add: map[int][]FileRef{level: {{Key: key, Seq: v.NextSeq, TableMeta: meta}}}}); err != nil {
+			b.Fatal(err)
+		}
+	}
+	for f := range l1Files {
+		var entries []Entry
+		for i := f * keys / l1Files; i < (f+1)*keys/l1Files; i++ {
+			entries = append(entries, entry(i))
+		}
+		add(1, entries)
+	}
+	for f := range l0Files {
+		var entries []Entry
+		for i := f; i < keys; i += 4 * l0Files {
+			entries = append(entries, entry(i))
+		}
+		add(0, entries)
+	}
+	o := DefaultOptions()
+	o.Workers = 2 // eight partitions: four rounds, as a job much wider than its workers runs
+	j := v.job(0, v.Levels[0], o)
+	r := Reader{Open: func(ctx context.Context, f FileRef) (*Table, error) {
+		return OpenTableAt(ctx, latencySource{objects[f.Key], rtt}, f.TableMeta)
+	}}
+	var puts atomic.Int64
+	put := func(_ context.Context, level int, seq uint64, data []byte) (string, error) {
+		time.Sleep(rtt + time.Duration(len(data))*putNsPerByte)
+		return fmt.Sprintf("out/%d-%d-%d", level, seq, puts.Add(1)), nil
+	}
+	for _, arm := range []struct {
+		name      string
+		readAhead int64
+		uploads   int
+	}{
+		{"block-reads,sync-puts", -1, -1},
+		{"read-ahead,sync-puts", 0, -1},
+		{"read-ahead,async-puts", 0, 0},
+	} {
+		b.Run(arm.name, func(b *testing.B) {
+			o := o
+			o.ReadAheadBytes, o.Uploads = arm.readAhead, arm.uploads
+			b.SetBytes(inBytes)
+			for b.Loop() {
+				if _, _, err := Compact(context.Background(), v, j, o, r, put); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }

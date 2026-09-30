@@ -317,6 +317,15 @@ type named struct {
 
 func (n named) iter(ctx context.Context) Iterator { return &namedIter{n.t.Iter(ctx), n.key} }
 
+// scan is iter for a compaction's pass over keys below hi, read window
+// bytes at a time (Table.scan); a negative window reads block by block.
+func (n named) scan(ctx context.Context, window int64, hi []byte) *namedIter {
+	if window < 0 {
+		return &namedIter{n.t.Iter(ctx), n.key}
+	}
+	return &namedIter{n.t.scan(ctx, window, hi), n.key}
+}
+
 type namedIter struct {
 	*TableIter
 	key string

@@ -53,6 +53,8 @@ with add/remove operands (`setmerge.Value`, `setmerge.Operand`,
 
 Rebase holds when the only other writer adds level-0 files (`Flush`).
 `Options.Workers` caps the key-range partitions merged at once.
+`Options.ReadAheadBytes` (1 MiB) is the window a merge reads its inputs in: one range read per window, not per block, with the next window read while the merge walks this one.
+`Options.Uploads` (`Workers`) caps the finished output files being put at once; a merge hands a file to `put` and goes on, and `Compact` returns once every put has.
 
 `Options.MaxTableAge` bounds how long a delete or an overwrite waits above
 the bottom level, where the versions it supersedes are dropped. Every
@@ -89,8 +91,11 @@ own: a frame claiming or decoding to more than `max` bytes is refused.
 
 A `Table` is safe for concurrent reads; an iterator is not. `Compact` runs up
 to `Options.Workers` merges at once: `Source.ReadAt` and `Merger` are called
-from all of them and must be safe for concurrent use; `Putter` is too, unless
-`Workers` is 1; `Opener` is called from one goroutine at a time.
+from all of them and must be safe for concurrent use (a merge also reads its
+next window from a goroutine of its own); `Putter` is called from up to
+`Options.Uploads` goroutines (`Workers` when negative) and must be safe for
+concurrent use unless that is 1; `Opener` is called from one goroutine at a
+time.
 
 `OpenTableAt` reads the index and the footer behind it in one range read and
 checks, in order, the footer's index position against the manifest, the
