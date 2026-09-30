@@ -210,20 +210,85 @@ func footerFor(off int64, idx []byte, count int64) []byte {
 	return append(f, tableMagic...)
 }
 
-// TestLegacyMagicOpens: a table written through v0.3.0, before the magic
-// changed to LSM1, has the same layout and still opens.
-func TestLegacyMagicOpens(t *testing.T) {
-	data, meta, err := BuildTable(putEntries(randKeys(rand.New(rand.NewPCG(9, 9)), 50, 'L')), 512)
+// TestUnfilteredMagicOpens: a table written before v0.7.0 has no key
+// filter (LSM1, and DWL1 through v0.3.0) and still opens, and every key
+// reads back through Get.
+func TestUnfilteredMagicOpens(t *testing.T) {
+	entries := putEntries(randKeys(rand.New(rand.NewPCG(9, 9)), 50, 'L'))
+	for _, magic := range []string{unfilteredMagic, legacyMagic} {
+		data, meta, err := BuildTable(entries, 512)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The same table as a writer before the filter built it: the index
+		// without its filter frame, and the footer behind it.
+		f := filterBytes(meta.Count)
+		meta.IndexLen -= f + int64(uvarintLen(uint64(f)))
+		idx := data[meta.IndexOff : meta.IndexOff+meta.IndexLen]
+		data = append(slices.Clone(data[:meta.IndexOff+meta.IndexLen]), footerFor(meta.IndexOff, idx, meta.Count)...)
+		copy(data[len(data)-4:], magic)
+		tb, err := OpenTableAt(context.Background(), BytesSource(data), meta)
+		if err != nil {
+			t.Fatalf("%s: %v", magic, err)
+		}
+		if tb.filter != nil {
+			t.Fatalf("%s: a filter from a table without one", magic)
+		}
+		for _, e := range entries {
+			if _, ok, err := tb.Get(context.Background(), e.Key); !ok || err != nil {
+				t.Fatalf("%s: %x: %v %v", magic, e.Key, ok, err)
+			}
+		}
+	}
+}
+
+// countingSource counts the block reads a lookup makes.
+type countingSource struct {
+	BytesSource
+	reads int
+}
+
+func (c *countingSource) ReadAt(ctx context.Context, off, length int64) ([]byte, error) {
+	c.reads++
+	return c.BytesSource.ReadAt(ctx, off, length)
+}
+
+// TestFilterSkipsAbsentKeys: a point lookup of a key the table does not
+// hold reads a block for about one key in a hundred, not for every key
+// inside the table's range; a key it holds is never ruled out.
+func TestFilterSkipsAbsentKeys(t *testing.T) {
+	rng := rand.New(rand.NewPCG(3, 4))
+	keys := randKeys(rng, 4000, 'I')
+	var held, absent [][]byte
+	for i, k := range keys { // interleaved: every absent key sits inside the range
+		if i%2 == 0 {
+			held = append(held, k)
+		} else {
+			absent = append(absent, k)
+		}
+	}
+	data, meta, err := BuildTable(putEntries(held), 512)
 	if err != nil {
 		t.Fatal(err)
 	}
-	copy(data[len(data)-4:], legacyMagic)
-	tb, err := OpenTableAt(context.Background(), BytesSource(data), meta)
+	src := &countingSource{BytesSource: data}
+	tb, err := OpenTableAt(context.Background(), src, meta)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n := len(collect(t, tb.Iter(context.Background()))); n != 50 {
-		t.Fatalf("%d entries", n)
+	src.reads = 0
+	for _, k := range absent {
+		if _, ok, err := tb.Get(context.Background(), k); ok || err != nil {
+			t.Fatalf("absent %x: %v %v", k, ok, err)
+		}
+	}
+	if src.reads > len(absent)*3/100 {
+		t.Fatalf("%d block reads for %d absent keys, want about 1%%", src.reads, len(absent))
+	}
+	for _, k := range held {
+		if _, ok, err := tb.Get(context.Background(), k); !ok || err != nil {
+			t.Fatalf("held %x: %v %v", k, ok, err)
+		}
 	}
 }
 

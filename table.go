@@ -24,11 +24,12 @@ import (
 // value of LargeValueBytes or more is a block of its own, so a point read
 // of a large value decodes that block and nothing else. The index is
 // uvarint(blocks), then per block uvarint(offset) uvarint(length)
-// uvarint(raw length) uvarint(len first) first uvarint(len last) last. The
-// footer is 32 bytes: index offset u64, index length u64, entry count u64,
-// crc32c(index) u32, magic.
+// uvarint(raw length) uvarint(len first) first uvarint(len last) last,
+// then the table's key filter (filter.go) as uvarint(len filter) filter.
+// The footer is 32 bytes: index offset u64, index length u64, entry count
+// u64, crc32c(index) u32, magic.
 const (
-	tableMagic  = "LSM1"
+	tableMagic  = "LSM2"
 	footerBytes = 32
 	// DefaultBlockBytes is the raw size a block is closed at.
 	DefaultBlockBytes = 64 << 10
@@ -44,9 +45,13 @@ const (
 	MaxTableBytes = 64 << 20
 )
 
-// legacyMagic is the footer magic tables carried through v0.3.0; the
-// layout is the same, so a reader accepts both.
-const legacyMagic = "DWL1"
+// unfilteredMagic is the footer magic of tables v0.4.0 through v0.6.2
+// wrote, and legacyMagic of those through v0.3.0: the same layout without
+// the key filter, read as a table whose filter holds every key.
+const (
+	unfilteredMagic = "LSM1"
+	legacyMagic     = "DWL1"
+)
 
 // ErrUnsupportedFormat is a table whose footer magic is neither the
 // current nor the legacy one: bytes from a newer format, not corruption.
@@ -67,8 +72,8 @@ const MaxEntryBytes = MaxTableBytes - entryOverhead
 
 // entryOverhead is the most a table of one entry adds around it: footer,
 // index count, block crc, mode and count, the entry's varints and kind,
-// and an index entry naming the key twice.
-const entryOverhead = footerBytes + binary.MaxVarintLen64 + blockOverhead + 2*binary.MaxVarintLen64 + 1 + 5*binary.MaxVarintLen64
+// an index entry naming the key twice, and a one-key filter.
+const entryOverhead = footerBytes + binary.MaxVarintLen64 + blockOverhead + 2*binary.MaxVarintLen64 + 1 + 5*binary.MaxVarintLen64 + binary.MaxVarintLen64 + filterBlockBytes
 
 // blockOverhead is a block's crc, mode byte and count varint.
 const blockOverhead = 5 + binary.MaxVarintLen64
@@ -182,7 +187,8 @@ type TableWriter struct {
 	meta       TableMeta
 	last       []byte
 	spaces     []SpaceRange
-	idx        int64 // index bytes of the closed blocks
+	idx        int64    // index bytes of the closed blocks
+	hashes     []uint64 // keyHash of every key, for the filter
 }
 
 // NewTableWriter returns a writer closing blocks at blockBytes of raw
@@ -223,6 +229,7 @@ func (w *TableWriter) Add(e Entry) error {
 	w.raw = binary.AppendUvarint(w.raw, uint64(len(e.Value)))
 	w.raw = append(w.raw, e.Value...)
 	w.n++
+	w.hashes = append(w.hashes, keyHash(e.Key))
 	if w.meta.Count == 0 {
 		w.meta.Min = bytes.Clone(e.Key)
 	}
@@ -244,7 +251,7 @@ func (w *TableWriter) Add(e Entry) error {
 // bound is the finished table's size from above: the blocks written, the
 // open block as if stored raw, and the index and footer they will need.
 func (w *TableWriter) bound() int64 {
-	n := int64(len(w.out)) + w.idx + footerBytes + binary.MaxVarintLen64
+	n := int64(len(w.out)) + w.idx + footerBytes + binary.MaxVarintLen64 + filterFrame(w.meta.Count+1)
 	if w.n > 0 {
 		n += blockOverhead + int64(len(w.raw)) + indexEntry(w.first, w.last)
 	}
@@ -325,6 +332,9 @@ func (w *TableWriter) Finish() ([]byte, TableMeta, error) {
 		idx = binary.AppendUvarint(idx, uint64(len(b.last)))
 		idx = append(idx, b.last...)
 	}
+	f := buildFilter(w.hashes)
+	idx = binary.AppendUvarint(idx, uint64(len(f)))
+	idx = append(idx, f...)
 	w.meta.IndexOff, w.meta.IndexLen = int64(len(w.out)), int64(len(idx))
 	w.out = append(w.out, idx...)
 	w.out = binary.BigEndian.AppendUint64(w.out, uint64(w.meta.IndexOff))
@@ -382,10 +392,11 @@ type BlockCache interface {
 // A Table is safe for concurrent reads; a TableIter is not. Name and Cache
 // are optional; the opener sets them when blocks should be cached.
 type Table struct {
-	src   Source
-	index []blockIndex
-	Name  string
-	Cache BlockCache
+	src    Source
+	index  []blockIndex
+	filter filter
+	Name   string
+	Cache  BlockCache
 }
 
 // OpenTableAt opens a table from its manifest metadata with one range read
@@ -411,7 +422,8 @@ func OpenTableAt(ctx context.Context, src Source, meta TableMeta) (*Table, error
 	if binary.BigEndian.Uint64(f[0:8]) != uint64(off) || binary.BigEndian.Uint64(f[8:16]) != uint64(n) {
 		return nil, fmt.Errorf("%w: lsm: table footer disagrees with the manifest", ErrCorrupt)
 	}
-	if m := string(f[28:]); m != tableMagic && m != legacyMagic {
+	m := string(f[28:])
+	if m != tableMagic && m != unfilteredMagic && m != legacyMagic {
 		return nil, fmt.Errorf("%w: magic %q", ErrUnsupportedFormat, m)
 	}
 	if crc32.Checksum(idx, castagnoli) != binary.BigEndian.Uint32(f[24:28]) {
@@ -440,6 +452,13 @@ func OpenTableAt(ctx context.Context, src Source, meta TableMeta) (*Table, error
 		}
 		prevEnd, prevLast = b.off+b.length, b.last
 		t.index = append(t.index, b)
+	}
+	if m == tableMagic {
+		f := d.bytes()
+		if d.err != nil || len(f) == 0 || len(f)%filterBlockBytes != 0 {
+			return nil, fmt.Errorf("%w: lsm: table filter", ErrCorrupt)
+		}
+		t.filter = filter(bytes.Clone(f))
 	}
 	if d.rest() != 0 {
 		return nil, fmt.Errorf("%w: lsm: table index trailing bytes", ErrCorrupt)
@@ -588,6 +607,15 @@ func (b *Block) search(target []byte) int {
 
 // Get is a point lookup: the newest version of key in this table.
 func (t *Table) Get(ctx context.Context, key []byte) (Entry, bool, error) {
+	return t.get(ctx, key, keyHash(key))
+}
+
+// get is Get with key's hash, which a lookup across tables computes once.
+// A key the filter rules out reads no block.
+func (t *Table) get(ctx context.Context, key []byte, h uint64) (Entry, bool, error) {
+	if !t.filter.mayHold(h) {
+		return Entry{}, false, nil
+	}
 	i := sort.Search(len(t.index), func(i int) bool { return bytes.Compare(t.index[i].last, key) >= 0 })
 	if i == len(t.index) || bytes.Compare(t.index[i].first, key) > 0 {
 		return Entry{}, false, nil

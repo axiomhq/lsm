@@ -70,12 +70,15 @@ plus one job per level, provided something calls `Pick` on an idle version.
 | part | bytes |
 | --- | --- |
 | block | crc32c u32, mode byte (0 zstd, 1 stored), payload; raw is uvarint(count), then per entry uvarint(len key) key, kind byte, uvarint(len value) value |
-| index | uvarint(blocks), then per block offset, length, raw length, first key, last key (all uvarint-framed) |
-| footer | 32 bytes: index offset u64, index length u64, entry count u64, crc32c(index) u32, magic `LSM1` (`DWL1` through v0.3.0, same layout, still read) |
+| index | uvarint(blocks), then per block offset, length, raw length, first key, last key (all uvarint-framed), then the key filter: uvarint(length), bloom bits |
+| footer | 32 bytes: index offset u64, index length u64, entry count u64, crc32c(index) u32, magic `LSM2` (`LSM1` through v0.6.2 and `DWL1` through v0.3.0: no key filter, still read) |
 
 Blocks close at 64 KiB raw (`DefaultBlockBytes`). A value of 4 KiB or more
 (`LargeValueBytes`) is a block of its own, so a point read decodes only that
-block. A block zstd cannot shrink by an eighth is stored raw. Every read
+block. A block zstd cannot shrink by an eighth is stored raw. The key
+filter is a bloom filter at 10 bits per key (about 1% false positives): a
+point lookup of a key a table does not hold reads no block of it, so a key
+written once costs one block read whatever the level-0 depth. Every read
 checks the checksums, and corrupt bytes return an error wrapping
 `lsm.ErrCorrupt`.
 
@@ -100,7 +103,7 @@ format change bumps its minor version, and a reader keeps accepting the
 previous magic when the layout did not change.
 
 An entry must fit a table of its own: `Add` returns `lsm.ErrEntryTooLarge`
-past `lsm.MaxEntryBytes` (value plus three times the key, 128 bytes under
+past `lsm.MaxEntryBytes` (value plus three times the key, 202 bytes under
 `MaxTableBytes`), so a compaction can always start a file with any entry it
 reads. Writers before v0.4.0 checked only the finished table, so a table they
 wrote could hold an entry past that limit: a key over about a third of

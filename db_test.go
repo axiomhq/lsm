@@ -383,7 +383,7 @@ func TestCompactLeavesUntouchedFiles(t *testing.T) {
 	ctx := context.Background()
 	st := newMemStore()
 	o := DefaultOptions()
-	o.FileBytes = 200 // the ten-key files (~105 bytes) are past half a file
+	o.FileBytes = 300 // the ten-key files (~170 bytes with their filter) are past half a file
 	put := func(key string, x uint32) Entry {
 		return Entry{Key: []byte(key), Kind: KindPut, Value: setmerge.Value(set(x))}
 	}

@@ -205,6 +205,7 @@ func (r Reader) Iter(ctx context.Context, v Version, lo, hi []byte) (Iterator, e
 // versions found resolved as Iter resolves them.
 func (r Reader) Get(ctx context.Context, v Version, key []byte) ([]byte, bool, error) {
 	var hits []Entry
+	h := keyHash(key)
 	// The files newest first, without materialising the overlapping list:
 	// a point lookup is the hottest read.
 walk:
@@ -213,7 +214,7 @@ walk:
 			if !f.Overlaps(key, nil) || bytes.Compare(f.Min, key) > 0 {
 				continue
 			}
-			e, ok, err := r.getIn(ctx, f, key)
+			e, ok, err := r.getIn(ctx, f, key, h)
 			if err != nil {
 				return nil, false, err
 			}
@@ -254,6 +255,7 @@ type Located struct {
 // decoded anyway. ok is false for a missing or deleted key. A merge entry
 // is an error: Locate does not resolve merges.
 func (r Reader) Locate(ctx context.Context, v Version, key []byte) (l Located, ok bool, err error) {
+	h := keyHash(key)
 	for _, level := range v.Levels {
 		for _, f := range level {
 			if !f.Overlaps(key, nil) || bytes.Compare(f.Min, key) > 0 {
@@ -263,10 +265,13 @@ func (r Reader) Locate(ctx context.Context, v Version, key []byte) (l Located, o
 			if err != nil {
 				return Located{}, false, fmt.Errorf("lsm: open %s: %w", f.Key, err)
 			}
+			if !t.filter.mayHold(h) {
+				continue
+			}
 			if off, length, ok := t.Single(key); ok {
 				return Located{File: f, Table: t, Off: off, Length: length}, true, nil
 			}
-			e, ok, err := t.Get(ctx, key)
+			e, ok, err := t.get(ctx, key, h)
 			if err != nil {
 				return Located{}, false, fmt.Errorf("lsm: %s: %w", f.Key, err)
 			}
@@ -286,12 +291,12 @@ func (r Reader) Locate(ctx context.Context, v Version, key []byte) (l Located, o
 }
 
 // getIn is one table's point lookup.
-func (r Reader) getIn(ctx context.Context, f FileRef, key []byte) (Entry, bool, error) {
+func (r Reader) getIn(ctx context.Context, f FileRef, key []byte, h uint64) (Entry, bool, error) {
 	t, err := r.Open(ctx, f)
 	if err != nil {
 		return Entry{}, false, fmt.Errorf("lsm: open %s: %w", f.Key, err)
 	}
-	e, ok, err := t.Get(ctx, key)
+	e, ok, err := t.get(ctx, key, h)
 	if err != nil {
 		return Entry{}, false, fmt.Errorf("lsm: %s: %w", f.Key, err)
 	}
