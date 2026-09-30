@@ -174,6 +174,7 @@ type TableMeta struct {
 type TableWriter struct {
 	blockBytes int
 	raw        []byte // current block
+	blk        []byte // current block with its entry count, as flushBlock writes it (scratch)
 	n          int    // entries in current block
 	first      []byte
 	out        []byte
@@ -275,26 +276,30 @@ func (w *TableWriter) flushBlock() {
 	if w.n == 0 {
 		return
 	}
-	raw := binary.AppendUvarint(make([]byte, 0, len(w.raw)+8), uint64(w.n))
+	// The block is its entry count, then its entries, built in a scratch
+	// the writer reuses and written straight into the table after its
+	// checksum: no copy of the block per step.
+	raw := binary.AppendUvarint(w.blk[:0], uint64(w.n))
 	raw = append(raw, w.raw...)
+	w.blk = raw
+	off := int64(len(w.out))
+	w.out = append(w.out, 0, 0, 0, 0) // the checksum, over the payload once it is written
 	// A block that is one large value (dense or already-encoded bytes,
 	// read by the thousand) is stored as it is; the fifth zstd saves on
 	// them is not worth decoding on every read. The rest is stored only
 	// when zstd saves less than an eighth. A stored block's decode aliases
 	// the table bytes and costs a checksum and nothing else.
-	var payload []byte
-	if w.n == 1 && len(w.raw) >= LargeValueBytes {
-		payload = append([]byte{blockStored}, raw...)
-	} else {
-		payload = append([]byte{blockZstd}, blockEncoder.EncodeAll(raw, nil)...)
-		if len(payload)-1 > len(raw)-len(raw)/8 {
-			payload = append(payload[:0], blockStored)
-			payload = append(payload, raw...)
+	stored := w.n == 1 && len(w.raw) >= LargeValueBytes
+	if !stored {
+		w.out = blockEncoder.EncodeAll(raw, append(w.out, blockZstd))
+		if stored = len(w.out)-int(off)-5 > len(raw)-len(raw)/8; stored {
+			w.out = w.out[:off+4]
 		}
 	}
-	off := int64(len(w.out))
-	w.out = binary.BigEndian.AppendUint32(w.out, crc32.Checksum(payload, castagnoli))
-	w.out = append(w.out, payload...)
+	if stored {
+		w.out = append(append(w.out, blockStored), raw...)
+	}
+	binary.BigEndian.PutUint32(w.out[off:], crc32.Checksum(w.out[off+4:], castagnoli))
 	w.index = append(w.index, blockIndex{off: off, length: int64(len(w.out)) - off, rawLen: int64(len(raw)),
 		first: bytes.Clone(w.first), last: bytes.Clone(w.last)})
 	w.idx += indexEntry(w.first, w.last)

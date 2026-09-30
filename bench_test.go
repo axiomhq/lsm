@@ -106,3 +106,33 @@ func BenchmarkBlockDecode(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkBuildTable builds one 32 MiB table of small compressible
+// entries, the shape of a flush's postings and document blocks, with a
+// large incompressible value every so often.
+func BenchmarkBuildTable(b *testing.B) {
+	rng := rand.New(rand.NewPCG(1, 2))
+	var entries []Entry
+	for i, n := 0, 0; n < 32<<20; i++ {
+		v := make([]byte, 64+rng.IntN(512))
+		if i%64 == 0 {
+			v = make([]byte, LargeValueBytes)
+			for j := range v {
+				v[j] = byte(rng.IntN(256))
+			}
+		} else {
+			for j := range v {
+				v[j] = byte('a' + rng.IntN(8))
+			}
+		}
+		key := binary.BigEndian.AppendUint64([]byte{'D'}, uint64(i))
+		entries = append(entries, Entry{Key: key, Kind: KindPut, Value: v})
+		n += len(key) + len(v)
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, _, err := BuildTable(entries, 0); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
