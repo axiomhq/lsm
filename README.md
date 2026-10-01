@@ -1,82 +1,248 @@
 # lsm
 
+[![go.dev reference](https://img.shields.io/badge/go.dev-reference-007d9c?logo=go&logoColor=white&style=flat-square)](https://pkg.go.dev/github.com/axiomhq/lsm)
+[![Latest Release](https://img.shields.io/github/v/release/axiomhq/lsm?style=flat-square)](https://github.com/axiomhq/lsm/releases/latest)
+
+lsm is a log-structured merge tree for object storage.
+
+The basic idea is that an LSM tree is mostly a file format and a set of rules
+for merging files, and neither one needs to own a disk. So this package doesn't
+do any I/O. You give it sorted entries, and it gives you table bytes to store.
+You give it byte ranges back, and it answers reads. You keep the `Version`,
+which lists the live tables, in a manifest of your own, and you update it with
+a compare-and-swap. Every table is written once and never modified, which is
+exactly what object stores like S3 are good at.
+
+A key's history is a stack of versions: `Put`, `Delete`, and `Merge`. Reads
+fold that history into one value per key. Compaction is that same fold,
+written back out one level deeper.
+
 ```sh
 go get github.com/axiomhq/lsm
 ```
 
-Sorted, immutable key-value tables in levels, with merge and compaction,
-built for object storage. Every file is written once and read by byte range.
-A key's history is versions (`Put`, `Delete`, `Merge`) stored as values. The
-package does no I/O: you store the table bytes, you read byte ranges back, and
-you own the manifest that holds the `Version` (compare-and-swap it).
+## Usage
 
-## Write a table
+Here's the whole lifecycle: flush, compact, read. A map stands in for the
+object store. [example_test.go](example_test.go) has runnable examples,
+including merge operands.
 
-1. Sort your entries by key, one entry per key: `lsm.Entry{Key, Kind, Value}` with `Kind` one of `KindPut`, `KindDelete`, `KindMerge`.
-2. Flush them as a level-0 table: `next, ref, err := lsm.Flush(ctx, v, entries, lsm.DefaultOptions(), put)`.
-   `put` is `func(ctx, level int, seq uint64, data []byte) (key string, err error)`: store `data`, return its object key.
-3. Save `next` in your manifest with a conditional write. On a lost race, reload and retry.
+```go
+ctx := context.Background()
 
-For bytes without levels, `data, meta, err := lsm.BuildTable(entries, lsm.DefaultBlockBytes)`, or `lsm.NewTableWriter(blockBytes)` with `Add` and `Finish` to stream.
+// A map stands in for your object store.
+objects := map[string][]byte{}
 
-## Read
+// put stores a table and returns the object key it lives under.
+put := func(ctx context.Context, level int, seq uint64, data []byte) (string, error) {
+	key := fmt.Sprintf("%d-%d", level, seq)
+	objects[key] = data
+	return key, nil
+}
 
-1. Write an `Opener`: `func(ctx, f lsm.FileRef) (*lsm.Table, error)`. Inside, call `lsm.OpenTableAt(ctx, src, f.TableMeta)`.
-   `src` implements `ReadAt(ctx, off, length int64) ([]byte, error)`. Use `lsm.BytesSource(data)` for bytes in memory.
-2. Build a reader: `r := lsm.Reader{Open: open, Merger: setmerge.Merger{}}`.
-3. Point read: `value, ok, err := r.Get(ctx, v, key)`.
-4. Range read: `it, err := r.Iter(ctx, v, lo, hi)`, then `for ok := it.SeekGE(nil); ok; ok = it.Next() { it.Key(); it.Value() }` and check `it.Err()`. A nil seek lands on `lo`.
+// open reads a table back. A real Source reads byte ranges of an object.
+open := func(ctx context.Context, f lsm.FileRef) (*lsm.Table, error) {
+	return lsm.OpenTableAt(ctx, lsm.BytesSource(objects[f.Key]), f.TableMeta)
+}
 
-For large put-only values, `l, ok, err := r.Locate(ctx, v, key)` returns the
-value's extent in its table (`Table.Single`) when it sits alone in a stored
-block, so you read just those bytes with `l.Table.ReadAt`. `l.File.Key` names the
-object it came from.
+opts := lsm.DefaultOptions()
+opts.L0Trigger = 2 // compact early, for the demo
+opts.Workers = 1   // put isn't safe for concurrent use
 
-`t.Span(lo, hi)` is the range of a table's block indexes that may hold keys
-in `[lo, hi)`, from the in-memory index alone: a cache signature can name the
-blocks a key range touches without reading one.
+// Two flushes, each a sorted batch with one entry per key.
+var v lsm.Version
+v, _, err := lsm.Flush(ctx, v, []lsm.Entry{
+	{Key: []byte("a"), Kind: lsm.KindPut, Value: []byte("1")},
+	{Key: []byte("b"), Kind: lsm.KindPut, Value: []byte("2")},
+}, opts, put)
+if err != nil {
+	log.Fatal(err)
+}
+v, _, err = lsm.Flush(ctx, v, []lsm.Entry{
+	{Key: []byte("a"), Kind: lsm.KindDelete},
+	{Key: []byte("c"), Kind: lsm.KindPut, Value: []byte("3")},
+}, opts, put)
+if err != nil {
+	log.Fatal(err)
+}
 
-`Merger` folds `KindMerge` operands onto the value beneath them; leave it nil
-when no key uses `KindMerge`. `setmerge.Merger` (import
-`github.com/axiomhq/lsm/setmerge`) ships with the module: roaring-bitmap sets
-with add/remove operands (`setmerge.Value`, `setmerge.Operand`,
-`setmerge.Decode`).
+// Compact until Pick has nothing left to do.
+r := lsm.Reader{Open: open}
+for job, ok := lsm.Pick(v, opts); ok; job, ok = lsm.Pick(v, opts) {
+	if v, _, err = lsm.Compact(ctx, v, job, opts, r, put); err != nil {
+		log.Fatal(err)
+	}
+}
+fmt.Printf("level 0: %d files, level 1: %d files\n", len(v.Levels[0]), len(v.Levels[1]))
 
-## Compact
+// Read it all back.
+it, err := r.Iter(ctx, v, nil, nil)
+if err != nil {
+	log.Fatal(err)
+}
+for ok := it.SeekGE(nil); ok; ok = it.Next() {
+	fmt.Printf("%s=%s\n", it.Key(), it.Value())
+}
+if err := it.Err(); err != nil {
+	log.Fatal(err)
+}
+```
 
-1. Pick a job: `job, ok := lsm.Pick(v, opts)`. `ok` is false when every level is in shape.
-2. Run it: `next, edit, err := lsm.Compact(ctx, v, job, opts, r, put)`, with `r` the `Reader` from Read.
-3. Save `next` with a conditional write. Delete the inputs' objects only after that write succeeds.
-   On error, `edit.Add` lists the output files already stored, orphans you may delete, and `edit.NextSeq` is the first sequence no output used. Before retrying, apply `lsm.Edit{NextSeq: edit.NextSeq}` to the version you retry from, never the failed edit's `Add`.
-   `seq` is unique within one level of a version, not across writers that start from one: name objects by more than `seq` when writers race, and identify files by `Key`.
-4. Lost the write to a newer version `head`? Rebase: `next, err = head.Rebase(v, edit)`, then write again. `lsm.ErrStale` means another compaction changed the same files: delete the outputs and pick again.
+```
+level 0: 0 files, level 1: 2 files
+b=2
+c=3
+```
 
-`Pick` tiers by default (`docs/tiered.md`), because it rewrites a byte fewer times than leveled when level 0 fills faster than jobs finish: on one ingest-heavy workload it took 4,355 docs/s against leveled's 3,596, and in simulation it reads and writes 9.5x the ingested bytes against 25x.
+The delete hid `a`, and compaction into the bottom level dropped it. Level 1
+ended up with two files, not one, because of key spaces.
 
-- Every level below 0 is a sorted run, newest first, and each key space has its own stack of runs.
+### Key spaces
+
+The first byte of every key is its space. This is a format rule, not a
+suggestion: compaction never writes a file that spans two spaces, it tracks
+each file's per-space ranges (`FileRef.Spaces`), and it leaves alone any file
+that no input writes to. The package doesn't interpret the space byte beyond
+that.
+
+### Writing
+
+Sort your entries by key, one entry per key, and call `lsm.Flush`. It writes
+one level-0 table through your `Putter` and returns the next `Version`. Save
+that version with a conditional write. If you lose the race, reload and try
+again.
+
+A `Putter` stores `data` and returns its object key. `seq` is unique within
+one level of a version, and no more. Two writers that start from the same
+version hand out the same seqs, so if your writers can race, don't name
+objects by `seq` alone: add the level and a writer ID, or let the store pick
+the name. A file's identity is `FileRef.Key`.
+
+If you only want table bytes, without levels, use
+`lsm.BuildTable(entries, lsm.DefaultBlockBytes)`, or stream with
+`lsm.NewTableWriter(blockBytes)`, `Add`, and `Finish`.
+
+### Reading
+
+A `Reader` needs an `Opener`, which turns a `FileRef` into a `*Table`. Call
+`lsm.OpenTableAt` with a `Source`, which is anything with
+`ReadAt(ctx, off, length int64) ([]byte, error)`. `lsm.BytesSource` wraps
+bytes in memory.
+
+- `r.Get(ctx, v, key)` is a point read.
+- `r.Iter(ctx, v, lo, hi)` is a range read over `[lo, hi)`. A nil `SeekGE`
+  lands on `lo`. Check `it.Err()` when you're done.
+- `r.Locate(ctx, v, key)` is for large put-only values. When the value sits
+  alone in a stored block, you get its extent in the table (`Table.Single`),
+  and you can read exactly those bytes with `l.Table.ReadAt`. `l.File.Key`
+  names the object it came from.
+- `t.Span(lo, hi)` returns the block indexes of a table that may hold keys in
+  `[lo, hi)`, from the in-memory index alone. That's enough to build a cache
+  key for a range without reading any blocks.
+
+### Merging
+
+`KindMerge` entries are operands, and a `Merger` folds them onto the value
+beneath them. Leave `Reader.Merger` nil if you never write `KindMerge`.
+
+The module ships one Merger, `setmerge.Merger`, for roaring-bitmap sets with
+add and remove operands. Build values with `setmerge.Value`, operands with
+`setmerge.Operand`, and read them back with `setmerge.Decode`.
+
+### Compacting
+
+Compaction is three steps.
+
+1. `job, ok := lsm.Pick(v, opts)` picks the next job. `ok` is false when
+   every level is in shape.
+2. `next, edit, err := lsm.Compact(ctx, v, job, opts, r, put)` runs it.
+3. Save `next` with a conditional write. Delete the input objects only after
+   that write succeeds.
+
+If `Compact` fails, `edit.Add` lists the outputs it already stored. Those are
+orphans, and you can delete them. `edit.NextSeq` is the first sequence no
+output used. Before you retry, apply `lsm.Edit{NextSeq: edit.NextSeq}` to the
+version you retry from, so the retry doesn't reuse those seqs. Never apply the
+failed edit's `Add`.
+
+If you lose the write to a newer version `head`, you don't have to throw the
+work away. `head.Rebase(v, edit)` replays the compaction onto `head`, and you
+can write again. Rebase works when the only other writer added level-0 files
+with `Flush`. Anything else, like a second compaction over the same files,
+returns `lsm.ErrStale`: delete your outputs and pick again.
+
+## Tiered and leveled compaction
+
+`Pick` uses tiered compaction by default. It rewrites each byte fewer times
+than leveled compaction does when level 0 fills faster than jobs finish. On one
+ingest-heavy workload, tiered took 4,355 docs/s to leveled's 3,596. In
+simulation, it reads and writes 9.5x the ingested bytes, where leveled reads
+and writes 25x. [docs/tiered.md](docs/tiered.md) has the details, but the
+rules are short.
+
+- Every level below 0 is one sorted run, newest first, and each key space has
+  its own stack of runs.
 - Level 0 becomes a new run.
-- A space's runs merge by size: equal runs pair up like the bits of a binary counter.
-- A space merges by count past `Options.MaxRuns` (8).
+- A space's runs merge by size. Equal runs pair up like the bits of a binary
+  counter.
+- Past `Options.MaxRuns` (8) runs, a space merges by count.
 
-A byte is rewritten about log2(space bytes / level-0 bytes) times, not once per level-0 job. A new-run job (`Job.NewRun`) moves the runs it displaces one level deeper. Its `Edit` lists moved files in `Del` and in `Add` below level 1 under their own keys, so `Add[Level+1]` is still exactly the new outputs.
+So a byte is rewritten about log2(space bytes / level-0 bytes) times, rather
+than once per level-0 job. A new-run job (`Job.NewRun`) moves the runs it
+displaces one level deeper. Its `Edit` lists those moved files in `Del`, and
+in `Add` below level 1 under their own keys, so `Add[Level+1]` is still
+exactly the new outputs.
 
-`Options.Leveled: true` picks by level budgets instead (the v0.9.0 picker), and drains first: a level over its budget (`BaseBytes` × `LevelRatio`^(n-1)) moves the contiguous run of files with the least overlap below per byte, at least its excess and at most `BaseBytes`; the level furthest over goes first. Level 0 compacts at `L0Trigger` files only when every deeper level is within budget, so each level-0 job is followed by the deeper work it causes and level 1 stays near `BaseBytes`. A level-0 job takes the oldest file's key space (first key byte) and every level-0 file overlapping it: write level-0 tables one space each and a job rewrites only that space's share of level 1. A writer that must bound level 0 while deeper levels drain holds its flushes back itself.
+Set `Options.Leveled` to get the leveled picker from v0.9.0 instead. Each
+level has a budget of `BaseBytes` × `LevelRatio`^(n-1), and the picker drains
+before it fills.
 
-Rebase holds when the only other writer adds level-0 files (`Flush`).
-`Options.Workers` caps the key-range partitions merged at once.
-`Options.ReadAheadBytes` (1 MiB) is the window a merge reads its inputs in: one range read per window, not per block, with the next window read while the merge walks this one.
-`Options.Uploads` (`Workers`) caps the finished output files being put at once; a merge hands a file to `put` and goes on, and `Compact` returns once every put has.
+- A level over budget moves the contiguous run of files that overlaps the
+  level below the least, per byte. It moves at least its excess, and at most
+  `BaseBytes`. The level furthest over budget goes first.
+- Level 0 compacts at `L0Trigger` files, but only when every deeper level is
+  within budget. That way each level-0 job is followed by the deeper work it
+  causes, and level 1 stays near `BaseBytes`.
+- A level-0 job takes the oldest file's key space and every level-0 file that
+  overlaps it. If you write each level-0 table to one space, a job rewrites
+  only that space's share of level 1.
 
-`Options.MaxTableAge` bounds how long a delete or an overwrite waits above
-the bottom level, where the versions it supersedes are dropped. Every
-`FileRef` carries `Oldest`, the unix second of the oldest write it may still
-hold a superseded version of: the write time for a `Flush` and for a
-compaction into the bottom, else the oldest of the files merged into it.
-When no size rule fires, `Pick` compacts the shallowest file above the bottom
-level whose `Oldest` is past the age (level 0 whole), and the next picks
-carry it down. `Oldest` 0 (a manifest before v0.6.0) counts as the epoch. A
-key's superseded bytes are gone from the tables within about `MaxTableAge`
-plus one job per level, provided something calls `Pick` on an idle version.
+The leveled picker doesn't hold back your flushes. If you need to bound level
+0 while deeper levels drain, that's up to you.
+
+## Options
+
+- `Options.Workers` caps how many key-range partitions one compaction merges
+  at once.
+- `Options.ReadAheadBytes` (1 MiB) is the window a merge reads its inputs in.
+  That's one range read per window, not per block, and the next window is
+  read while the merge walks the current one.
+- `Options.Uploads` (defaults to `Workers`) caps how many finished output
+  files are being put at once. A merge hands a file to `put` and moves on,
+  and `Compact` returns once every put has finished.
+- `Options.MaxTableAge` bounds how long a delete or overwrite can wait above
+  the bottom level, which is where the versions it supersedes get dropped.
+
+That last one needs a bit more explanation. Every `FileRef` carries `Oldest`,
+the unix second of the oldest write whose superseded versions it may still
+hold. For a `Flush`, or a compaction into the bottom level, that's the write
+time. Otherwise it's the oldest `Oldest` of the files merged into it. When no
+size rule fires, `Pick` compacts the shallowest file above the bottom level
+whose `Oldest` is past the age (level 0 goes whole), and later picks carry it
+down. A key's superseded bytes are gone within about `MaxTableAge` plus one
+job per level, as long as something keeps calling `Pick` on an idle version.
+An `Oldest` of 0, from a manifest written before v0.6.0, counts as the epoch.
+
+## Concurrency
+
+A `Table` is safe for concurrent reads. An iterator isn't.
+
+`Compact` runs up to `Options.Workers` merges at once, so `Source.ReadAt` and
+`Merger` must be safe for concurrent use. Each merge also reads its next
+window from a goroutine of its own. `Putter` is called from up to
+`Options.Uploads` goroutines (`Workers` when negative), so it must be safe for
+concurrent use unless that number is 1. `Opener` is called from one goroutine
+at a time.
 
 ## Table format
 
@@ -86,61 +252,81 @@ plus one job per level, provided something calls `Pick` on an idle version.
 | index | uvarint(blocks), then per block offset, length, raw length, first key, last key (all uvarint-framed), then the key filter: uvarint(length), bloom bits |
 | footer | 32 bytes: index offset u64, index length u64, entry count u64, crc32c(index) u32, magic `LSM2` (`LSM1` through v0.6.2 and `DWL1` through v0.3.0: no key filter, still read) |
 
-Blocks close at 64 KiB raw (`DefaultBlockBytes`). A value of 4 KiB or more
-(`LargeValueBytes`) is a block of its own, so a point read decodes only that
-block. A block zstd cannot shrink by an eighth is stored raw. The key
-filter is a bloom filter at 10 bits per key (about 1% false positives): a
-point lookup of a key a table does not hold reads no block of it, so a key
-written once costs one block read whatever the level-0 depth. A point
-lookup binary-searches each level below 0 for its one candidate file, so
-its cost grows with the level count, not the file count. Every read
-checks the checksums, and corrupt bytes return an error wrapping
-`lsm.ErrCorrupt`.
+Blocks close at 64 KiB of raw bytes (`DefaultBlockBytes`). A value of 4 KiB or
+more (`LargeValueBytes`) gets a block of its own, so a point read of it
+decodes only that block. If zstd can't shrink a block by at least an eighth,
+the block is stored raw.
 
-`lsm.DecompressBounded(data, max)` is that size-capped zstd decode on its
-own: a frame claiming or decoding to more than `max` bytes is refused.
+The key filter is a bloom filter at 10 bits per key, which gives about 1%
+false positives. A point lookup of a key that a table doesn't hold reads no
+blocks from it, so a key written once costs one block read, however deep
+level 0 gets. Below level 0, a point lookup binary-searches each level for its
+one candidate file, so its cost grows with the number of levels, not the
+number of files.
 
-## Concurrency and format
+Every read verifies checksums. Corrupt bytes return an error that wraps
+`lsm.ErrCorrupt`. `lsm.DecompressBounded(data, max)` exposes the size-capped
+zstd decode that every block read uses: it refuses a frame that claims, or
+decodes to, more than `max` bytes.
 
-A `Table` is safe for concurrent reads; an iterator is not. `Compact` runs up
-to `Options.Workers` merges at once: `Source.ReadAt` and `Merger` are called
-from all of them and must be safe for concurrent use (a merge also reads its
-next window from a goroutine of its own); `Putter` is called from up to
-`Options.Uploads` goroutines (`Workers` when negative) and must be safe for
-concurrent use unless that is 1; `Opener` is called from one goroutine at a
-time.
+## Compatibility
 
-`OpenTableAt` reads the index and the footer behind it in one range read and
-checks, in order, the footer's index position against the manifest, the
-magic, and the index crc32c. The 32-byte footer frame (index offset and
-length first, magic last) is fixed for every format, so a footer that
-disagrees with the manifest is `ErrCorrupt` and a magic the reader does not
-know is `lsm.ErrUnsupportedFormat`: bytes from a newer format, not
-corruption. The magic is the format's version; while the module is v0 a
-format change bumps its minor version, and a reader keeps accepting the
-previous magic when the layout did not change.
+`OpenTableAt` fetches the index and the footer behind it in one range read.
+It checks, in order, the footer's index position against the manifest, the
+magic, and the index crc32c. The 32-byte footer frame, with index offset and
+length first and magic last, is the same in every format. So a footer that
+disagrees with the manifest is `ErrCorrupt`, but a magic the reader doesn't
+know is `lsm.ErrUnsupportedFormat`: those are bytes from a newer format, not
+corruption.
 
-An entry must fit a table of its own: `Add` returns `lsm.ErrEntryTooLarge`
-past `lsm.MaxEntryBytes` (value plus three times the key, 202 bytes under
-`MaxTableBytes`), so a compaction can always start a file with any entry it
-reads. Writers before v0.4.0 checked only the finished table, so a table they
-wrote could hold an entry past that limit: a key over about a third of
+The magic is the format's version. While the module is v0, a format change
+bumps the minor version, and readers keep accepting the previous magic when
+the layout didn't change.
+
+The manifest encoding is the JSON field names on `Version`, `FileRef`,
+`TableMeta`, and `SpaceRange`. They're stable: a manifest written by any
+earlier version decodes with every field in place.
+
+### Entry size
+
+An entry has to fit in a table of its own, so a compaction can always start a
+new file with whatever entry it reads next. `Add` returns
+`lsm.ErrEntryTooLarge` past `lsm.MaxEntryBytes`, which is the value plus three
+times the key, 202 bytes under `MaxTableBytes`. A block's raw bytes never
+exceed `MaxTableBytes`, whatever `BlockBytes` says, and a compaction closes
+an output file before the entry that would push it past `FileBytes`.
+
+Writers before v0.4.0 checked only the finished table, so a table they wrote
+can hold an entry past that limit. That means a key over about a third of
 `MaxTableBytes` with a small value, or a value plus three times its key within
-about a hundred bytes of `MaxTableBytes`, wherever it sat in its block. It still reads, but a compaction
-over it fails with `ErrEntryTooLarge`. A block's raw bytes never exceed `MaxTableBytes` whatever
-`BlockBytes` says, and a compaction closes an output file before the entry
-that would take it past `FileBytes`.
+about a hundred bytes of `MaxTableBytes`, wherever it sits in its block. The
+table still reads fine, but a compaction over it fails with
+`ErrEntryTooLarge`.
 
-The manifest encoding is the json names on `Version`, `FileRef`, `TableMeta`
-and `SpaceRange`. They are stable: a manifest written by any earlier version
-decodes with every field in place.
+## Subpackages
 
-## Key components and postings
+Package keyenc builds composite keys whose byte order matches the order of
+their values. `keyenc.AppendString` and `keyenc.AppendFloat64` encode,
+`keyenc.String` and `keyenc.Float64` decode, and `keyenc.PrefixEnd(p)` is the
+exclusive upper bound of a scan over prefix `p`.
 
-1. `keyenc.AppendString` and `keyenc.AppendFloat64` build composite keys whose byte order is the value order. `keyenc.String` and `keyenc.Float64` read them back, and `keyenc.PrefixEnd(p)` is the exclusive upper bound of a scan over prefix `p`.
-2. `postings.Encode` and `postings.Decode` store (docnum, weight) lists sorted by docnum as delta varints. Corrupt bytes return an error wrapping `lsm.ErrCorrupt`.
+Package postings stores (docnum, weight) lists, sorted by docnum, as delta
+varints, with `postings.Encode` and `postings.Decode`. Corrupt bytes return an
+error that wraps `lsm.ErrCorrupt`.
 
-## Test
+## Comparisons
+
+[Pebble](https://github.com/cockroachdb/pebble),
+[RocksDB](https://github.com/facebook/rocksdb), and
+[goleveldb](https://github.com/syndtr/goleveldb) are complete storage engines.
+They own a directory: a write-ahead log, a memtable, and a manifest. lsm is
+the part underneath. It has no log and no memtable, and it doesn't own a
+manifest. You buffer and sort writes yourself, you decide where the bytes
+live, and you decide how versions are published. In exchange, every file is
+immutable and read by byte range, which fits object storage, and readers and
+compactors can run anywhere that can reach the objects.
+
+## Testing
 
 ```sh
 go test -race ./...
