@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Prepares a fresh Amp orb: installs the Go toolchain go.mod asks for,
+# downloads modules, and warms the build cache for `go test -race ./...`.
+# Idempotent: a warm orb skips the download and reuses the caches.
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+step() {
+	local name="$1"
+	shift
+	local start=$SECONDS
+	echo "==> $name"
+	"$@"
+	echo "<== $name ($((SECONDS - start))s)"
+}
+
+go_root=/usr/local/go
+# The go directive, e.g. "1.27" or "1.27.1".
+go_want="$(awk '$1 == "go" { print $2; exit }' go.mod)"
+go_minor="$(cut -d. -f1,2 <<<"$go_want")"
+
+# Prints the installed version without letting go.mod trigger a toolchain download.
+installed_go() {
+	[[ -x "$go_root/bin/go" ]] || return 1
+	GOTOOLCHAIN=local "$go_root/bin/go" env GOVERSION
+}
+
+# True when the installed version is in go.mod's minor release and at least
+# the go directive: "1.27" accepts any 1.27.x, "1.27.1" requires >= 1.27.1.
+satisfies() {
+	local have="${1#go}"
+	[[ "$have" == "$go_minor".* ]] &&
+		[[ "$(printf '%s\n' "$have" "$go_want" | sort -V | head -1)" == "$go_want" ]]
+}
+
+install_go() {
+	local have
+	have="$(installed_go || true)"
+	if [[ -n "$have" ]] && satisfies "$have"; then
+		echo "$have already installed"
+		return
+	fi
+
+	# Newest stable patch of the minor release; releases are listed newest first.
+	local release
+	release="$(curl -fsSL 'https://go.dev/dl/?mode=json&include=all' |
+		jq -er --arg prefix "go$go_minor." '
+			[.[] | select(.stable and (.version | startswith($prefix)))]
+			| first
+			| .version as $v
+			| .files[] | select(.os == "linux" and .arch == "amd64" and .kind == "archive")
+			| "\($v) \(.filename) \(.sha256)"')"
+	local version filename sha256
+	read -r version filename sha256 <<<"$release"
+
+	echo "installing $version (have: ${have:-none})"
+	local tmp
+	tmp="$(mktemp -d)"
+	curl -fsSL -o "$tmp/$filename" "https://go.dev/dl/$filename"
+	echo "$sha256  $tmp/$filename" | sha256sum -c --quiet
+	sudo rm -rf "$go_root"
+	sudo tar -C /usr/local -xzf "$tmp/$filename"
+	rm -rf "$tmp"
+}
+
+link_go() {
+	# /usr/local/bin is on PATH for Amp, login shells, and orb services.
+	sudo ln -sfn "$go_root/bin/go" /usr/local/bin/go
+	sudo ln -sfn "$go_root/bin/gofmt" /usr/local/bin/gofmt
+	go version
+}
+
+step "install Go $go_want" install_go
+step "link go into /usr/local/bin" link_go
+step "go mod download" go mod download
+# Compiles every package and test binary with the race detector, matching the
+# README's test command, so the first test run in a new orb starts warm.
+step "warm build cache" go test -race -run '^$' ./...
