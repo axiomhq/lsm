@@ -25,7 +25,7 @@ func TestMergeIterPrecedence(t *testing.T) {
 	m := NewMerge(newer, older)
 	var got []string
 	for ok := m.SeekGE(nil); ok; ok = m.Next() {
-		got = append(got, fmt.Sprintf("%s:%d:%s:%d", m.Key(), m.Kind(), m.Value(), m.Source()))
+		got = append(got, fmt.Sprintf("%s:%d:%s:%d", m.Key(), m.Kind(), m.Value(), m.Precedence()))
 	}
 	want := []string{"a:1:a:1", "b:1:new:0", "b:1:old:1", "c:1:c:1", "d:2::0"}
 	if !slices.Equal(got, want) {

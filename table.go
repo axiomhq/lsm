@@ -65,9 +65,8 @@ var ErrUnsupportedFormat = errors.New("lsm: unsupported table format")
 // could hold an entry past this limit: a key over about a third of
 // MaxTableBytes with a small value, or a value plus three times its key
 // within about a hundred bytes of MaxTableBytes, wherever it sat in its
-// block. Such a table
-// still reads, but a compaction over it fails with ErrEntryTooLarge. No
-// such entry is known to exist.
+// block. Such a table still reads, but a compaction over it fails with
+// ErrEntryTooLarge. No such entry is known to exist.
 const MaxEntryBytes = MaxTableBytes - entryOverhead
 
 // entryOverhead is the most a table of one entry adds around it: footer,
@@ -80,6 +79,11 @@ const blockOverhead = 5 + binary.MaxVarintLen64
 
 // ErrEntryTooLarge is Add's refusal of an entry over MaxEntryBytes.
 var ErrEntryTooLarge = errors.New("lsm: entry too large")
+
+// ErrBadEntry is Add's refusal of an entry with an empty key, a key not
+// after the one before it, or an unknown kind. Flush and BuildTable return
+// it too, as they Add their entries.
+var ErrBadEntry = errors.New("lsm: bad entry")
 
 // entryRaw is an entry's encoded size in a block: length varints, key,
 // kind and value.
@@ -118,23 +122,23 @@ var blockDecoder = func() *zstd.Decoder {
 	return d
 }()
 
-// DecompressBounded decodes zstd frames to at most max bytes. max is a
+// DecompressBounded decodes zstd frames to at most limit bytes. limit is a
 // ceiling, not a size the stream dictates: a frame whose header claims more
-// is refused before anything is allocated, and output past max is refused
+// is refused before anything is allocated, and output past limit is refused
 // after decoding. A frame without a content size, or trailing frames, can
-// allocate up to MaxTableBytes before that check: that, not max, is the
-// allocation bound. max is capped at MaxTableBytes. Every failure wraps
+// allocate up to MaxTableBytes before that check: that, not limit, is the
+// allocation bound. limit is capped at MaxTableBytes. Every failure wraps
 // ErrCorrupt.
-func DecompressBounded(data []byte, max uint64) ([]byte, error) {
-	max = min(max, MaxTableBytes)
+func DecompressBounded(data []byte, limit uint64) ([]byte, error) {
+	limit = min(limit, MaxTableBytes)
 	var h zstd.Header
 	if err := h.Decode(data); err != nil {
 		return nil, fmt.Errorf("%w: lsm: zstd: %w", ErrCorrupt, err)
 	}
 	size := uint64(0)
 	if h.HasFCS {
-		if h.FrameContentSize > max {
-			return nil, fmt.Errorf("%w: lsm: zstd frame claims %d bytes, max %d", ErrCorrupt, h.FrameContentSize, max)
+		if h.FrameContentSize > limit {
+			return nil, fmt.Errorf("%w: lsm: zstd frame claims %d bytes, max %d", ErrCorrupt, h.FrameContentSize, limit)
 		}
 		size = h.FrameContentSize
 	}
@@ -142,8 +146,8 @@ func DecompressBounded(data []byte, max uint64) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: lsm: zstd: %w", ErrCorrupt, err)
 	}
-	if uint64(len(out)) > max {
-		return nil, fmt.Errorf("%w: lsm: zstd frame decoded to %d bytes, max %d", ErrCorrupt, len(out), max)
+	if uint64(len(out)) > limit {
+		return nil, fmt.Errorf("%w: lsm: zstd frame decoded to %d bytes, max %d", ErrCorrupt, len(out), limit)
 	}
 	return out, nil
 }
@@ -153,6 +157,11 @@ var errBlockEntry = fmt.Errorf("%w: lsm: block entry", ErrCorrupt)
 type blockIndex struct {
 	off, length, rawLen int64
 	first, last         []byte
+}
+
+// wrap names block i in err.
+func (b blockIndex) wrap(i int, err error) error {
+	return fmt.Errorf("lsm: block %d at %d+%d: %w", i, b.off, b.length, err)
 }
 
 // SpaceRange is the key range a table holds in one key space.
@@ -208,13 +217,13 @@ func NewTableWriter(blockBytes int) *TableWriter {
 // A block's raw bytes never exceed MaxTableBytes, whatever blockBytes says.
 func (w *TableWriter) Add(e Entry) error {
 	if len(e.Key) == 0 {
-		return fmt.Errorf("lsm: empty key")
+		return fmt.Errorf("%w: empty key", ErrBadEntry)
 	}
 	if w.last != nil && bytes.Compare(e.Key, w.last) <= 0 {
-		return fmt.Errorf("lsm: key %x not after %x", e.Key, w.last)
+		return fmt.Errorf("%w: key %x not after %x", ErrBadEntry, e.Key, w.last)
 	}
 	if e.Kind < KindPut || e.Kind > KindMerge {
-		return fmt.Errorf("lsm: bad kind %d", e.Kind)
+		return fmt.Errorf("%w: kind %d", ErrBadEntry, e.Kind)
 	}
 	if len(e.Value)+3*len(e.Key) > MaxEntryBytes {
 		return fmt.Errorf("%w: lsm: key %.32x: value %d, key %d, max value+3*key %d", ErrEntryTooLarge, e.Key, len(e.Value), len(e.Key), MaxEntryBytes)
@@ -324,7 +333,7 @@ func (w *TableWriter) flushBlock() {
 // Finish closes the table and returns its bytes and metadata.
 func (w *TableWriter) Finish() ([]byte, TableMeta, error) {
 	if w.meta.Count == 0 {
-		return nil, TableMeta{}, fmt.Errorf("lsm: empty table")
+		return nil, TableMeta{}, errors.New("lsm: empty table")
 	}
 	w.flushBlock()
 	w.meta.Max = bytes.Clone(w.last)
@@ -482,7 +491,7 @@ func OpenTableAt(ctx context.Context, src Source, meta TableMeta) (*Table, error
 // index, so a caller can derive a cache signature from which blocks of a
 // table a key range touches without reading a block.
 func (t *Table) Span(lo, hi []byte) (first, last int, ok bool) {
-	first = sort.Search(len(t.index), func(i int) bool { return bytes.Compare(t.index[i].last, lo) >= 0 })
+	first = t.blockFor(lo)
 	if first == len(t.index) {
 		return 0, 0, false
 	}
@@ -494,6 +503,12 @@ func (t *Table) Span(lo, hi []byte) (first, last int, ok bool) {
 		return 0, 0, false
 	}
 	return first, last, true
+}
+
+// blockFor is the first block whose last key is at or past key (nil: the
+// first block), the only one that may hold key; len(t.index) when none.
+func (t *Table) blockFor(key []byte) int {
+	return sort.Search(len(t.index), func(i int) bool { return bytes.Compare(t.index[i].last, key) >= 0 })
 }
 
 // Block is one decoded block: entry start offsets into raw.
@@ -521,16 +536,17 @@ func (t *Table) readBlock(ctx context.Context, i int) (*Block, error) {
 		}
 	}
 	stored, err := t.src.ReadAt(ctx, bi.off, bi.length)
-	if err == nil {
-		var b *Block
-		if b, err = decodeBlock(stored, bi.rawLen); err == nil {
-			if t.Cache != nil {
-				t.Cache.Put(t.Name, bi.off, bi.length, b)
-			}
-			return b, nil
-		}
+	if err != nil {
+		return nil, bi.wrap(i, err)
 	}
-	return nil, fmt.Errorf("lsm: block %d at %d+%d: %w", i, bi.off, bi.length, err)
+	b, err := decodeBlock(stored, bi.rawLen)
+	if err != nil {
+		return nil, bi.wrap(i, err)
+	}
+	if t.Cache != nil {
+		t.Cache.Put(t.Name, bi.off, bi.length, b)
+	}
+	return b, nil
 }
 
 func decodeBlock(stored []byte, rawLen int64) (*Block, error) {
@@ -561,27 +577,26 @@ func decodeBlock(stored []byte, rawLen int64) (*Block, error) {
 	// One pass proves every entry is in bounds, in order and of a known
 	// kind, so entry() and key() need no checks of their own.
 	var prev []byte
-	bad := errBlockEntry
 	for range n {
 		start := at
 		kl, k := binary.Uvarint(raw[at:])
 		if k <= 0 || kl == 0 || kl > uint64(len(raw)-at-k) {
-			return nil, bad
+			return nil, errBlockEntry
 		}
 		at += k
 		key := raw[at : at+int(kl)]
 		at += int(kl)
 		if at >= len(raw) || Kind(raw[at]) < KindPut || Kind(raw[at]) > KindMerge {
-			return nil, bad
+			return nil, errBlockEntry
 		}
 		at++
 		vl, j := binary.Uvarint(raw[at:])
 		if j <= 0 || vl > uint64(len(raw)-at-j) {
-			return nil, bad
+			return nil, errBlockEntry
 		}
 		at += j + int(vl)
 		if prev != nil && bytes.Compare(prev, key) >= 0 {
-			return nil, bad
+			return nil, errBlockEntry
 		}
 		b.offs = append(b.offs, int32(start))
 		prev = key
@@ -625,7 +640,7 @@ func (t *Table) get(ctx context.Context, key []byte, h uint64) (Entry, bool, err
 	if !t.filter.mayHold(h) {
 		return Entry{}, false, nil
 	}
-	i := sort.Search(len(t.index), func(i int) bool { return bytes.Compare(t.index[i].last, key) >= 0 })
+	i := t.blockFor(key)
 	if i == len(t.index) || bytes.Compare(t.index[i].first, key) > 0 {
 		return Entry{}, false, nil
 	}
@@ -654,7 +669,7 @@ func (t *Table) get(ctx context.Context, key []byte, h uint64) (Entry, bool, err
 // block's checksum covers the whole block, so bytes read through Single are
 // not verified; the whole-block read path (Get, Iter) is.
 func (t *Table) Single(key []byte) (off, length int64, ok bool) {
-	i := sort.Search(len(t.index), func(i int) bool { return bytes.Compare(t.index[i].last, key) >= 0 })
+	i := t.blockFor(key)
 	if i == len(t.index) || !bytes.Equal(t.index[i].first, key) || !bytes.Equal(t.index[i].last, key) {
 		return 0, 0, false
 	}
@@ -716,7 +731,7 @@ func (t *Table) scan(ctx context.Context, window int64, hi []byte) *TableIter {
 	if hi != nil {
 		stop = sort.Search(len(t.index), func(i int) bool { return bytes.Compare(t.index[i].first, hi) >= 0 })
 	}
-	return &TableIter{ctx: ctx, t: t, bi: -1, ra: &readAhead{t: t, max: window, stop: stop}}
+	return &TableIter{ctx: ctx, t: t, bi: -1, ra: &readAhead{t: t, window: window, stop: stop}}
 }
 
 // TableIter iterates one table in key order. It stores its context
@@ -736,7 +751,7 @@ type TableIter struct {
 // next is the window after it, in flight.
 type readAhead struct {
 	t         *Table
-	max       int64
+	window    int64 // the most bytes one read spans, past its first block
 	stop      int
 	cur, next *window
 }
@@ -755,7 +770,7 @@ func (r *readAhead) fetch(ctx context.Context, lo int) *window {
 	idx := r.t.index
 	off := idx[lo].off
 	hi := lo + 1
-	for hi < r.stop && idx[hi].off+idx[hi].length-off <= r.max {
+	for hi < r.stop && idx[hi].off+idx[hi].length-off <= r.window {
 		hi++
 	}
 	n := idx[hi-1].off + idx[hi-1].length - off
@@ -800,15 +815,15 @@ func (r *readAhead) block(ctx context.Context, i int) (*Block, error) {
 		<-r.cur.done
 	}
 	w, bi := r.cur, r.t.index[i]
-	err := w.err
-	if err == nil {
-		at := bi.off - r.t.index[w.lo].off
-		var b *Block
-		if b, err = decodeBlock(w.buf[at:at+bi.length], bi.rawLen); err == nil {
-			return b, nil
-		}
+	if w.err != nil {
+		return nil, bi.wrap(i, w.err)
 	}
-	return nil, fmt.Errorf("lsm: block %d at %d+%d: %w", i, bi.off, bi.length, err)
+	at := bi.off - r.t.index[w.lo].off
+	b, err := decodeBlock(w.buf[at:at+bi.length], bi.rawLen)
+	if err != nil {
+		return nil, bi.wrap(i, err)
+	}
+	return b, nil
 }
 
 // SeekGE positions at the first entry with key >= target (nil: the first
@@ -817,10 +832,7 @@ func (it *TableIter) SeekGE(target []byte) bool {
 	if it.err != nil {
 		return false
 	}
-	bi := 0
-	if target != nil {
-		bi = sort.Search(len(it.t.index), func(i int) bool { return bytes.Compare(it.t.index[i].last, target) >= 0 })
-	}
+	bi := it.t.blockFor(target)
 	if bi == len(it.t.index) {
 		it.blk = nil
 		return false
@@ -891,7 +903,7 @@ type decoder struct {
 func (d *decoder) uvarint() uint64 {
 	v, n := binary.Uvarint(d.b)
 	if n <= 0 {
-		d.err = fmt.Errorf("uvarint")
+		d.err = errors.New("uvarint")
 		d.b = nil
 		return 0
 	}
@@ -902,7 +914,7 @@ func (d *decoder) uvarint() uint64 {
 func (d *decoder) bytes() []byte {
 	n := d.uvarint()
 	if d.err != nil || n > uint64(len(d.b)) {
-		d.err = fmt.Errorf("bytes")
+		d.err = errors.New("bytes")
 		d.b = nil
 		return nil
 	}

@@ -92,8 +92,8 @@ type SpacePolicy struct {
 	DeadRatio float64
 }
 
-// DefaultOptions: tiered, 4 L0 files, 8 runs, 48 MiB files (leveled:
-// ratio 10, 256 MiB L1).
+// DefaultOptions returns tiered compaction with 4 L0 files, 8 runs and
+// 48 MiB files (leveled: ratio 10, 256 MiB L1).
 func DefaultOptions() Options {
 	return Options{L0Trigger: 4, MaxRuns: 8, LevelRatio: 10, BaseBytes: 256 << 20, FileBytes: 48 << 20, BlockBytes: DefaultBlockBytes}
 }
@@ -208,7 +208,7 @@ func keyRange(files []FileRef) (lo, hi []byte) {
 }
 
 // afterMax is the exclusive bound just past an inclusive Max.
-func afterMax(max []byte) []byte { return append(bytes.Clone(max), 0) }
+func afterMax(key []byte) []byte { return append(bytes.Clone(key), 0) }
 
 // receives reports whether any input may hold a key in [lo, hi] (hi
 // exclusive unless incl; nil is unbounded), by the inputs' key-space
@@ -216,14 +216,14 @@ func afterMax(max []byte) []byte { return append(bytes.Clone(max), 0) }
 // and exact for the case it is for, a space whose new keys all sort past
 // the file.
 func receives(inputs []FileRef, lo, hi []byte, incl bool) bool {
-	meets := func(min, max []byte) bool {
-		if bytes.Compare(max, lo) < 0 {
+	meets := func(first, last []byte) bool {
+		if bytes.Compare(last, lo) < 0 {
 			return false
 		}
 		if hi == nil {
 			return true
 		}
-		c := bytes.Compare(min, hi)
+		c := bytes.Compare(first, hi)
 		return c < 0 || incl && c == 0
 	}
 	for _, f := range inputs {
@@ -300,7 +300,8 @@ func (v Version) pickLeveled(o Options) (Job, bool) {
 		return Job{}, false
 	}
 	cutoff := time.Now().Add(-o.MaxTableAge).Unix()
-	for l := 0; l == 0 || l < len(v.Levels)-1; l++ {
+	// Level 0 always, then every level above the bottom.
+	for l := range max(1, len(v.Levels)-1) {
 		for _, f := range v.Levels[l] {
 			if f.Oldest >= cutoff {
 				continue
@@ -582,12 +583,12 @@ func (v Version) shift() (del []string, add map[int][]FileRef) {
 		for _, f := range v.Levels[l] {
 			held[f.Min[0]] = true
 		}
-		any := false
+		anyMoving := false
 		for s := range moving {
 			moving[s] = held[s] && (l == 1 || moving[s])
-			any = any || moving[s]
+			anyMoving = anyMoving || moving[s]
 		}
-		if !any {
+		if !anyMoving {
 			break
 		}
 		for _, f := range v.Levels[l] {
@@ -660,8 +661,8 @@ func (v Version) job(level int, inputs []FileRef, o Options) Job {
 // one serial pass. An overlap file no input key falls in stays where it
 // is, unread and unwritten: a level-0 file spans every key space by its
 // bounds, but a space whose keys only grow gains keys only past its last
-// file, so bounds alone would rewrite them every round.
-// Output files are unique by sequence within one compaction, so a partition publishes as it
+// file, so bounds alone would rewrite them every round. Output files are
+// unique by sequence within one compaction, so a partition publishes as it
 // goes; the caller publishes the version, and a crash before that leaves
 // only orphan objects. The returned Edit is the change from v (inputs and
 // rewritten overlap deleted, outputs added), for a caller that publishes
@@ -693,33 +694,11 @@ func Compact(ctx context.Context, v Version, j Job, o Options, r Reader, put Put
 		overlaps[i] = &named{f.Key, t}
 		touched = append(touched, f)
 	}
-	// The partitions, in key order, each a run of consecutive touched
-	// overlap files (and the gaps around them, which hold input keys alone)
-	// worth about FileBytes of overlap: enough files for the merge to run
-	// wide, never so many that every round leaves a smaller file behind. An
-	// untouched file ends the partition before it and the next starts after
-	// it, so no output spans it.
 	var parts []partition
-	cur := partition{}
-	var curBytes int64
-	for i, f := range j.Overlap {
-		if overlaps[i] == nil {
-			cur.hi = f.Min
-			parts = append(parts, cur)
-			cur, curBytes = partition{lo: afterMax(f.Max)}, 0
-			continue
-		}
-		if curBytes >= o.FileBytes/2 {
-			cur.hi = f.Min
-			parts = append(parts, cur)
-			cur, curBytes = partition{lo: f.Min}, 0
-		}
-		cur.overlaps = append(cur.overlaps, overlaps[i])
-		curBytes += f.Bytes
-	}
-	parts = append(parts, cur)
 	if len(j.Overlap) == 0 {
 		parts = spaceParts(j.Inputs)
+	} else {
+		parts = overlapParts(j.Overlap, overlaps, o.FileBytes)
 	}
 	// The outputs' age: a bottom job drops every tombstone and shadowed
 	// version, so its outputs are as new as the job; any other keeps the
@@ -828,6 +807,35 @@ func spaceParts(inputs []FileRef) []partition {
 		}
 	}
 	return parts
+}
+
+// overlapParts is the partitions of a job with overlap, in key order, each
+// a run of consecutive touched overlap files (and the gaps around them,
+// which hold input keys alone) worth about fileBytes of overlap: enough
+// files for the merge to run wide, never so many that every round leaves a
+// smaller file behind. opened[i] is overlap[i] open, nil when untouched. An
+// untouched file ends the partition before it and the next starts after
+// it, so no output spans it.
+func overlapParts(overlap []FileRef, opened []*named, fileBytes int64) []partition {
+	var parts []partition
+	var cur partition
+	var curBytes int64
+	for i, f := range overlap {
+		if opened[i] == nil {
+			cur.hi = f.Min
+			parts = append(parts, cur)
+			cur, curBytes = partition{lo: afterMax(f.Max)}, 0
+			continue
+		}
+		if curBytes >= fileBytes/2 {
+			cur.hi = f.Min
+			parts = append(parts, cur)
+			cur, curBytes = partition{lo: f.Min}, 0
+		}
+		cur.overlaps = append(cur.overlaps, opened[i])
+		curBytes += f.Bytes
+	}
+	return append(parts, cur)
 }
 
 // partition is one independent merge of a compaction: the inputs and the

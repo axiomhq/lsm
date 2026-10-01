@@ -118,17 +118,18 @@ func TestTableWriterRejectsBadInput(t *testing.T) {
 	if err := w.Add(Entry{Key: []byte("b"), Kind: KindPut}); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.Add(Entry{Key: []byte("b"), Kind: KindPut}); err == nil {
-		t.Fatal("duplicate key accepted")
-	}
-	if err := w.Add(Entry{Key: []byte("a"), Kind: KindPut}); err == nil {
-		t.Fatal("unsorted key accepted")
-	}
-	if err := w.Add(Entry{Key: []byte("c"), Kind: 9}); err == nil {
-		t.Fatal("bad kind accepted")
-	}
-	if err := w.Add(Entry{Kind: KindPut}); err == nil {
-		t.Fatal("empty key accepted")
+	for _, c := range []struct {
+		name string
+		e    Entry
+	}{
+		{"duplicate key", Entry{Key: []byte("b"), Kind: KindPut}},
+		{"unsorted key", Entry{Key: []byte("a"), Kind: KindPut}},
+		{"bad kind", Entry{Key: []byte("c"), Kind: 9}},
+		{"empty key", Entry{Kind: KindPut}},
+	} {
+		if err := w.Add(c.e); !errors.Is(err, ErrBadEntry) {
+			t.Fatalf("%s: %v, want ErrBadEntry", c.name, err)
+		}
 	}
 	if _, _, err := NewTableWriter(0).Finish(); err == nil {
 		t.Fatal("empty table accepted")

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 )
 
@@ -35,8 +36,14 @@ func NewMerge(its ...Iterator) *MergeIter {
 	return &MergeIter{its: its, keys: make([][]byte, len(its)), heap: make([]int, 0, len(its)), cur: -1}
 }
 
-// Source is the index of the iterator holding the current entry: its
-// precedence, 0 being newest.
+// Precedence is the index of the iterator holding the current entry, 0
+// being newest.
+func (m *MergeIter) Precedence() int { return m.cur }
+
+// Source is Precedence.
+//
+// Deprecated: use Precedence; Source is also the name of the table byte
+// source interface.
 func (m *MergeIter) Source() int { return m.cur }
 
 func (m *MergeIter) SeekGE(target []byte) bool {
@@ -189,10 +196,7 @@ func (r *ResolveIter) Next() bool {
 			r.kind, r.value = KindDelete, nil
 			return true
 		}
-		// oldest first for the merger
-		for i, j := 0, len(r.ops)-1; i < j; i, j = i+1, j-1 {
-			r.ops[i], r.ops[j] = r.ops[j], r.ops[i]
-		}
+		slices.Reverse(r.ops) // oldest first for the merger
 		if r.merger == nil {
 			r.err = ErrNoMerger
 			return false

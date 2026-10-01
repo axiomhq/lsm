@@ -37,6 +37,11 @@ func (f FileRef) Overlaps(lo, hi []byte) bool {
 	return hi == nil || bytes.Compare(f.Min, hi) < 0
 }
 
+// holds reports whether key is within the file's [Min, Max].
+func (f FileRef) holds(key []byte) bool {
+	return bytes.Compare(f.Min, key) <= 0 && bytes.Compare(key, f.Max) <= 0
+}
+
 // Version is the levels of a namespace's LSM at one manifest. Level 0 is
 // newest first and its files overlap; every later level is sorted by Min
 // with disjoint ranges. NextSeq names the next file.
@@ -235,7 +240,7 @@ func (r Reader) Get(ctx context.Context, v Version, key []byte) ([]byte, bool, e
 walk:
 	for l, files := range v.Levels {
 		for _, f := range candidates(l, files, key) {
-			if !f.Overlaps(key, nil) || bytes.Compare(f.Min, key) > 0 {
+			if !f.holds(key) {
 				continue
 			}
 			e, ok, err := r.getIn(ctx, f, key, h)
@@ -267,8 +272,8 @@ walk:
 // Located is the newest version of a key: the value's extent in a table
 // when Table.Single applies, otherwise the value itself.
 type Located struct {
-	File        FileRef // the file the answer came from: its Key names the object
-	Table       *Table
+	File        FileRef // for an extent, the file it is in: its Key names the object
+	Table       *Table  // for an extent, the open table to read it from; nil for a value
 	Off, Length int64
 	Value       []byte
 }
@@ -282,7 +287,7 @@ func (r Reader) Locate(ctx context.Context, v Version, key []byte) (l Located, o
 	h := keyHash(key)
 	for l, files := range v.Levels {
 		for _, f := range candidates(l, files, key) {
-			if !f.Overlaps(key, nil) || bytes.Compare(f.Min, key) > 0 {
+			if !f.holds(key) {
 				continue
 			}
 			t, err := r.Open(ctx, f)

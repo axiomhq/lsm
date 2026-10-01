@@ -24,8 +24,9 @@ go get github.com/axiomhq/lsm
 ## Usage
 
 Here's the whole lifecycle: flush, compact, read. A map stands in for the
-object store. [example_test.go](example_test.go) has runnable examples,
-including merge operands.
+object store. This is `ExampleCompact` in [example_test.go](example_test.go),
+so `go test` checks it; the file has more examples, including merge
+operands.
 
 ```go
 ctx := context.Background()
@@ -272,9 +273,9 @@ one candidate file, so its cost grows with the number of levels, not the
 number of files.
 
 Every read verifies checksums. Corrupt bytes return an error that wraps
-`lsm.ErrCorrupt`. `lsm.DecompressBounded(data, max)` exposes the size-capped
-zstd decode that every block read uses: it refuses a frame that claims, or
-decodes to, more than `max` bytes.
+`lsm.ErrCorrupt`. `lsm.DecompressBounded(data, limit)` exposes the
+size-capped zstd decode that every block read uses: it refuses a frame that
+claims, or decodes to, more than `limit` bytes.
 
 ## Compatibility
 

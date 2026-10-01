@@ -1,59 +1,58 @@
 package keyenc
 
 import (
+	"bytes"
 	"encoding/binary"
 	"math"
+	"strings"
 )
 
 // AppendString appends s escaped: 0x00 becomes 0x00 0xFF, and 0x00 0x00
 // ends it. The byte order of encodings equals the byte order of the
 // strings, and a component that follows is unambiguous.
 func AppendString(dst []byte, s string) []byte {
-	for i := 0; i < len(s); i++ {
-		if s[i] == 0 {
-			dst = append(dst, 0, 0xFF)
-			continue
+	for {
+		i := strings.IndexByte(s, 0)
+		if i < 0 {
+			break
 		}
-		dst = append(dst, s[i])
+		dst = append(append(dst, s[:i]...), 0, 0xFF)
+		s = s[i+1:]
 	}
-	return append(dst, 0, 0)
+	return append(append(dst, s...), 0, 0)
 }
 
 // String reads a string written by AppendString and returns the bytes
 // after it. ok is false for a truncated or invalid escape.
 func String(b []byte) (s string, rest []byte, ok bool) {
-	var out []byte
-	for i := 0; i < len(b); i++ {
-		if b[i] != 0 {
-			continue
-		}
-		if i+1 >= len(b) {
+	var out []byte // nil until the first escape: most strings have none
+	for {
+		i := bytes.IndexByte(b, 0)
+		if i < 0 || i+1 == len(b) {
 			return "", nil, false
 		}
-		if b[i+1] == 0 {
+		switch b[i+1] {
+		case 0:
 			if out == nil {
 				return string(b[:i]), b[i+2:], true
 			}
-			out = append(out, b[:i]...)
-			return string(out), b[i+2:], true
-		}
-		if b[i+1] != 0xFF {
+			return string(append(out, b[:i]...)), b[i+2:], true
+		case 0xFF:
+			out = append(append(out, b[:i]...), 0)
+			b = b[i+2:]
+		default:
 			return "", nil, false
 		}
-		out = append(out, b[:i]...)
-		out = append(out, 0)
-		b = b[i+2:]
-		i = -1
 	}
-	return "", nil, false
 }
 
 // AppendFloat64 appends f as 8 big-endian bytes whose byte order is the
 // numeric order, negative through positive: the sign bit is flipped for
 // non-negative values and every bit for negative ones. -0 is written as
-// +0, so the two are one key and read back as +0. NaN is not ordered and does not round-trip in general: math.NaN()
-// (sign bit clear) reads back as a tiny positive number, and only NaNs with
-// the sign bit set come back bit for bit. Reject NaN before encoding.
+// +0, so the two are one key and read back as +0. NaN is not ordered and
+// does not round-trip in general: math.NaN() (sign bit clear) reads back
+// as a tiny positive number, and only NaNs with the sign bit set come back
+// bit for bit. Reject NaN before encoding.
 func AppendFloat64(dst []byte, f float64) []byte {
 	if f == 0 {
 		f = 0
@@ -85,7 +84,7 @@ func Float64(b []byte) (f float64, rest []byte, ok bool) {
 // PrefixEnd returns the exclusive upper bound of every key that starts
 // with p, or nil when there is none (p is empty or all 0xFF).
 func PrefixEnd(p []byte) []byte {
-	end := append([]byte(nil), p...)
+	end := bytes.Clone(p)
 	for i := len(end) - 1; i >= 0; i-- {
 		if end[i] != 0xFF {
 			end[i]++
