@@ -45,6 +45,12 @@ level.
    Equal runs pair up like the bits of a binary counter.
 3. Count: past `MaxRuns` (8) runs in a space, the adjacent window of
    `runs - MaxRuns + 1` runs with the fewest bytes merges.
+   A write-once space (`Options.Spaces`, `SpacePolicy.WriteOnce`) skips rule 2:
+   its newest `Fanout` (8) adjacent runs within twice the newest's bytes merge
+   into the oldest of them, it counts to its own `MaxRuns`, and, with
+   `DeadRatio` set, every run merges into the oldest once its tombstones reach
+   that share of its puts. Its keys never repeat across runs, so a pair merge buys fewer runs
+   and reclaims nothing; an 8-way merge buys the same for fewer rewrites.
 4. Age (`MaxTableAge`): an aged file in any run but a space's oldest merges that
    run and every older run of the space into the oldest. An aged level-0 file
    merges level 0 and every level into the deepest. That only happens to an idle
@@ -109,3 +115,50 @@ while level 0 holds more than 2 GiB at `L0Trigger`.
 
 Tiered pays for this in read cost and job size: a lookup probes a space's
 runs, and a merge of a space's largest runs reads tens of GB in one job.
+
+`TestWriteOnceSimulation` (tiered_sim_test.go): the same flushes, split by a
+vector index's shares: one write-once space of full vectors 50%, one of
+document blocks 20%, four tiered spaces 7.5% each. Written is level 0 plus
+compaction, per ingested byte.
+
+| policy | written, 300 flushes | vectors space | max runs in a space | written, 60 flushes |
+| --- | --- | --- | --- | --- |
+| tiered | 5.54× | 5.73× | 10 | 4.56× |
+| write-once, count rule alone, MaxRuns 16 | 8.50× | 9.48× | 20 | |
+| write-once, count rule alone, MaxRuns 32 | 6.25× | 6.35× | 36 | |
+| write-once, count rule alone, MaxRuns 64 | 4.94× | 4.49× | 68 | |
+| write-once, fanout 4, MaxRuns 64 | 5.65× | 5.68× | 13 | 3.97× |
+| write-once, fanout 8, MaxRuns 32 | 4.41× | 3.83× | 18 | 3.41× |
+| write-once, fanout 16, MaxRuns 64 | 4.42× | 3.81× | 31 | 3.31× |
+
+The count rule alone (a picker draft) merges the cheapest adjacent pair past
+`MaxRuns`, which keeps rewriting the newest run: worse than pairs below 64
+runs. Fanout 8 writes a fifth less than tiered at 18 runs; 16 adds runs and
+saves nothing more.
+
+`BenchmarkRuns` (bench_test.go) is the read cost of those runs, in memory:
+8,192 4 KiB values striped over the runs.
+
+| runs | Get | Locate | 64-key Iter |
+| --- | --- | --- | --- |
+| 8 | 1.11 µs | 0.57 µs | 74 µs |
+| 18 | 1.67 µs | 1.00 µs | 91 µs |
+| 32 | 2.39 µs | 1.54 µs | 119 µs |
+| 64 | 3.89 µs | 2.60 µs | 170 µs |
+
+A key filter keeps a lookup at one block read whatever the runs; the cost is
+CPU: about 50 ns a run for Get, 36 ns for Locate.
+
+`DeadRatio` on a growing vector index (2M rows streamed, 128-d, three LSMs,
+splits deleting a quarter to a half of a round's blocks; bytes written per
+row, the store's total, n = 3 against tiered's 2,271, n = 4):
+
+| write-once F, V, R, D, E | bytes written per row |
+| --- | --- |
+| DeadRatio 0.25 | 2,824 (+24%) |
+| DeadRatio 0.5 | 2,375 (+5%) |
+| DeadRatio 1 | 1,927 (−15%) |
+| DeadRatio 0 (never) | 1,817 (−20%) |
+
+Every reclaim rewrote the whole space; under that churn the reclaims cost
+more than the pairs they replace. A low ratio pays where deletes are rare.

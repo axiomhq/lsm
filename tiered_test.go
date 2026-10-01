@@ -3,6 +3,7 @@ package lsm
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"slices"
 	"testing"
@@ -231,5 +232,111 @@ func TestTieredAgeCarriesDeletesToBottom(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestPickWriteOnce: a write-once space skips the size rule's pairs,
+// where a tiered space with the same runs merges, merges Fanout runs of
+// about one size, and merges by count past its own MaxRuns.
+func TestPickWriteOnce(t *testing.T) {
+	f := func(seq uint64, lo, hi string, n int64) FileRef {
+		return FileRef{Key: fmt.Sprint("f", seq), Seq: seq, TableMeta: TableMeta{Min: []byte(lo), Max: []byte(hi), Bytes: n, Count: 1}}
+	}
+	o := Options{L0Trigger: 2, MaxRuns: 2, FileBytes: 1 << 20, Spaces: map[byte]SpacePolicy{'a': {WriteOnce: true, Fanout: 3, MaxRuns: 3}}}
+	v, _ := Version{}.Apply(Edit{Add: map[int][]FileRef{1: {f(1, "a1", "a3", 10)}, 2: {f(2, "a4", "a6", 10)}}})
+	if j, ok := Pick(v, o); ok {
+		t.Fatalf("write-once space picked %+v by size", j)
+	}
+	if j, ok := Pick(v, Options{L0Trigger: 2, MaxRuns: 2, FileBytes: 1 << 20}); !ok || j.Level != 1 {
+		t.Fatalf("tiered space: %+v, want the size merge", j)
+	}
+	// Fanout: three runs within twice the newest merge into the oldest.
+	v3, _ := v.Apply(Edit{Add: map[int][]FileRef{3: {f(3, "a7", "a8", 20)}, 4: {f(4, "a0", "a0", 100)}}})
+	if j, ok := Pick(v3, o); !ok || j.Level != 2 || len(j.Inputs) != 2 {
+		t.Fatalf("fanout job %+v, want runs 1-3 merged into run 3", j)
+	}
+	// Count: runs 10 30 90 270, none within twice another, past MaxRuns 3:
+	// the cheapest adjacent pair merges.
+	v4, _ := Version{}.Apply(Edit{Add: map[int][]FileRef{
+		1: {f(1, "a1", "a3", 10)}, 2: {f(2, "a4", "a6", 30)}, 3: {f(3, "a7", "a8", 90)}, 4: {f(4, "a0", "a0", 270)},
+	}})
+	if j, ok := Pick(v4, o); !ok || j.Level != 1 || len(j.Inputs) != 1 || j.Inputs[0].Key != "f1" {
+		t.Fatalf("write-once count job %+v, want run 1 merged into run 2", j)
+	}
+	o.Spaces['a'] = SpacePolicy{WriteOnce: true, Fanout: 3, MaxRuns: 4}
+	if j, ok := Pick(v4, o); ok {
+		t.Fatalf("write-once space at its MaxRuns picked %+v", j)
+	}
+}
+
+// TestWriteOnceChurnReclaims: new keys over flushes become runs that never
+// merge; tombstones under DeadRatio of the puts leave them be, and past it
+// every run merges into the oldest, into the bottom: the deleted keys are
+// in no table, the rest read back, and no tombstone is left.
+func TestWriteOnceChurnReclaims(t *testing.T) {
+	ctx := context.Background()
+	st := newMemStore()
+	const dead = 0.25
+	o := Options{L0Trigger: 1, Spaces: map[byte]SpacePolicy{'F': {WriteOnce: true, MaxRuns: 64, DeadRatio: dead}}}
+	key := func(i int) []byte { return fmt.Appendf(nil, "F%04d", i) }
+	var v Version
+	jobs := 0
+	flush := func(es []Entry) {
+		var err error
+		if v, _, err = Flush(ctx, v, es, o, st.put); err != nil {
+			t.Fatal(err)
+		}
+		for {
+			j, ok := Pick(v, o)
+			if !ok {
+				return
+			}
+			if !j.NewRun {
+				jobs++
+			}
+			if v, _, err = Compact(ctx, v, j, o, st.reader(), st.put); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	for b := range 4 {
+		var es []Entry
+		for i := range 10 {
+			es = append(es, Entry{Key: key(b*10 + i), Kind: KindPut, Value: []byte("v")})
+		}
+		flush(es)
+	}
+	del := func(lo, hi int) {
+		var es []Entry
+		for i := lo; i < hi; i++ {
+			es = append(es, Entry{Key: key(i), Kind: KindDelete})
+		}
+		flush(es)
+	}
+	under := int(math.Ceil(dead*40)) - 1
+	del(0, under) // just under DeadRatio of the 40 puts
+	if jobs != 0 || len(v.Levels) != 6 {
+		t.Fatalf("%d merges, %d levels: write-once runs merged under DeadRatio", jobs, len(v.Levels))
+	}
+	del(under, under+1)
+	if jobs != 1 {
+		t.Fatalf("%d merges past DeadRatio, want 1", jobs)
+	}
+	var files []FileRef
+	for _, l := range v.Levels {
+		files = append(files, l...)
+	}
+	var count, deletes int64
+	for _, f := range files {
+		count, deletes = count+f.Count, deletes+f.Deletes
+	}
+	if count != int64(40-under-1) || deletes != 0 {
+		t.Fatalf("after the merge: %d entries, %d tombstones; want %d puts", count, deletes, 40-under-1)
+	}
+	for i := range 40 {
+		_, ok, err := st.reader().Get(ctx, v, key(i))
+		if err != nil || ok != (i > under) {
+			t.Fatalf("key %d: found %v, %v", i, ok, err)
+		}
 	}
 }

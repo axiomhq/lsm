@@ -18,7 +18,7 @@ import (
 //
 // A block is crc32c(payload) as 4 bytes, then payload: a mode byte
 // (blockZstd: zstd(raw); blockStored: raw itself, for a block zstd could
-// not shrink by an eighth, as a block of large incompressible values),
+// not shrink by an eighth, or one large value zstd could not halve),
 // then the bytes. raw is uvarint(count), then per entry uvarint(len key)
 // key, kind byte, uvarint(len value) value, keys strictly increasing. A
 // value of LargeValueBytes or more is a block of its own, so a point read
@@ -173,6 +173,9 @@ type TableMeta struct {
 	IndexOff int64        `json:"index_off"`
 	IndexLen int64        `json:"index_len"`
 	Spaces   []SpaceRange `json:"spaces,omitempty"`
+	// Deletes is the entries of Count that are tombstones (KindDelete); 0
+	// in a manifest before v0.11.0.
+	Deletes int64 `json:"deletes,omitempty"`
 }
 
 // TableWriter builds one table in memory.
@@ -234,6 +237,9 @@ func (w *TableWriter) Add(e Entry) error {
 		w.meta.Min = bytes.Clone(e.Key)
 	}
 	w.meta.Count++
+	if e.Kind == KindDelete {
+		w.meta.Deletes++
+	}
 	space := e.Key[0]
 	if k := len(w.spaces); k == 0 || w.spaces[k-1].Space != space {
 		if k > 0 {
@@ -291,19 +297,21 @@ func (w *TableWriter) flushBlock() {
 	w.blk = raw
 	off := int64(len(w.out))
 	w.out = append(w.out, 0, 0, 0, 0) // the checksum, over the payload once it is written
-	// A block that is one large value (dense or already-encoded bytes,
-	// read by the thousand) is stored as it is; the fifth zstd saves on
-	// them is not worth decoding on every read. The rest is stored only
-	// when zstd saves less than an eighth. A stored block's decode aliases
-	// the table bytes and costs a checksum and nothing else.
-	stored := w.n == 1 && len(w.raw) >= LargeValueBytes
-	if !stored {
-		w.out = blockEncoder.EncodeAll(raw, append(w.out, blockZstd))
-		if stored = len(w.out)-int(off)-5 > len(raw)-len(raw)/8; stored {
-			w.out = w.out[:off+4]
-		}
+	// A block is stored as it is when zstd saves less than an eighth, and
+	// a block that is one large value unless zstd at least halves it:
+	// dense vectors (zstd saves 0-3% on f16 and i8 rows), read by the
+	// thousand through Single's extents, stay stored, while a large value
+	// that is mostly text, read whole anyway, takes a third of its bytes.
+	// A stored block's decode aliases the table bytes and costs a checksum
+	// and nothing else.
+	saves := len(raw) / 8
+	if w.n == 1 && len(w.raw) >= LargeValueBytes {
+		saves = len(raw) / 2
 	}
+	w.out = blockEncoder.EncodeAll(raw, append(w.out, blockZstd))
+	stored := len(w.out)-int(off)-5 > len(raw)-saves
 	if stored {
+		w.out = w.out[:off+4]
 		w.out = append(append(w.out, blockStored), raw...)
 	}
 	binary.BigEndian.PutUint32(w.out[off:], crc32.Checksum(w.out[off+4:], castagnoli))

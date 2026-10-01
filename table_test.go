@@ -355,8 +355,8 @@ func FuzzOpenTable(f *testing.F) {
 // TestSingleLocatesStoredValues: Single finds, from the index alone, the
 // extent of a value that is alone in a stored block, and declines a value
 // that shares its block or sits in a compressed one. Large values of every
-// varint width of length, keys of varied length, a large value that zstd
-// would shrink (it is stored anyway: one value, one block), and a tiny
+// varint width of length, keys of varied length, a large value zstd
+// halves (compressed, so declined), and a tiny
 // value left alone in the table's last block, which is declined: only a
 // large value is worth an unverified extent read.
 func TestSingleLocatesStoredValues(t *testing.T) {
@@ -373,7 +373,7 @@ func TestSingleLocatesStoredValues(t *testing.T) {
 		key := append([]byte{'F'}, bytes.Repeat([]byte{byte('a' + i)}, 1+i*20)...)
 		entries = append(entries, Entry{Key: key, Kind: KindPut, Value: incompressible(n)})
 	}
-	// A large value zstd shrinks: alone in its block, stored raw.
+	// A large value zstd halves: alone in its block, compressed.
 	entries = append(entries, Entry{Key: []byte("Fzeros"), Kind: KindPut, Value: make([]byte, 2*LargeValueBytes)})
 	// Small values that share blocks: compressible ones and random ones.
 	for i := range 40 {
@@ -397,7 +397,7 @@ func TestSingleLocatesStoredValues(t *testing.T) {
 	singles := 0
 	for _, e := range entries {
 		off, length, ok := tb.Single(e.Key)
-		alone := len(e.Value) >= LargeValueBytes
+		alone := len(e.Value) >= LargeValueBytes && string(e.Key) != "Fzeros"
 		if ok != alone {
 			t.Fatalf("%q: single %v, want %v", e.Key, ok, alone)
 		}
@@ -410,8 +410,8 @@ func TestSingleLocatesStoredValues(t *testing.T) {
 			t.Fatalf("%q: extent %d+%d reads %d bytes (%v), want the value of %d", e.Key, off, length, len(got), err, len(e.Value))
 		}
 	}
-	if singles != 7 {
-		t.Fatalf("%d single values, want 7", singles)
+	if singles != 6 {
+		t.Fatalf("%d single values, want 6", singles)
 	}
 	if _, _, ok := tb.Single([]byte("Fnone")); ok {
 		t.Fatal("a missing key located")
@@ -516,10 +516,13 @@ func TestLargeBlockBytesReopens(t *testing.T) {
 	if !errors.Is(err, ErrEntryTooLarge) || !strings.Contains(err.Error(), "4b626967") {
 		t.Fatalf("entry one past the limit: %v", err)
 	}
-	// An entry at MaxEntryBytes fills a table alone: nothing else fits, the
-	// bound holds, and it reopens.
+	// An entry at MaxEntryBytes, incompressible, fills a table alone:
+	// nothing else fits, the bound holds, and it reopens.
 	w = NewTableWriter(0)
-	if err := w.Add(Entry{Key: key, Kind: KindPut, Value: make([]byte, MaxEntryBytes-3*len(key))}); err != nil {
+	big := make([]byte, MaxEntryBytes-3*len(key))
+	chacha := rand.NewChaCha8([32]byte{5})
+	chacha.Read(big)
+	if err := w.Add(Entry{Key: key, Kind: KindPut, Value: big}); err != nil {
 		t.Fatal(err)
 	}
 	if w.fits(Entry{Key: []byte("Kc"), Kind: KindPut, Value: []byte("v")}, MaxTableBytes) {

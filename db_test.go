@@ -680,10 +680,8 @@ func TestVersionSignature(t *testing.T) {
 func TestReaderLocate(t *testing.T) {
 	ctx := context.Background()
 	st := newMemStore()
-	big := make([]byte, LargeValueBytes)
-	for i := range big {
-		big[i] = byte(i * 7)
-	}
+	big := make([]byte, LargeValueBytes) // incompressible: a stored block
+	rand.NewChaCha8([32]byte{7}).Read(big)
 	v, _, err := Flush(ctx, Version{}, []Entry{
 		{Key: []byte("big"), Kind: KindPut, Value: big},
 		{Key: []byte("gone"), Kind: KindPut, Value: []byte("old")},

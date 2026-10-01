@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/axiomhq/lsm/setmerge"
@@ -54,7 +55,9 @@ func TestLocateNamesTheFile(t *testing.T) {
 	ctx := context.Background()
 	m := newMemStore()
 	v := Version{}
-	big := Entry{Key: []byte("Fbig"), Kind: KindPut, Value: bytes.Repeat([]byte{7}, 2*LargeValueBytes)}
+	val := make([]byte, 2*LargeValueBytes) // incompressible: a stored block
+	rand.NewChaCha8([32]byte{7}).Read(val)
+	big := Entry{Key: []byte("Fbig"), Kind: KindPut, Value: val}
 	small := Entry{Key: []byte("Gsmall"), Kind: KindPut, Value: []byte("v")}
 	next, _, err := Flush(ctx, v, []Entry{big, small}, DefaultOptions(), m.put)
 	if err != nil {

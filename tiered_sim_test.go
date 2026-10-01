@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"slices"
 	"testing"
 )
 
@@ -28,7 +29,14 @@ type simResult struct {
 	stallSecs, secs         float64 // time folds waited; time to ingest every fold
 	maxL0, maxRuns, depth   int     // level-0 files, levels holding one space, levels
 	jobs                    int
-	biggest                 int64 // bytes one job read
+	biggest                 int64      // bytes one job read
+	bySpace                 [256]int64 // bytes compaction wrote per space
+}
+
+// simShare is a key space's share of every fold's bytes.
+type simShare struct {
+	space byte
+	share float64
 }
 
 func simKey(space byte, pos uint64) []byte {
@@ -135,8 +143,9 @@ func simCompact(v Version, j Job, o Options, id *int) (e Edit, read int64) {
 }
 
 // simulate replays folds through Pick until every fold is in.
-// With skew, the first space takes half of every fold's bytes.
-func simulate(t *testing.T, o Options, folds int, skew bool) simResult {
+// With skew, the first space takes half of every fold's bytes; with
+// shares, the fold is two files per space it names, by its share.
+func simulate(t *testing.T, o Options, folds int, skew bool, shares ...simShare) simResult {
 	var r simResult
 	var v Version
 	id := 0
@@ -169,6 +178,9 @@ func simulate(t *testing.T, o Options, folds int, skew bool) simResult {
 				r.written += in
 				r.jobs++
 				r.biggest = max(r.biggest, in)
+				for _, f := range edit.Add[j.Level+1] {
+					r.bySpace[f.Min[0]] += f.Bytes
+				}
 			}
 		}
 		if foldEnd < 0 {
@@ -188,15 +200,20 @@ func simulate(t *testing.T, o Options, folds int, skew bool) simResult {
 		case foldEnd >= 0 && (jobEnd < 0 || foldEnd <= jobEnd):
 			now = foldEnd
 			var files []FileRef
-			for i := range simFoldFiles {
-				n := int64(simFoldBytes / simFoldFiles)
-				if skew {
-					n = simFoldBytes / (2 * (2*simSpaces - 2)) // a weight of 1 in 2×(spaces-1) + 2×(spaces-1)
-					if i%simSpaces == 0 {
-						n *= simSpaces - 1
+			for i, sh := range slices.Concat(shares, shares) {
+				files = append(files, simFile(&id, v.NextSeq+uint64(i), sh.space, 0, math.MaxUint64, int64(sh.share*simFoldBytes/2)))
+			}
+			if len(shares) == 0 {
+				for i := range simFoldFiles {
+					n := int64(simFoldBytes / simFoldFiles)
+					if skew {
+						n = simFoldBytes / (2 * (2*simSpaces - 2)) // a weight of 1 in 2×(spaces-1) + 2×(spaces-1)
+						if i%simSpaces == 0 {
+							n *= simSpaces - 1
+						}
 					}
+					files = append(files, simFile(&id, v.NextSeq+uint64(i), byte('A'+i%simSpaces), 0, math.MaxUint64, n))
 				}
-				files = append(files, simFile(&id, v.NextSeq+uint64(i), byte('A'+i%simSpaces), 0, math.MaxUint64, n))
 			}
 			var err error
 			if v, err = v.Apply(Edit{Add: map[int][]FileRef{0: files}}); err != nil {
@@ -275,6 +292,43 @@ func TestFoldPatternSimulation(t *testing.T) {
 		// faster than the merges behind them retire them.
 		if ti.maxRuns > 2*DefaultOptions().MaxRuns || ti.stalls > lv.stalls {
 			t.Errorf("tiered%s: %d runs in a space (MaxRuns %d), %d stalled folds (leveled %d)", skew, ti.maxRuns, DefaultOptions().MaxRuns, ti.stalls, lv.stalls)
+		}
+	}
+}
+
+// TestWriteOnceSimulation replays folds whose bytes split by the shares
+// of a vector index's spaces (F full-vector blocks half, D document blocks
+// a fifth, four tiered spaces the rest) through the tiered picker with F
+// and D tiered, then write-once, and reports the bytes written (level 0
+// and compaction) per ingested byte, per space, and the most runs a
+// lookup in a space walks. On 300 folds tiered wrote 5.54×, write-once at
+// fanout 8 4.41× (F 5.73× → 3.83×) in 18 runs.
+func TestWriteOnceSimulation(t *testing.T) {
+	folds := 300
+	if testing.Short() {
+		folds = 60
+	}
+	shares := []simShare{{'A', .075}, {'D', .2}, {'F', .5}, {'I', .075}, {'P', .075}, {'T', .075}}
+	var tiered float64
+	for _, c := range []SpacePolicy{{}, {Fanout: 4, MaxRuns: 64}, {Fanout: 8, MaxRuns: 16}, {Fanout: 8, MaxRuns: 32}, {Fanout: 8, MaxRuns: 64}, {Fanout: 16, MaxRuns: 64}} {
+		o := DefaultOptions()
+		name := "tiered"
+		if c.MaxRuns > 0 {
+			c.WriteOnce = true
+			name = fmt.Sprintf("write-once F, D, fanout %d, MaxRuns %d", c.Fanout, c.MaxRuns)
+			o.Spaces = map[byte]SpacePolicy{'D': c, 'F': c}
+		}
+		r := simulate(t, o, folds, false, shares...)
+		wa := float64(r.ingested+r.written) / float64(r.ingested)
+		per := func(sp byte, share float64) float64 {
+			return 1 + float64(r.bySpace[sp])/(share*float64(r.ingested))
+		}
+		t.Logf("%s: written %.2f× the ingested bytes (F %.2f×, D %.2f×, A %.2f×), max runs in a space %d, stalled folds %d, ingest %.1f MB/s",
+			name, wa, per('F', .5), per('D', .2), per('A', .075), r.maxRuns, r.stalls, float64(r.ingested)/r.secs/1e6)
+		if c.MaxRuns == 0 {
+			tiered = wa
+		} else if c.Fanout == 8 && wa >= tiered {
+			t.Errorf("%s: written %.2f× ≥ tiered %.2f×", name, wa, tiered)
 		}
 	}
 }

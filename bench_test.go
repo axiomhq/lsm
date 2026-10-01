@@ -282,3 +282,85 @@ func BenchmarkGet(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkRuns is the read cost of a write-once space's runs: 8192 keys
+// of 4 KiB values (a stored block each, as Locate serves) striped over
+// runs runs of one file each, every run spanning the space, so a key is
+// in one run and a lookup walks about half of them; Iter64 reads 64
+// consecutive keys, a merge of every run.
+func BenchmarkRuns(b *testing.B) {
+	const keys = 8192
+	ctx := context.Background()
+	key := func(i int) []byte { return binary.BigEndian.AppendUint32([]byte{'F'}, uint32(i)) }
+	val := make([]byte, LargeValueBytes)
+	for _, runs := range []int{8, 18, 32, 64} {
+		tables := map[string]*Table{}
+		add := map[int][]FileRef{}
+		for run := range runs {
+			w := NewTableWriter(DefaultBlockBytes)
+			for i := run; i < keys; i += runs {
+				if err := w.Add(Entry{Key: key(i), Kind: KindPut, Value: val}); err != nil {
+					b.Fatal(err)
+				}
+			}
+			data, meta, err := w.Finish()
+			if err != nil {
+				b.Fatal(err)
+			}
+			ref := FileRef{Key: fmt.Sprint("f", run), Seq: uint64(run), TableMeta: meta}
+			if tables[ref.Key], err = OpenTableAt(ctx, BytesSource(data), meta); err != nil {
+				b.Fatal(err)
+			}
+			add[run+1] = []FileRef{ref}
+		}
+		v, err := Version{}.Apply(Edit{Add: add})
+		if err != nil {
+			b.Fatal(err)
+		}
+		r := Reader{Open: func(_ context.Context, f FileRef) (*Table, error) { return tables[f.Key], nil }}
+		rng := rand.New(rand.NewPCG(1, 2))
+		lookups := make([]int, 1024)
+		for i := range lookups {
+			lookups[i] = rng.IntN(keys - 64)
+		}
+		b.Run(fmt.Sprintf("runs=%d/Get", runs), func(b *testing.B) {
+			b.ReportAllocs()
+			i := 0
+			for b.Loop() {
+				if _, ok, err := r.Get(ctx, v, key(lookups[i%len(lookups)])); !ok || err != nil {
+					b.Fatalf("get: %v %v", ok, err)
+				}
+				i++
+			}
+		})
+		b.Run(fmt.Sprintf("runs=%d/Locate", runs), func(b *testing.B) {
+			b.ReportAllocs()
+			i := 0
+			for b.Loop() {
+				if _, ok, err := r.Locate(ctx, v, key(lookups[i%len(lookups)])); !ok || err != nil {
+					b.Fatalf("locate: %v %v", ok, err)
+				}
+				i++
+			}
+		})
+		b.Run(fmt.Sprintf("runs=%d/Iter64", runs), func(b *testing.B) {
+			b.ReportAllocs()
+			i := 0
+			for b.Loop() {
+				lo := lookups[i%len(lookups)]
+				it, err := r.Iter(ctx, v, key(lo), key(lo+64))
+				if err != nil {
+					b.Fatal(err)
+				}
+				n := 0
+				for ok := it.SeekGE(nil); ok; ok = it.Next() {
+					n++
+				}
+				if n != 64 || it.Err() != nil {
+					b.Fatalf("iter: %d keys, %v", n, it.Err())
+				}
+				i++
+			}
+		})
+	}
+}

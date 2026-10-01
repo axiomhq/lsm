@@ -2,6 +2,7 @@ package lsm
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"fmt"
 	"runtime"
@@ -55,6 +56,40 @@ type Options struct {
 	// once every put has (0: Workers; negative: each merge waits for its
 	// own put).
 	Uploads int
+	// Spaces sets a key space's merge policy (tiered only), by its first
+	// key byte; a space it does not name tiers by size.
+	Spaces map[byte]SpacePolicy
+}
+
+// SpacePolicy is one key space's merge policy.
+type SpacePolicy struct {
+	// WriteOnce: the space's keys are written once, each to a new key, so
+	// runs hold disjoint keys and a merge of them reclaims only what was
+	// deleted: every merge is bought for fewer runs per read. Such a space
+	// trades the size rule's pairs for Fanout-way merges, and merges all
+	// its runs into the oldest once their tombstones reach DeadRatio of
+	// their puts (TableMeta.Deletes). An overwrite is not counted: it
+	// stays correct, and is reclaimed by the next merge over it.
+	WriteOnce bool
+	// Fanout is the runs a write-once space merges at once (0: 8): the
+	// newest Fanout adjacent runs within twice the newest's bytes merge
+	// into the oldest of them, so a byte is rewritten about
+	// log_Fanout(space bytes / level-0 bytes) times, and the space holds
+	// up to Fanout-1 runs of each size.
+	Fanout int
+	// MaxRuns bounds the space's runs (0: Options.MaxRuns).
+	MaxRuns int
+	// DeadRatio is the tombstones per put in a write-once space's runs at
+	// which all of them merge into the oldest, into the bottom, where a
+	// tombstone and the put it shadows drop (0: never; MaxTableAge and the
+	// Fanout merges reclaim alone). Each tombstone shadows one put, so 0.5
+	// keeps a space within about twice its live bytes, and the merge costs
+	// the space's bytes per DeadRatio of them reclaimed: under heavy churn
+	// (a growing index whose splits delete a third of the blocks each
+	// round) that is more than the pairs it replaces wrote. A tombstone
+	// whose put a merge above the bottom dropped still counts, so 1 fires
+	// when such tombstones pile up.
+	DeadRatio float64
 }
 
 // DefaultOptions: tiered, 4 L0 files, 8 runs, 48 MiB files (leveled:
@@ -368,6 +403,10 @@ func (v Version) spaceOfOldest() []FileRef {
 //     runs.
 //  3. Count: past MaxRuns runs in a space, the adjacent window of
 //     runs-MaxRuns+1 of them with the fewest bytes merges.
+//     A write-once space (Options.Spaces) merges its newest Fanout runs
+//     of about one size in place of rule 2, counts to its own MaxRuns,
+//     and merges every run into the oldest once its tombstones reach its
+//     DeadRatio of its puts.
 //  4. Age (MaxTableAge): an aged file in any run of a space but the oldest
 //     merges its run and every older one into the oldest; an aged level-0
 //     file (an idle version: an active one makes level 0 a new run first)
@@ -383,18 +422,18 @@ func (v Version) pickTiered(o Options) (Job, bool) {
 		return v.newRun(), true
 	}
 	type run struct {
-		level int
-		bytes int64
+		level                 int
+		bytes, count, deletes int64
 	}
 	var spaces [256][]run // per space, the levels holding it, newest first
 	for l := 1; l < len(v.Levels); l++ {
 		for _, f := range v.Levels[l] {
 			rs := spaces[f.Min[0]]
-			if n := len(rs); n > 0 && rs[n-1].level == l {
-				rs[n-1].bytes += f.Bytes
-			} else {
-				rs = append(rs, run{l, f.Bytes})
+			if n := len(rs); n == 0 || rs[n-1].level != l {
+				rs = append(rs, run{level: l})
 			}
+			r := &rs[len(rs)-1]
+			r.bytes, r.count, r.deletes = r.bytes+f.Bytes, r.count+f.Count, r.deletes+f.Deletes
 			spaces[f.Min[0]] = rs
 		}
 	}
@@ -411,6 +450,20 @@ func (v Version) pickTiered(o Options) (Job, bool) {
 		}
 	}
 	for s, rs := range spaces {
+		if p := o.Spaces[byte(s)]; p.WriteOnce {
+			fan := max(2, cmp.Or(p.Fanout, 8))
+			for i := 0; i+fan <= len(rs); i++ {
+				k := i + 1
+				for k < len(rs) && rs[k].bytes <= 2*rs[i].bytes {
+					k++
+				}
+				if k-i >= fan {
+					owe(s, rs[k-fan:k])
+					break
+				}
+			}
+			continue
+		}
 		for i := range rs {
 			sum, k := rs[i].bytes, i
 			for k+1 < len(rs) && rs[k+1].bytes <= sum {
@@ -425,10 +478,22 @@ func (v Version) pickTiered(o Options) (Job, bool) {
 	}
 	if bestBytes < 0 {
 		for s, rs := range spaces {
-			if len(rs) <= o.MaxRuns {
+			p := o.Spaces[byte(s)]
+			if p.WriteOnce && len(rs) > 1 {
+				var count, deletes int64
+				for _, r := range rs {
+					count, deletes = count+r.count, deletes+r.deletes
+				}
+				if p.DeadRatio > 0 && deletes > 0 && float64(deletes) >= p.DeadRatio*float64(count-deletes) {
+					owe(s, rs)
+					continue
+				}
+			}
+			maxRuns := cmp.Or(p.MaxRuns, o.MaxRuns)
+			if len(rs) <= maxRuns {
 				continue
 			}
-			w := len(rs) - o.MaxRuns + 1
+			w := len(rs) - maxRuns + 1
 			win, winBytes := 0, int64(-1)
 			for i := 0; i+w <= len(rs); i++ {
 				var n int64

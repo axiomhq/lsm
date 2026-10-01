@@ -186,6 +186,11 @@ rules are short.
 - A space's runs merge by size. Equal runs pair up like the bits of a binary
   counter.
 - Past `Options.MaxRuns` (8) runs, a space merges by count.
+- A write-once space (`Options.Spaces`, `SpacePolicy{WriteOnce: true}`)
+  never overwrites a key, so merging it reclaims only deletes. Its runs merge
+  `Fanout` (8) at a time instead of in pairs, up to its own `MaxRuns`. With
+  `DeadRatio` set, all its runs merge into the oldest once its tombstones
+  reach that share of its puts (`TableMeta.Deletes`).
 
 So a byte is rewritten about log2(space bytes / level-0 bytes) times, rather
 than once per level-0 job. A new-run job (`Job.NewRun`) moves the runs it
@@ -256,6 +261,8 @@ Blocks close at 64 KiB of raw bytes (`DefaultBlockBytes`). A value of 4 KiB or
 more (`LargeValueBytes`) gets a block of its own, so a point read of it
 decodes only that block. If zstd can't shrink a block by at least an eighth,
 the block is stored raw.
+A block that is one large value is stored raw unless zstd at least halves
+it, so dense vectors stay readable by extent (`Table.Single`).
 
 The key filter is a bloom filter at 10 bits per key, which gives about 1%
 false positives. A point lookup of a key that a table doesn't hold reads no
