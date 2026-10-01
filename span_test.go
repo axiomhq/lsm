@@ -51,6 +51,72 @@ func TestSpanNamesTheBlocksAKeyRangeTouches(t *testing.T) {
 	}
 }
 
+// TestBlockExtentServesTheSpan: the blocks' extents tile the table from 0
+// to the index, and a reader whose source serves only the extents of the
+// blocks Span names for a range reads every key in it.
+func TestBlockExtentServesTheSpan(t *testing.T) {
+	var entries []Entry
+	for i := range 200 {
+		entries = append(entries, Entry{Key: fmt.Appendf(nil, "k%03d", i), Kind: KindPut, Value: bytes.Repeat([]byte{byte(i)}, 40)})
+	}
+	data, meta, err := BuildTable(entries, 512)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	tb, err := OpenTableAt(ctx, BytesSource(data), meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var end int64
+	for i := range tb.index {
+		off, length := tb.BlockExtent(i)
+		if off != end || length <= 0 {
+			t.Fatalf("block %d at %d+%d, want it to start at %d", i, off, length, end)
+		}
+		end = off + length
+	}
+	if end != meta.IndexOff {
+		t.Fatalf("blocks end at %d, the index starts at %d", end, meta.IndexOff)
+	}
+	lo, hi := []byte("k050"), []byte("k090")
+	first, last, ok := tb.Span(lo, hi)
+	if !ok {
+		t.Fatal("no span")
+	}
+	served := extentSource{data: data, ok: map[[2]int64]bool{{meta.IndexOff, meta.IndexLen + 32}: true}}
+	for i := first; i <= last; i++ {
+		off, length := tb.BlockExtent(i)
+		served.ok[[2]int64{off, length}] = true
+	}
+	only, err := OpenTableAt(ctx, served, meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 50; i < 90; i++ {
+		key := fmt.Appendf(nil, "k%03d", i)
+		if e, found, err := only.Get(ctx, key); err != nil || !found || !bytes.Equal(e.Value, entries[i].Value) {
+			t.Fatalf("%q from the span's extents: %v %v", key, found, err)
+		}
+	}
+	if _, _, err := only.Get(ctx, []byte("k150")); err == nil {
+		t.Fatal("a key outside the span was read from extents the source does not serve")
+	}
+}
+
+// extentSource serves only the extents in ok.
+type extentSource struct {
+	data []byte
+	ok   map[[2]int64]bool
+}
+
+func (s extentSource) ReadAt(_ context.Context, off, length int64) ([]byte, error) {
+	if !s.ok[[2]int64{off, length}] {
+		return nil, fmt.Errorf("extent %d+%d not served", off, length)
+	}
+	return s.data[off : off+length], nil
+}
+
 func TestLocateNamesTheFile(t *testing.T) {
 	ctx := context.Background()
 	m := newMemStore()

@@ -511,6 +511,13 @@ func (t *Table) blockFor(key []byte) int {
 	return sort.Search(len(t.index), func(i int) bool { return bytes.Compare(t.index[i].last, key) >= 0 })
 }
 
+// BlockExtent is block i's bytes in the table, its offset and length: a
+// reader that knows from Span which blocks a key range touches can fetch
+// them all at once before iterating, rather than one round trip a block.
+func (t *Table) BlockExtent(i int) (off, length int64) {
+	return t.index[i].off, t.index[i].length
+}
+
 // Block is one decoded block: entry start offsets into raw.
 type Block struct {
 	raw  []byte
