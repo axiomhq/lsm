@@ -236,3 +236,66 @@ func TestGroupedSpaceBlocks(t *testing.T) {
 		}
 	}
 }
+
+// TestBoundedIterReadsNoBlockPastTheRange: Reader.Iter over one group's
+// range reads that group's blocks and no other (it used to load the next
+// block to learn the range had ended), and still yields every key in it.
+func TestBoundedIterReadsNoBlockPastTheRange(t *testing.T) {
+	ctx := context.Background()
+	o := DefaultOptions()
+	o.BlockBytes = 512
+	o.Spaces = map[byte]SpacePolicy{'H': {Group: func([]byte) int { return 3 }}}
+	var entries []Entry
+	for g := range 20 {
+		for i := range 30 {
+			entries = append(entries, Entry{Key: fmt.Appendf(nil, "H%02d%03d", g, i), Kind: KindPut, Value: bytes.Repeat([]byte{byte(g)}, 30)})
+		}
+	}
+	data, meta, err := BuildTableOptions(entries, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reads := map[int64]int{}
+	src := countingExtents{data: data, reads: reads}
+	f := FileRef{Key: "t", TableMeta: meta}
+	v := Version{Levels: [][]FileRef{nil, {f}}}
+	r := Reader{Open: func(ctx context.Context, _ FileRef) (*Table, error) { return OpenTableAt(ctx, src, meta) }}
+	for _, g := range []int{0, 7, 19} {
+		clear(reads)
+		lo, hi := fmt.Appendf(nil, "H%02d", g), fmt.Appendf(nil, "H%02d", g+1)
+		it, err := r.Iter(ctx, v, lo, hi)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for ok := it.SeekGE(lo); ok; ok = it.Next() {
+			n++
+		}
+		if err := it.Err(); err != nil || n != 30 {
+			t.Fatalf("group %d: %d keys (%v)", g, n, err)
+		}
+		tb, _ := OpenTableAt(ctx, BytesSource(data), meta)
+		first, last, _ := tb.Span(lo, hi)
+		want := map[int64]bool{}
+		for i := first; i <= last; i++ {
+			off, _ := tb.BlockExtent(i)
+			want[off] = true
+		}
+		for off := range reads {
+			if off != meta.IndexOff && !want[off] {
+				t.Fatalf("group %d: read a block at %d outside its span %d..%d", g, off, first, last)
+			}
+		}
+	}
+}
+
+// countingExtents records the offset of every read.
+type countingExtents struct {
+	data  []byte
+	reads map[int64]int
+}
+
+func (s countingExtents) ReadAt(_ context.Context, off, length int64) ([]byte, error) {
+	s.reads[off]++
+	return s.data[off : off+length], nil
+}

@@ -765,7 +765,25 @@ func uvarintLen(x uint64) int {
 // Iter returns an iterator over the table. It is not positioned until
 // SeekGE.
 func (t *Table) Iter(ctx context.Context) *TableIter {
-	return &TableIter{ctx: ctx, t: t, bi: -1}
+	return t.iterBelow(ctx, nil)
+}
+
+// iterBelow is Iter over the keys below hi (nil: to the end): it never
+// loads a block the index shows starts at or past hi. A bounded read
+// (Reader.Iter) learned its range had ended by reading the next block,
+// one extra block a range: a whole neighbouring group's when groups get
+// blocks of their own (SpacePolicy.Group).
+func (t *Table) iterBelow(ctx context.Context, hi []byte) *TableIter {
+	return &TableIter{ctx: ctx, t: t, bi: -1, stop: t.stopBefore(hi)}
+}
+
+// stopBefore is the first block whose first key is at or past hi, or the
+// block count for nil.
+func (t *Table) stopBefore(hi []byte) int {
+	if hi == nil {
+		return len(t.index)
+	}
+	return sort.Search(len(t.index), func(i int) bool { return bytes.Compare(t.index[i].first, hi) >= 0 })
 }
 
 // scan is Iter for a forward pass over the table's keys below hi (nil:
@@ -778,11 +796,8 @@ func (t *Table) Iter(ctx context.Context) *TableIter {
 // is past it). Its blocks bypass Cache: they are read once, and would
 // evict what point reads share.
 func (t *Table) scan(ctx context.Context, window int64, hi []byte) *TableIter {
-	stop := len(t.index)
-	if hi != nil {
-		stop = sort.Search(len(t.index), func(i int) bool { return bytes.Compare(t.index[i].first, hi) >= 0 })
-	}
-	return &TableIter{ctx: ctx, t: t, bi: -1, ra: &readAhead{t: t, window: window, stop: stop}}
+	stop := t.stopBefore(hi)
+	return &TableIter{ctx: ctx, t: t, bi: -1, stop: stop, ra: &readAhead{t: t, window: window, stop: stop}}
 }
 
 // TableIter iterates one table in key order. It stores its context
@@ -791,11 +806,14 @@ type TableIter struct {
 	ctx context.Context
 	t   *Table
 	ra  *readAhead // nil: a block per read, through Cache
-	bi  int
-	blk *Block
-	ei  int
-	cur Entry
-	err error
+	// stop is the first block the iterator never loads: its keys are all
+	// at or past the bound it was made with (iterBelow, scan).
+	stop int
+	bi   int
+	blk  *Block
+	ei   int
+	cur  Entry
+	err  error
 }
 
 // readAhead is a scan's windows: cur holds the block the cursor is in,
@@ -884,7 +902,7 @@ func (it *TableIter) SeekGE(target []byte) bool {
 		return false
 	}
 	bi := it.t.blockFor(target)
-	if bi == len(it.t.index) {
+	if bi >= it.stop {
 		it.blk = nil
 		return false
 	}
@@ -928,7 +946,7 @@ func (it *TableIter) Next() bool {
 	}
 	it.ei++
 	if it.ei >= len(it.blk.offs) {
-		if it.bi+1 == len(it.t.index) {
+		if it.bi+1 >= it.stop {
 			it.blk = nil
 			return false
 		}
