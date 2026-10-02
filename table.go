@@ -199,8 +199,9 @@ type TableWriter struct {
 	meta       TableMeta
 	last       []byte
 	spaces     []SpaceRange
-	idx        int64    // index bytes of the closed blocks
-	hashes     []uint64 // keyHash of every key, for the filter
+	idx        int64                // index bytes of the closed blocks
+	hashes     []uint64             // keyHash of every key, for the filter
+	groups     map[byte]SpacePolicy // SpacePolicy.Group by space; nil: none
 }
 
 // NewTableWriter returns a writer closing blocks at blockBytes of raw
@@ -278,7 +279,26 @@ func (w *TableWriter) bound() int64 {
 // raw bytes stay within MaxTableBytes.
 func (w *TableWriter) joins(e Entry) bool {
 	return w.n > 0 && len(e.Value) < LargeValueBytes && len(w.raw)+len(e.Value) <= w.blockBytes &&
-		int64(len(w.raw))+entryRaw(e)+int64(uvarintLen(uint64(w.n+1))) <= MaxTableBytes
+		int64(len(w.raw))+entryRaw(e)+int64(uvarintLen(uint64(w.n+1))) <= MaxTableBytes && w.sameGroup(e.Key)
+}
+
+// sameGroup reports whether key may share the open block with the last
+// key: always, unless either key's space groups its keys, and then only
+// when both are in one space and one group.
+func (w *TableWriter) sameGroup(key []byte) bool {
+	if w.groups == nil {
+		return true
+	}
+	last, ok := w.groups[w.last[0]]
+	next, okNext := w.groups[key[0]]
+	if !ok && !okNext {
+		return true
+	}
+	if key[0] != w.last[0] {
+		return false
+	}
+	n, m := min(next.Group(key), len(key)), min(last.Group(w.last), len(w.last))
+	return n == m && bytes.Equal(key[:n], w.last[:m])
 }
 
 // fits reports whether the table can take e, placed as Add would place it,
@@ -366,9 +386,33 @@ func (w *TableWriter) Finish() ([]byte, TableMeta, error) {
 	return w.out, w.meta, nil
 }
 
+// NewTableWriterOptions is NewTableWriter at o.BlockBytes that also keeps
+// each space's groups in blocks of their own (SpacePolicy.Group).
+func NewTableWriterOptions(o Options) *TableWriter {
+	o = o.withDefaults()
+	w := NewTableWriter(o.BlockBytes)
+	for s, p := range o.Spaces {
+		if p.Group != nil {
+			if w.groups == nil {
+				w.groups = map[byte]SpacePolicy{}
+			}
+			w.groups[s] = p
+		}
+	}
+	return w
+}
+
+// BuildTableOptions is BuildTable through NewTableWriterOptions.
+func BuildTableOptions(entries []Entry, o Options) ([]byte, TableMeta, error) {
+	return buildTable(entries, NewTableWriterOptions(o))
+}
+
 // BuildTable writes sorted, unique entries as one table.
 func BuildTable(entries []Entry, blockBytes int) ([]byte, TableMeta, error) {
-	w := NewTableWriter(blockBytes)
+	return buildTable(entries, NewTableWriter(blockBytes))
+}
+
+func buildTable(entries []Entry, w *TableWriter) ([]byte, TableMeta, error) {
 	for _, e := range entries {
 		if err := w.Add(e); err != nil {
 			return nil, TableMeta{}, err

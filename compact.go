@@ -79,6 +79,14 @@ type SpacePolicy struct {
 	Fanout int
 	// MaxRuns bounds the space's runs (0: Options.MaxRuns).
 	MaxRuns int
+	// Group, when set, is the length of the prefix of a key of the space
+	// that names its group: a table block never holds two groups, nor a
+	// group and another space's keys, so a group's entries in a table are
+	// whole blocks a reader fetches exactly (Table.Span, BlockExtent).
+	// Every table this Options builds keeps it (Flush, Compact,
+	// BuildTableOptions). The cost is an index entry per group a table
+	// holds.
+	Group func(key []byte) int
 	// DeadRatio is the tombstones per put in a write-once space's runs at
 	// which all of them merge into the oldest, into the bottom, where a
 	// tombstone and the put it shadows drop (0: never; MaxTableAge and the
@@ -150,7 +158,7 @@ type Putter func(ctx context.Context, level int, seq uint64, data []byte) (strin
 // version holding it. Cost: the entries' own bytes once.
 func Flush(ctx context.Context, v Version, entries []Entry, o Options, put Putter) (Version, FileRef, error) {
 	o = o.withDefaults()
-	data, meta, err := BuildTable(entries, o.BlockBytes)
+	data, meta, err := BuildTableOptions(entries, o)
 	if err != nil {
 		return Version{}, FileRef{}, err
 	}
@@ -944,7 +952,7 @@ func (c *compaction) writePartition(ctx context.Context, pi int, p partition) er
 			}
 		}
 		if w == nil {
-			w = NewTableWriter(c.o.BlockBytes)
+			w = NewTableWriterOptions(c.o)
 			space = e.Key[0]
 		}
 		if err := w.Add(e); err != nil {
