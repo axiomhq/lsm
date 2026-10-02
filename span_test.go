@@ -299,3 +299,28 @@ func (s countingExtents) ReadAt(_ context.Context, off, length int64) ([]byte, e
 	s.reads[off]++
 	return s.data[off : off+length], nil
 }
+
+// TestRawSpaceKeepsLargeValuesExtentReadable: a large value zstd halves
+// is compressed (no extent) unless its space is Raw, where it is stored
+// and Table.Single names its bytes.
+func TestRawSpaceKeepsLargeValuesExtentReadable(t *testing.T) {
+	ctx := context.Background()
+	val := bytes.Repeat([]byte("0123"), LargeValueBytes) // compresses to almost nothing
+	o := DefaultOptions()
+	o.Spaces = map[byte]SpacePolicy{'F': {Raw: true}}
+	data, meta, err := BuildTableOptions([]Entry{{Key: []byte("D1"), Kind: KindPut, Value: val}, {Key: []byte("F1"), Kind: KindPut, Value: val}}, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tb, err := OpenTableAt(ctx, BytesSource(data), meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := tb.Single([]byte("D1")); ok {
+		t.Fatal("a compressible large value outside a Raw space was stored")
+	}
+	off, length, ok := tb.Single([]byte("F1"))
+	if !ok || length != int64(len(val)) || !bytes.Equal(data[off:off+length], val) {
+		t.Fatalf("Raw space: Single %d+%d %v", off, length, ok)
+	}
+}

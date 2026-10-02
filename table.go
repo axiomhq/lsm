@@ -201,7 +201,7 @@ type TableWriter struct {
 	spaces     []SpaceRange
 	idx        int64                // index bytes of the closed blocks
 	hashes     []uint64             // keyHash of every key, for the filter
-	groups     map[byte]SpacePolicy // SpacePolicy.Group by space; nil: none
+	policies   map[byte]SpacePolicy // the spaces with a Group or Raw; nil: none
 }
 
 // NewTableWriter returns a writer closing blocks at blockBytes of raw
@@ -286,12 +286,8 @@ func (w *TableWriter) joins(e Entry) bool {
 // key: always, unless either key's space groups its keys, and then only
 // when both are in one space and one group.
 func (w *TableWriter) sameGroup(key []byte) bool {
-	if w.groups == nil {
-		return true
-	}
-	last, ok := w.groups[w.last[0]]
-	next, okNext := w.groups[key[0]]
-	if !ok && !okNext {
+	last, next := w.policies[w.last[0]], w.policies[key[0]]
+	if last.Group == nil && next.Group == nil {
 		return true
 	}
 	if key[0] != w.last[0] {
@@ -334,11 +330,15 @@ func (w *TableWriter) flushBlock() {
 	// A stored block's decode aliases the table bytes and costs a checksum
 	// and nothing else.
 	saves := len(raw) / 8
-	if w.n == 1 && len(w.raw) >= LargeValueBytes {
+	large := w.n == 1 && len(w.raw) >= LargeValueBytes
+	if large {
 		saves = len(raw) / 2
 	}
-	w.out = blockEncoder.EncodeAll(raw, append(w.out, blockZstd))
-	stored := len(w.out)-int(off)-5 > len(raw)-saves
+	stored := large && w.policies[w.first[0]].Raw
+	if !stored {
+		w.out = blockEncoder.EncodeAll(raw, append(w.out, blockZstd))
+		stored = len(w.out)-int(off)-5 > len(raw)-saves
+	}
 	if stored {
 		w.out = w.out[:off+4]
 		w.out = append(append(w.out, blockStored), raw...)
@@ -392,11 +392,11 @@ func NewTableWriterOptions(o Options) *TableWriter {
 	o = o.withDefaults()
 	w := NewTableWriter(o.BlockBytes)
 	for s, p := range o.Spaces {
-		if p.Group != nil {
-			if w.groups == nil {
-				w.groups = map[byte]SpacePolicy{}
+		if p.Group != nil || p.Raw {
+			if w.policies == nil {
+				w.policies = map[byte]SpacePolicy{}
 			}
-			w.groups[s] = p
+			w.policies[s] = p
 		}
 	}
 	return w

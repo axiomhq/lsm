@@ -87,6 +87,13 @@ type SpacePolicy struct {
 	// BuildTableOptions). The cost is an index entry per group a table
 	// holds.
 	Group func(key []byte) int
+	// Raw stores every large value of the space as it is (a block of its
+	// own, Table.Single), whatever zstd would save: a reader reads parts
+	// of it by extent, a row of a vector page say, which a compressed
+	// block forbids. A space of large values zstd halves (vectors whose
+	// lanes are small integers) otherwise compresses, and a read of one
+	// row of a value decodes the whole of it.
+	Raw bool
 	// DeadRatio is the tombstones per put in a write-once space's runs at
 	// which all of them merge into the oldest, into the bottom, where a
 	// tombstone and the put it shadows drop (0: never; MaxTableAge and the
