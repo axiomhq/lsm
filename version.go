@@ -163,13 +163,19 @@ func (v Version) Apply(e Edit) (Version, error) {
 var ErrStale = errors.New("lsm: edit is stale")
 
 // Rebase applies e, a compaction's edit computed on base, to v, a version
-// published since. It holds when v differs from base only by level-0 files
-// added (Flush): every file e deletes is still in v at its level in base,
-// and levels 1 and deeper name the same files as in base. Then the outputs
-// sit where the compaction put them, the added level-0 files stay newer
-// than every input, and a job that dropped tombstones (Job.Bottom) still
-// has nothing beneath it. Anything else, a second compaction say, is
-// ErrStale.
+// published since. It holds when v differs from base by level-0 files
+// added (Flush) and by tiered new runs (Job.NewRun) published since:
+//
+//   - every file e deletes is still in v, level 0 at level 0;
+//   - every file of base at level 1 or deeper is still in v, each space's
+//     run moved whole to one level, the runs of a space in their order;
+//   - every file of v at level 1 or deeper that base lacks lies above
+//     every run of its space that base holds.
+//
+// Then e's outputs land in the level their run moved to: the added
+// files stay newer than every input, and a job that dropped tombstones
+// (Job.Bottom) still has nothing beneath it. Anything else, a second
+// merge say, or a new run over a merge, is ErrStale.
 func (v Version) Rebase(base Version, e Edit) (Version, error) {
 	level := func(ver Version) map[string]int {
 		at := map[string]int{}
@@ -183,22 +189,71 @@ func (v Version) Rebase(base Version, e Edit) (Version, error) {
 	was, now := level(base), level(v)
 	for _, k := range e.Del {
 		l, ok := was[k]
-		if nl, present := now[k]; !ok || !present || nl != l {
+		if nl, present := now[k]; !ok || !present || (l == 0) != (nl == 0) {
 			return Version{}, fmt.Errorf("%w: %s", ErrStale, k)
 		}
 	}
-	for l := 1; l < max(len(base.Levels), len(v.Levels)); l++ {
-		var a, b []FileRef
-		if l < len(base.Levels) {
-			a = base.Levels[l]
-		}
-		if l < len(v.Levels) {
-			b = v.Levels[l]
-		}
-		if !slices.EqualFunc(a, b, func(x, y FileRef) bool { return x.Key == y.Key }) {
-			return Version{}, fmt.Errorf("%w: level %d changed", ErrStale, l)
+	type run struct {
+		space byte
+		level int
+	}
+	moved := map[run]int{} // a base run → its level in v
+	top := [256]int{}      // per space, its shallowest base run's level in v (0: none)
+	for l := 1; l < len(base.Levels); l++ {
+		for _, f := range base.Levels[l] {
+			nl, ok := now[f.Key]
+			r := run{f.Min[0], l}
+			if p, seen := moved[r]; !ok || nl == 0 || seen && p != nl {
+				return Version{}, fmt.Errorf("%w: level %d changed", ErrStale, l)
+			}
+			moved[r] = nl
+			if top[r.space] == 0 {
+				top[r.space] = nl
+			}
 		}
 	}
+	// Runs of a space keep their order: base levels ascend, so must theirs.
+	last := [256]int{}
+	for l := 1; l < len(base.Levels); l++ {
+		for _, f := range base.Levels[l] {
+			s := f.Min[0]
+			if nl := moved[run{s, l}]; nl != last[s] {
+				if nl < last[s] {
+					return Version{}, fmt.Errorf("%w: level %d reordered", ErrStale, l)
+				}
+				last[s] = nl
+			}
+		}
+	}
+	same := true
+	for r, nl := range moved {
+		same = same && nl == r.level
+	}
+	for l := 1; l < len(v.Levels); l++ {
+		for _, f := range v.Levels[l] {
+			if _, ok := was[f.Key]; ok {
+				continue
+			}
+			if t := top[f.Min[0]]; t != 0 && l >= t {
+				return Version{}, fmt.Errorf("%w: level %d changed", ErrStale, l)
+			}
+			same = false
+		}
+	}
+	if same {
+		return v.Apply(e)
+	}
+	add := make(map[int][]FileRef, len(e.Add))
+	for l, files := range e.Add {
+		for _, f := range files {
+			nl, ok := moved[run{f.Min[0], l}]
+			if !ok {
+				return Version{}, fmt.Errorf("%w: level %d has no run of space %#x to land in", ErrStale, l, f.Min[0])
+			}
+			add[nl] = append(add[nl], f)
+		}
+	}
+	e.Add = add
 	return v.Apply(e)
 }
 

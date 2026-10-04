@@ -99,6 +99,149 @@ func TestRebaseOverFlushesMatchesModel(t *testing.T) {
 	}
 }
 
+// TestRebaseMergeOverNewRunsMatchesModel: a tiered merge planned on a
+// snapshot rebases over the new runs (Job.NewRun) published while it ran,
+// which shift its runs deeper, and reads back exactly like the model.
+func TestRebaseMergeOverNewRunsMatchesModel(t *testing.T) {
+	for seed := uint64(1); seed <= 16; seed++ {
+		t.Run(fmt.Sprint(seed), func(t *testing.T) {
+			rng := rand.New(rand.NewPCG(seed, 13))
+			ctx := context.Background()
+			st := newMemStore()
+			m := model{}
+			universe := slices.Concat(randKeys(rng, 100, 'J'), randKeys(rng, 100, 'K'), randKeys(rng, 100, 'L'))
+			o := Options{L0Trigger: 2 + rng.IntN(2), FileBytes: 4 << 10, BlockBytes: 512}
+			var v Version
+			flush := func() {
+				t.Helper()
+				var err error
+				if v, _, err = Flush(ctx, v, randBatch(rng, universe, m), o, st.put); err != nil {
+					t.Fatal(err)
+				}
+			}
+			compact := func(snap Version, j Job) Edit {
+				t.Helper()
+				_, e, err := Compact(ctx, snap, j, o, st.reader(), st.put)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return e
+			}
+			shifted := 0
+			for round := 0; round < 60; round++ {
+				flush()
+				j, ok := Pick(v, o)
+				if !ok {
+					continue
+				}
+				if j.NewRun {
+					var err error
+					if v, err = v.Rebase(v, compact(v, j)); err != nil {
+						t.Fatal(err)
+					}
+					continue
+				}
+				snap, merge := v, compact(v, j)
+				// New runs publish while the merge runs.
+				runs := 0
+				for range 1 + rng.IntN(3) {
+					for len(v.Levels[0]) < o.L0Trigger {
+						flush()
+					}
+					nr, _ := Pick(v, o)
+					if !nr.NewRun {
+						t.Fatalf("round %d: level 0 at the trigger picked %+v", round, nr)
+					}
+					base, e := v, compact(v, nr)
+					var err error
+					if v, err = v.Rebase(base, e); err != nil {
+						t.Fatal(err)
+					}
+					runs++
+				}
+				var err error
+				if v, err = v.Rebase(snap, merge); err != nil {
+					t.Fatalf("round %d: merge over %d new runs: %v", round, runs, err)
+				}
+				shifted++
+				checkModel(t, ctx, v, st, m, rng, universe)
+			}
+			if shifted == 0 {
+				t.Fatal("no merge ran beside a new run")
+			}
+			for {
+				j, ok := Pick(v, o)
+				if !ok {
+					break
+				}
+				var err error
+				if v, err = v.Rebase(v, compact(v, j)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			checkModel(t, ctx, v, st, m, rng, universe)
+		})
+	}
+}
+
+// TestRebaseRefusesANewRunOverAMerge: a new run planned on a snapshot is
+// stale once a merge of runs it would shift has published.
+func TestRebaseRefusesANewRunOverAMerge(t *testing.T) {
+	ctx := context.Background()
+	rng := rand.New(rand.NewPCG(5, 5))
+	st := newMemStore()
+	m := model{}
+	universe := randKeys(rng, 300, 'K')
+	o := Options{L0Trigger: 2, FileBytes: 4 << 10, BlockBytes: 512}
+	var v Version
+	var err error
+	for tries := 0; ; tries++ {
+		if tries == 200 {
+			t.Fatal("setup: never a merge owed with level 0 at the trigger")
+		}
+		if v, _, err = Flush(ctx, v, randBatch(rng, universe, m), o, st.put); err != nil {
+			t.Fatal(err)
+		}
+		if len(v.Levels[0]) >= o.L0Trigger {
+			hold := v.Levels[0]
+			v.Levels[0] = nil
+			j, ok := Pick(v, o)
+			v.Levels[0] = hold
+			if ok && !j.NewRun {
+				break
+			}
+		}
+		// Only new runs: the merges they come to owe stay owed.
+		if j, ok := Pick(v, o); ok && j.NewRun {
+			if v, _, err = Compact(ctx, v, j, o, st.reader(), st.put); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	snap := v
+	nr, _ := Pick(snap, o)
+	_, en, err := Compact(ctx, snap, nr, o, st.reader(), st.put)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hold := snap.Levels[0]
+	snap.Levels[0] = nil
+	mj, _ := Pick(snap, o)
+	snap.Levels[0] = hold
+	_, em, err := Compact(ctx, snap, mj, o, st.reader(), st.put)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err := v.Rebase(snap, em)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := head.Rebase(snap, en); !errors.Is(err, ErrStale) {
+		t.Fatalf("a new run rebased over a merge: %v", err)
+	}
+	checkModel(t, ctx, head, st, m, rng, universe)
+}
+
 // TestRebaseRefusesAConcurrentCompaction: two compactions planned on one
 // snapshot; the second to publish is stale, whichever it is.
 func TestRebaseRefusesAConcurrentCompaction(t *testing.T) {
