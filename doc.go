@@ -19,8 +19,8 @@
 // leave alone the files no input writes to. The package does not interpret
 // the space byte beyond that.
 //
-// The table layout is documented at the constants in table.go and in the
-// README. Corrupt bytes return an error wrapping ErrCorrupt.
+// The table layout is documented at the constants in table.go and in
+// docs/design.md. Corrupt bytes return an error wrapping ErrCorrupt.
 // DecompressBounded, the size-capped zstd decode behind every block read,
 // is exported for other formats.
 //
