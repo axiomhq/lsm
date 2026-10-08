@@ -3,30 +3,37 @@
 [![go.dev reference](https://img.shields.io/badge/go.dev-reference-007d9c?logo=go&logoColor=white&style=flat-square)](https://pkg.go.dev/github.com/axiomhq/lsm)
 [![Latest Release](https://img.shields.io/github/v/release/axiomhq/lsm?style=flat-square)](https://github.com/axiomhq/lsm/releases/latest)
 
-lsm is a log-structured merge tree for object storage.
+lsm is a log-structured merge tree for object storage. It does no I/O.
 
-The basic idea is that an LSM tree is mostly a file format and a set of rules
-for merging files, and neither one needs to own a disk. So this package doesn't
-do any I/O. You give it sorted entries, and it gives you table bytes to store.
-You give it byte ranges back, and it answers reads. You keep the `Version`,
-which lists the live tables, in a manifest of your own, and you update it with
-a compare-and-swap. Every table is written once and never modified, which is
-exactly what object stores like S3 are good at.
+- You give it sorted entries. It gives you table bytes to store.
+- You give it byte ranges. It answers reads.
+- You keep the `Version` (the list of live tables) in your own manifest and
+  update it with a compare-and-swap.
+- Tables are written once and never modified, which suits S3-style stores.
 
-A key's history is a stack of versions: `Put`, `Delete`, and `Merge`. Reads
-fold that history into one value per key. Compaction is that same fold,
-written back out one level deeper.
+A key's history is a stack of `Put`, `Delete`, and `Merge` versions. Reads fold
+it into one value per key. Compaction does the same fold and writes the result
+one level deeper.
 
 ```sh
 go get github.com/axiomhq/lsm
 ```
 
+## Where to look
+
+| I want to... | Go to |
+| --- | --- |
+| Run the whole lifecycle | [Usage](#usage) |
+| Store a batch | [Writing](#writing) |
+| Read keys | [Reading](#reading) |
+| Merge files | [Compacting](#compacting) |
+| Tune compaction | [Options](#options) |
+
 ## Usage
 
-Here's the whole lifecycle: flush, compact, read. A map stands in for the
-object store. This is `ExampleCompact` in [example_test.go](example_test.go),
-so `go test` checks it; the file has more examples, including merge
-operands.
+Flush, compact, read. A map stands in for the object store. This is
+`ExampleCompact` in [example_test.go](example_test.go), so `go test` checks it.
+That file also shows merge operands.
 
 ```go
 ctx := context.Background()
@@ -96,15 +103,17 @@ c=3
 ```
 
 The delete hid `a`, and compaction into the bottom level dropped it. Level 1
-ended up with two files, not one, because of key spaces.
+has two files because `b` and `c` sit in different key spaces.
 
 ### Key spaces
 
-The first byte of every key is its space. This is a format rule, not a
-suggestion: compaction never writes a file that spans two spaces, it tracks
-each file's per-space ranges (`FileRef.Spaces`), and it leaves alone any file
-that no input writes to. The package doesn't interpret the space byte beyond
-that.
+The first byte of every key is its space. This is a format rule:
+
+- Compaction never writes a file that spans two spaces.
+- It tracks each file's per-space ranges in `FileRef.Spaces`.
+- It leaves alone any file that no input writes to.
+
+The package doesn't interpret the space byte beyond that.
 
 ### Writing
 
@@ -113,11 +122,11 @@ one level-0 table through your `Putter` and returns the next `Version`. Save
 that version with a conditional write. If you lose the race, reload and try
 again.
 
-A `Putter` stores `data` and returns its object key. `seq` is unique within
-one level of a version, and no more. Two writers that start from the same
-version hand out the same seqs, so if your writers can race, don't name
-objects by `seq` alone: add the level and a writer ID, or let the store pick
-the name. A file's identity is `FileRef.Key`.
+A `Putter` stores `data` and returns its object key. `seq` is unique within one
+level of a version, and nothing more. Two writers that start from the same
+version hand out the same seqs. If writers can race, don't name objects by
+`seq` alone. Add the level and a writer ID, or let the store pick the name. A
+file's identity is `FileRef.Key`.
 
 If you only want table bytes, without levels, use
 `lsm.BuildTable(entries, lsm.DefaultBlockBytes)`, or stream with
@@ -152,25 +161,25 @@ add and remove operands. Build values with `setmerge.Value`, operands with
 
 ### Compacting
 
-Compaction is three steps.
+Three steps:
 
-1. `job, ok := lsm.Pick(v, opts)` picks the next job. `ok` is false when
-   every level is in shape.
+1. `job, ok := lsm.Pick(v, opts)` picks the next job. `ok` is false when every
+   level is in shape.
 2. `next, edit, err := lsm.Compact(ctx, v, job, opts, r, put)` runs it.
 3. Save `next` with a conditional write. Delete the input objects only after
    that write succeeds.
 
-If `Compact` fails, `edit.Add` lists the outputs it already stored. Those are
-orphans, and you can delete them. `edit.NextSeq` is the first sequence no
+**If `Compact` fails:** `edit.Add` lists the outputs it already stored. They
+are orphans, so you can delete them. `edit.NextSeq` is the first sequence no
 output used. Before you retry, apply `lsm.Edit{NextSeq: edit.NextSeq}` to the
 version you retry from, so the retry doesn't reuse those seqs. Never apply the
 failed edit's `Add`.
 
-If you lose the write to a newer version `head`, you don't have to throw the
-work away. `head.Rebase(v, edit)` replays the compaction onto `head`, and you
-can write again. Rebase works when the only other writer added level-0 files
-with `Flush`. Anything else, like a second compaction over the same files,
-returns `lsm.ErrStale`: delete your outputs and pick again.
+**If you lose the write to a newer version `head`:** keep the work.
+`head.Rebase(v, edit)` replays the compaction onto `head`, and you can write
+again. Rebase works only when the other writer added level-0 files with
+`Flush`. Anything else, such as a second compaction over the same files,
+returns `lsm.ErrStale`. Delete your outputs and pick again.
 
 ## Tiered and leveled compaction
 
@@ -229,15 +238,19 @@ The leveled picker doesn't hold back your flushes. If you need to bound level
 - `Options.MaxTableAge` bounds how long a delete or overwrite can wait above
   the bottom level, which is where the versions it supersedes get dropped.
 
-That last one needs a bit more explanation. Every `FileRef` carries `Oldest`,
-the unix second of the oldest write whose superseded versions it may still
-hold. For a `Flush`, or a compaction into the bottom level, that's the write
-time. Otherwise it's the oldest `Oldest` of the files merged into it. When no
-size rule fires, `Pick` compacts the shallowest file above the bottom level
-whose `Oldest` is past the age (level 0 goes whole), and later picks carry it
-down. A key's superseded bytes are gone within about `MaxTableAge` plus one
-job per level, as long as something keeps calling `Pick` on an idle version.
-An `Oldest` of 0, from a manifest written before v0.6.0, counts as the epoch.
+How `MaxTableAge` works: every `FileRef` carries `Oldest`, the unix second of
+the oldest write whose superseded versions it may still hold.
+
+- For a `Flush`, or a compaction into the bottom level, `Oldest` is the write
+  time.
+- Otherwise it is the oldest `Oldest` of the files merged into it.
+- When no size rule fires, `Pick` compacts the shallowest file above the bottom
+  level whose `Oldest` is past the age. Level 0 goes whole. Later picks carry
+  it down.
+
+A key's superseded bytes are gone within about `MaxTableAge` plus one job per
+level, as long as something keeps calling `Pick` on an idle version. An
+`Oldest` of 0, from a manifest written before v0.6.0, counts as the epoch.
 
 ## Concurrency
 
@@ -304,12 +317,11 @@ times the key, 202 bytes under `MaxTableBytes`. A block's raw bytes never
 exceed `MaxTableBytes`, whatever `BlockBytes` says, and a compaction closes
 an output file before the entry that would push it past `FileBytes`.
 
-Writers before v0.4.0 checked only the finished table, so a table they wrote
-can hold an entry past that limit. That means a key over about a third of
-`MaxTableBytes` with a small value, or a value plus three times its key within
-about a hundred bytes of `MaxTableBytes`, wherever it sits in its block. The
-table still reads fine, but a compaction over it fails with
-`ErrEntryTooLarge`.
+Writers before v0.4.0 checked only the finished table, so their tables can hold
+an entry past that limit: a key over about a third of `MaxTableBytes` with a
+small value, or a value plus three times its key within about a hundred bytes
+of `MaxTableBytes`, wherever it sits in its block. Such a table reads fine, but
+a compaction over it fails with `ErrEntryTooLarge`.
 
 ## Subpackages
 
@@ -327,12 +339,11 @@ error that wraps `lsm.ErrCorrupt`.
 [Pebble](https://github.com/cockroachdb/pebble),
 [RocksDB](https://github.com/facebook/rocksdb), and
 [goleveldb](https://github.com/syndtr/goleveldb) are complete storage engines.
-They own a directory: a write-ahead log, a memtable, and a manifest. lsm is
-the part underneath. It has no log and no memtable, and it doesn't own a
-manifest. You buffer and sort writes yourself, you decide where the bytes
-live, and you decide how versions are published. In exchange, every file is
-immutable and read by byte range, which fits object storage, and readers and
-compactors can run anywhere that can reach the objects.
+They own a directory: a write-ahead log, a memtable, and a manifest.
+
+lsm has none of those. You buffer and sort writes, choose where the bytes live,
+and publish versions. In return, every file is immutable and read by byte
+range, and readers and compactors can run anywhere that can reach the objects.
 
 ## Testing
 
