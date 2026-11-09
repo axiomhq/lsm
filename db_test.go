@@ -649,6 +649,35 @@ func TestMalformedOperandIsCorrupt(t *testing.T) {
 	}
 }
 
+// Level 1+ files must not touch: a file starting at the previous Max is an
+// overlap, and a file with no key range is refused (Pick indexes Min[0]).
+func TestApplyRejectsTouchingAndEmptyRanges(t *testing.T) {
+	f := func(key, lo, hi string) FileRef {
+		return FileRef{Key: key, TableMeta: TableMeta{Min: []byte(lo), Max: []byte(hi)}}
+	}
+	if _, err := (Version{}).Apply(Edit{Add: map[int][]FileRef{1: {f("a", "a", "c"), f("b", "c", "e")}}}); err == nil {
+		t.Fatal("touching files accepted")
+	}
+	if _, err := (Version{}).Apply(Edit{Add: map[int][]FileRef{1: {f("a", "a", "b"), f("b", "c", "e")}}}); err != nil {
+		t.Fatalf("disjoint files: %v", err)
+	}
+	if _, err := (Version{}).Apply(Edit{Add: map[int][]FileRef{0: {f("a", "", "b")}}}); err == nil {
+		t.Fatal("file with no Min accepted")
+	}
+}
+
+func TestFlushStampsOldest(t *testing.T) {
+	st := newMemStore()
+	before := time.Now().Unix()
+	_, f, err := Flush(context.Background(), Version{}, []Entry{{Key: []byte("k"), Kind: KindPut, Value: []byte("v")}}, DefaultOptions(), st.put)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Oldest < before || f.Oldest > time.Now().Unix() {
+		t.Fatalf("Oldest = %d, want now (>= %d)", f.Oldest, before)
+	}
+}
+
 // TestVersionSignature: a file outside the ranges leaves the signature
 // alone, one inside changes it, and no overlap at all is not ok.
 func TestVersionSignature(t *testing.T) {

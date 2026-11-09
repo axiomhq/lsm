@@ -4,7 +4,7 @@ import "encoding/binary"
 
 // A table carries a bloom filter over its keys, after the index's block
 // entries. A point lookup of a key the table does not hold then reads no
-// block about 99 times in 100: a key written once is looked up across
+// block about 98 times in 100: a key written once is looked up across
 // every level-0 file and one file per deeper level, and without the filter
 // each of those whose key range covers it costs a block.
 //
@@ -12,7 +12,7 @@ import "encoding/binary"
 // so a lookup that walks forty tables takes one cache miss per table,
 // not one per probe.
 const (
-	filterBitsPerKey = 10 // about 1% false positives at filterProbes
+	filterBitsPerKey = 10 // about 1.2% false positives at filterProbes (measured)
 	filterProbes     = 7  // ln 2 × filterBitsPerKey
 	filterBlockBytes = 64 // a cache line
 	filterBlockBits  = filterBlockBytes * 8
