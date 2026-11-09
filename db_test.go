@@ -666,6 +666,45 @@ func TestApplyRejectsTouchingAndEmptyRanges(t *testing.T) {
 	}
 }
 
+// Ranges are [lo, hi): a file starting at hi, or ending before lo, is outside.
+func TestFileRefOverlapsHalfOpen(t *testing.T) {
+	f := FileRef{TableMeta: TableMeta{Min: []byte("c"), Max: []byte("e")}}
+	for _, c := range []struct {
+		lo, hi string
+		nilLo  bool
+		nilHi  bool
+		want   bool
+	}{
+		{lo: "a", hi: "c", want: false},
+		{lo: "a", hi: "d", want: true},
+		{lo: "e", nilHi: true, want: true},
+		{lo: "f", nilHi: true, want: false},
+		{nilLo: true, hi: "c", want: false},
+		{nilLo: true, nilHi: true, want: true},
+	} {
+		lo, hi := []byte(c.lo), []byte(c.hi)
+		if c.nilLo {
+			lo = nil
+		}
+		if c.nilHi {
+			hi = nil
+		}
+		if got := f.Overlaps(lo, hi); got != c.want {
+			t.Errorf("Overlaps(%q, %q) = %v, want %v", lo, hi, got, c.want)
+		}
+	}
+}
+
+// spaceEnd is the first key past a key's space; the last space has none.
+func TestSpaceEnd(t *testing.T) {
+	if got := spaceEnd([]byte{0xfe, 1}); !bytes.Equal(got, []byte{0xff}) {
+		t.Fatalf("spaceEnd(0xfe) = %x", got)
+	}
+	if got := spaceEnd([]byte{0xff, 1}); got != nil {
+		t.Fatalf("spaceEnd(0xff) = %x, want nil", got)
+	}
+}
+
 func TestFlushStampsOldest(t *testing.T) {
 	st := newMemStore()
 	before := time.Now().Unix()
