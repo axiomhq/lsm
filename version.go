@@ -139,6 +139,9 @@ func (v Version) Apply(e Edit) (Version, error) {
 		}
 		out.Levels[l] = append(out.Levels[l], e.Add[l]...)
 		for _, f := range e.Add[l] {
+			if len(f.Min) == 0 || len(f.Max) == 0 { // Pick and Rebase index Min[0]
+				return Version{}, fmt.Errorf("lsm: file %s has no key range", f.Key)
+			}
 			out.NextSeq = max(out.NextSeq, f.Seq+1)
 		}
 		if l == 0 {

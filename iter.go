@@ -319,9 +319,7 @@ type named struct {
 	t   *Table
 }
 
-func (n named) iter(ctx context.Context) Iterator { return n.iterBelow(ctx, nil) }
-
-// iterBelow is iter over keys below hi, loading no block past it.
+// iterBelow iterates keys below hi, loading no block past it.
 func (n named) iterBelow(ctx context.Context, hi []byte) Iterator {
 	return &namedIter{n.t.iterBelow(ctx, hi), n.key}
 }

@@ -75,13 +75,16 @@ failed edit's `Add`.
 **If you lose the write to a newer version `head`:** keep the work.
 `head.Rebase(v, edit)` replays the compaction onto `head`, and you can write
 again. Rebase works only when the other writer added level-0 files with
-`Flush`. Anything else, such as a second compaction over the same files,
+`Flush` or tiered new runs (`Job.NewRun`). Anything else, such as a second compaction over the same files,
 returns `lsm.ErrStale`. Delete your outputs and pick again.
 
 ## Options
 
-- `Options.Workers` caps how many key-range partitions one compaction merges
-  at once.
+- `Options.Workers` (`max(1, GOMAXPROCS/2)`) caps how many key-range
+  partitions one compaction merges at once.
+- Zero values take `DefaultOptions`: `L0Trigger` 4, `MaxRuns` 8,
+  `LevelRatio` 10, `BaseBytes` 256 MiB, `FileBytes` 48 MiB, `BlockBytes`
+  `DefaultBlockBytes`.
 - `Options.ReadAheadBytes` (1 MiB) is the window a merge reads its inputs in.
   That's one range read per window, not per block, and the next window is
   read while the merge walks the current one.

@@ -54,7 +54,7 @@ const (
 )
 
 // ErrUnsupportedFormat is a table whose footer magic is neither the
-// current nor the legacy one: bytes from a newer format, not corruption.
+// current nor an earlier one: bytes from a newer format, not corruption.
 var ErrUnsupportedFormat = errors.New("lsm: unsupported table format")
 
 // MaxEntryBytes bounds one entry: its value plus three times its key (the
@@ -124,10 +124,10 @@ var blockDecoder = func() *zstd.Decoder {
 
 // DecompressBounded decodes zstd frames to at most limit bytes. limit is a
 // ceiling, not a size the stream dictates: a frame whose header claims more
-// is refused before anything is allocated, and output past limit is refused
-// after decoding. A frame without a content size, or trailing frames, can
-// allocate up to MaxTableBytes before that check: that, not limit, is the
-// allocation bound. limit is capped at MaxTableBytes. Every failure wraps
+// is refused before anything is allocated, and a frame without a content
+// size (this package's writer always sets one) decodes under a decoder
+// capped at limit. Trailing frames can still allocate up to MaxTableBytes
+// before the final size check. limit is capped at MaxTableBytes. Every failure wraps
 // ErrCorrupt.
 func DecompressBounded(data []byte, limit uint64) ([]byte, error) {
 	limit = min(limit, MaxTableBytes)
@@ -136,13 +136,22 @@ func DecompressBounded(data []byte, limit uint64) ([]byte, error) {
 		return nil, fmt.Errorf("%w: lsm: zstd: %w", ErrCorrupt, err)
 	}
 	size := uint64(0)
+	dec := blockDecoder
 	if h.HasFCS {
 		if h.FrameContentSize > limit {
 			return nil, fmt.Errorf("%w: lsm: zstd frame claims %d bytes, max %d", ErrCorrupt, h.FrameContentSize, limit)
 		}
 		size = h.FrameContentSize
+	} else {
+		// Nothing in the header bounds the output: cap this call's decoder
+		// (its cap covers the frame's window as well as the output).
+		var err error
+		if dec, err = zstd.NewReader(nil, zstd.WithDecoderMaxMemory(min(limit+h.WindowSize, MaxTableBytes)), zstd.WithDecoderConcurrency(1)); err != nil {
+			return nil, err
+		}
+		defer dec.Close()
 	}
-	out, err := blockDecoder.DecodeAll(data, make([]byte, 0, size))
+	out, err := dec.DecodeAll(data, make([]byte, 0, size))
 	if err != nil {
 		return nil, fmt.Errorf("%w: lsm: zstd: %w", ErrCorrupt, err)
 	}
@@ -463,7 +472,7 @@ type Table struct {
 
 // OpenTableAt opens a table from its manifest metadata with one range read
 // of the index and the footer behind it. The footer's magic must be the
-// current or the legacy one, its index position must agree with meta, and
+// current or either earlier one, its index position must agree with meta, and
 // its crc32c must match the index.
 func OpenTableAt(ctx context.Context, src Source, meta TableMeta) (*Table, error) {
 	off, n := meta.IndexOff, meta.IndexLen
@@ -497,7 +506,7 @@ func OpenTableAt(ctx context.Context, src Source, meta TableMeta) (*Table, error
 	if blocks == 0 || blocks > uint64(n)/7 { // an index entry is at least 7 bytes
 		return nil, fmt.Errorf("%w: lsm: table index blocks", ErrCorrupt)
 	}
-	t.index = make([]blockIndex, 0, blocks)
+	t.index = make([]blockIndex, 0, min(blocks, 1<<12)) // blocks is only bounded by IndexLen/7: let append grow it
 	var prevEnd int64
 	var prevLast []byte
 	for range blocks {

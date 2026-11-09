@@ -48,12 +48,37 @@ func TestDecompressBoundedRefusesLargeOutput(t *testing.T) {
 	frame = append(frame, byte((n<<3|1)&0xFF), byte(n>>5), byte(n>>13))
 	frame = append(frame, bytes.Repeat([]byte{7}, n)...)
 
-	if _, err := DecompressBounded(frame, n-1); !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "decoded to") {
-		t.Fatalf("err = %v, want ErrCorrupt from the output check", err)
+	if _, err := DecompressBounded(frame, n-1); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("err = %v, want ErrCorrupt", err)
 	}
 	out, err := DecompressBounded(frame, n)
 	if err != nil || len(out) != n {
 		t.Fatalf("at max: %d bytes, err %v", len(out), err)
+	}
+}
+
+// A frame with no content size can't be refused by its header: 4000 RLE
+// blocks of 128 KiB are 16 KB that decode to 500 MiB. The limit (plus the
+// frame's 2 MiB window), not MaxTableBytes, must bound what is allocated.
+func TestDecompressBoundedCapsUnsizedFrame(t *testing.T) {
+	frame := binary.LittleEndian.AppendUint32(nil, 0xFD2FB528)
+	frame = append(frame, 0x00, 0x58) // no content size; 2 MiB window
+	for i := range 4000 {
+		last := byte(0)
+		if i == 3999 {
+			last = 1
+		}
+		frame = append(frame, 0x02|last, 0x00, 0x10, 'x') // RLE block: 128 KiB of 'x'
+	}
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	_, err := DecompressBounded(frame, 1<<10)
+	runtime.ReadMemStats(&after)
+	if !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("err = %v, want ErrCorrupt", err)
+	}
+	if n := after.TotalAlloc - before.TotalAlloc; n > 32<<20 {
+		t.Fatalf("refusal allocated %d bytes", n)
 	}
 }
 

@@ -649,6 +649,74 @@ func TestMalformedOperandIsCorrupt(t *testing.T) {
 	}
 }
 
+// Level 1+ files must not touch: a file starting at the previous Max is an
+// overlap, and a file with no key range is refused (Pick indexes Min[0]).
+func TestApplyRejectsTouchingAndEmptyRanges(t *testing.T) {
+	f := func(key, lo, hi string) FileRef {
+		return FileRef{Key: key, TableMeta: TableMeta{Min: []byte(lo), Max: []byte(hi)}}
+	}
+	if _, err := (Version{}).Apply(Edit{Add: map[int][]FileRef{1: {f("a", "a", "c"), f("b", "c", "e")}}}); err == nil {
+		t.Fatal("touching files accepted")
+	}
+	if _, err := (Version{}).Apply(Edit{Add: map[int][]FileRef{1: {f("a", "a", "b"), f("b", "c", "e")}}}); err != nil {
+		t.Fatalf("disjoint files: %v", err)
+	}
+	if _, err := (Version{}).Apply(Edit{Add: map[int][]FileRef{0: {f("a", "", "b")}}}); err == nil {
+		t.Fatal("file with no Min accepted")
+	}
+}
+
+// Ranges are [lo, hi): a file starting at hi, or ending before lo, is outside.
+func TestFileRefOverlapsHalfOpen(t *testing.T) {
+	f := FileRef{TableMeta: TableMeta{Min: []byte("c"), Max: []byte("e")}}
+	for _, c := range []struct {
+		lo, hi string
+		nilLo  bool
+		nilHi  bool
+		want   bool
+	}{
+		{lo: "a", hi: "c", want: false},
+		{lo: "a", hi: "d", want: true},
+		{lo: "e", nilHi: true, want: true},
+		{lo: "f", nilHi: true, want: false},
+		{nilLo: true, hi: "c", want: false},
+		{nilLo: true, nilHi: true, want: true},
+	} {
+		lo, hi := []byte(c.lo), []byte(c.hi)
+		if c.nilLo {
+			lo = nil
+		}
+		if c.nilHi {
+			hi = nil
+		}
+		if got := f.Overlaps(lo, hi); got != c.want {
+			t.Errorf("Overlaps(%q, %q) = %v, want %v", lo, hi, got, c.want)
+		}
+	}
+}
+
+// spaceEnd is the first key past a key's space; the last space has none.
+func TestSpaceEnd(t *testing.T) {
+	if got := spaceEnd([]byte{0xfe, 1}); !bytes.Equal(got, []byte{0xff}) {
+		t.Fatalf("spaceEnd(0xfe) = %x", got)
+	}
+	if got := spaceEnd([]byte{0xff, 1}); got != nil {
+		t.Fatalf("spaceEnd(0xff) = %x, want nil", got)
+	}
+}
+
+func TestFlushStampsOldest(t *testing.T) {
+	st := newMemStore()
+	before := time.Now().Unix()
+	_, f, err := Flush(context.Background(), Version{}, []Entry{{Key: []byte("k"), Kind: KindPut, Value: []byte("v")}}, DefaultOptions(), st.put)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Oldest < before || f.Oldest > time.Now().Unix() {
+		t.Fatalf("Oldest = %d, want now (>= %d)", f.Oldest, before)
+	}
+}
+
 // TestVersionSignature: a file outside the ranges leaves the signature
 // alone, one inside changes it, and no overlap at all is not ok.
 func TestVersionSignature(t *testing.T) {

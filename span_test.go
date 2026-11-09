@@ -46,6 +46,10 @@ func TestSpanNamesTheBlocksAKeyRangeTouches(t *testing.T) {
 			t.Fatalf("%q outside block %d [%q, %q]", key, first, b.first, b.last)
 		}
 	}
+	// hi is exclusive: a range ending at a block's first key leaves that block out.
+	if first, last, ok := tb.Span(tb.index[0].first, tb.index[1].first); !ok || first != 0 || last != 0 {
+		t.Fatalf("hi at a block's first key: %d..%d %v, want 0..0", first, last, ok)
+	}
 	if first, last, ok := tb.Span([]byte("k050"), []byte("k150")); !ok || first >= last || first == 0 || last == n-1 {
 		t.Fatalf("middle range: %d..%d %v of %d blocks", first, last, ok, n)
 	}
