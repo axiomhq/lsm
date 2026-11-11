@@ -422,6 +422,13 @@ func BuildTable(entries []Entry, blockBytes int) ([]byte, TableMeta, error) {
 }
 
 func buildTable(entries []Entry, w *TableWriter) ([]byte, TableMeta, error) {
+	// Size the table once, from above (a block per entry): grown by
+	// append, a table of large values was copied about four times over.
+	n := filterFrame(int64(len(entries))) + footerBytes + binary.MaxVarintLen64
+	for _, e := range entries {
+		n += entryRaw(e) + blockOverhead + indexEntry(e.Key, e.Key)
+	}
+	w.out = make([]byte, 0, min(n, MaxTableBytes))
 	for _, e := range entries {
 		if err := w.Add(e); err != nil {
 			return nil, TableMeta{}, err

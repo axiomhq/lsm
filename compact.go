@@ -1002,6 +1002,8 @@ func (c *compaction) writePartition(ctx context.Context, pi int, p partition) er
 		}
 		if w == nil {
 			w = NewTableWriterOptions(c.o)
+			// A file closes within FileBytes: one allocation, never regrown.
+			w.out = make([]byte, 0, c.o.FileBytes)
 			space = e.Key[0]
 		}
 		if err := w.Add(e); err != nil {
