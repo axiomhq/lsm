@@ -452,6 +452,21 @@ func BuildTableOptions(entries []Entry, o Options) ([]byte, TableMeta, error) {
 	return buildTable(entries, NewTableWriterOptions(o))
 }
 
+// WriteTableOptions is BuildTableOptions writing the table to w as it is
+// built, in batches of about 1 MiB, instead of returning it: it holds a
+// batch, not the table. It stops at w's first error and returns it.
+func WriteTableOptions(w io.Writer, entries []Entry, o Options) (TableMeta, error) {
+	t := NewTableWriterOptions(o)
+	t.sink = w
+	for _, e := range entries {
+		if err := t.Add(e); err != nil {
+			return TableMeta{}, err
+		}
+	}
+	_, meta, err := t.Finish()
+	return meta, err
+}
+
 // BuildTable writes sorted, unique entries as one table.
 func BuildTable(entries []Entry, blockBytes int) ([]byte, TableMeta, error) {
 	return buildTable(entries, NewTableWriter(blockBytes))

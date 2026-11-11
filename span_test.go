@@ -3,8 +3,10 @@ package lsm
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
+	"reflect"
 	"testing"
 
 	"github.com/axiomhq/lsm/setmerge"
@@ -202,6 +204,14 @@ func TestGroupedSpaceBlocks(t *testing.T) {
 		t.Fatal(err)
 	}
 	check("built", data, meta)
+	var streamed bytes.Buffer
+	if m, err := WriteTableOptions(&streamed, entries, o); err != nil || !bytes.Equal(streamed.Bytes(), data) || !reflect.DeepEqual(m, meta) {
+		t.Fatalf("WriteTableOptions wrote %d bytes, BuildTableOptions %d, or the metas differ (%v)", streamed.Len(), len(data), err)
+	}
+	boom := errors.New("boom")
+	if _, err := WriteTableOptions(&failAfter{n: len(data) / 2, err: boom}, entries, o); !errors.Is(err, boom) {
+		t.Fatalf("a failing writer gave %v", err)
+	}
 	if plain, _, err := BuildTable(entries, o.BlockBytes); err != nil || len(plain) >= len(data) {
 		// The grouped table has more, smaller blocks: a bigger index.
 		t.Fatalf("an ungrouped table is %d bytes, the grouped one %d (%v)", len(plain), len(data), err)
@@ -327,4 +337,17 @@ func TestRawSpaceKeepsLargeValuesExtentReadable(t *testing.T) {
 	if !ok || length != int64(len(val)) || !bytes.Equal(data[off:off+length], val) {
 		t.Fatalf("Raw space: Single %d+%d %v", off, length, ok)
 	}
+}
+
+// failAfter is a writer that takes n bytes, then fails with err.
+type failAfter struct {
+	n   int
+	err error
+}
+
+func (f *failAfter) Write(p []byte) (int, error) {
+	if f.n -= len(p); f.n < 0 {
+		return 0, f.err
+	}
+	return len(p), nil
 }
