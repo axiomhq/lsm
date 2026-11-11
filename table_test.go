@@ -489,7 +489,7 @@ func FuzzDecodeBlock(f *testing.F) {
 }
 
 // TestLargeBlockBytesReopens: a writer asked for blocks past what a reader
-// accepts closes them at MaxTableBytes regardless, so every table it
+// accepts closes them at MaxBlockBytes regardless, so every table it
 // finishes opens; an entry no block can hold is ErrEntryTooLarge with its
 // key, and one at MaxEntryBytes is accepted and finishes into a table a
 // reader accepts.
@@ -517,8 +517,9 @@ func TestLargeBlockBytesReopens(t *testing.T) {
 	if !errors.Is(err, ErrEntryTooLarge) || !strings.Contains(err.Error(), "4b626967") {
 		t.Fatalf("entry one past the limit: %v", err)
 	}
-	// An entry at MaxEntryBytes, incompressible, fills a table alone:
-	// nothing else fits, the bound holds, and it reopens.
+	// An entry at MaxEntryBytes, incompressible, fills a table of
+	// MaxBlockBytes alone: nothing else fits, the bound holds, and it
+	// reopens.
 	w = NewTableWriter(0)
 	big := make([]byte, MaxEntryBytes-3*len(key))
 	chacha := rand.NewChaCha8([32]byte{5})
@@ -526,12 +527,12 @@ func TestLargeBlockBytesReopens(t *testing.T) {
 	if err := w.Add(Entry{Key: key, Kind: KindPut, Value: big}); err != nil {
 		t.Fatal(err)
 	}
-	if w.fits(Entry{Key: []byte("Kc"), Kind: KindPut, Value: []byte("v")}, MaxTableBytes) {
+	if w.fits(Entry{Key: []byte("Kc"), Kind: KindPut, Value: []byte("v")}, MaxBlockBytes) {
 		t.Fatal("a small entry after a maximal one should not fit the table")
 	}
 	bound := w.bound()
 	data, meta, err = w.Finish()
-	if err != nil || int64(len(data)) > MaxTableBytes || int64(len(data)) > bound {
+	if err != nil || int64(len(data)) > MaxBlockBytes || int64(len(data)) > bound {
 		t.Fatalf("max entry: %d bytes (bound %d), %v", len(data), bound, err)
 	}
 	if _, err := OpenTableAt(context.Background(), BytesSource(data), meta); err != nil {
@@ -539,11 +540,39 @@ func TestLargeBlockBytesReopens(t *testing.T) {
 	}
 }
 
+// TestTablePastBlockBound: a table may outgrow MaxBlockBytes, up to
+// MaxTableBytes: one past it builds, opens and reads its last value by
+// extent.
+func TestTablePastBlockBound(t *testing.T) {
+	o := DefaultOptions()
+	o.Spaces = map[byte]SpacePolicy{'v': {Raw: true}}
+	val := make([]byte, 1<<20)
+	var entries []Entry
+	for i := range MaxBlockBytes>>20 + 8 {
+		val[0] = byte(i)
+		entries = append(entries, Entry{Key: fmt.Appendf(nil, "v%03d", i), Kind: KindPut, Value: bytes.Clone(val)})
+	}
+	data, meta, err := BuildTableOptions(entries, o)
+	if err != nil || meta.Bytes <= MaxBlockBytes {
+		t.Fatalf("%d bytes, %v", meta.Bytes, err)
+	}
+	tb, err := OpenTableAt(context.Background(), BytesSource(data), meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := entries[len(entries)-1]
+	off, n, ok := tb.Single(last.Key)
+	if !ok || !bytes.Equal(data[off:off+n], last.Value) {
+		t.Fatalf("last value at %d+%d %v", off, n, ok)
+	}
+}
+
 // TestFitsSplitsBeforeOverflow: bound is the finished size from above and
 // tightly, so a writer that finishes whenever fits says no never exceeds
-// MaxTableBytes, and small entries fill a file to its limit rather than a
+// its limit, and small entries fill a file to its limit rather than a
 // fraction of it.
 func TestFitsSplitsBeforeOverflow(t *testing.T) {
+	const limit = 64 << 20
 	rng := rand.New(rand.NewPCG(11, 12))
 	w := NewTableWriter(0)
 	big := make([]byte, 20<<20)
@@ -553,10 +582,10 @@ func TestFitsSplitsBeforeOverflow(t *testing.T) {
 	small := make([]byte, 1<<10)
 	var finished int
 	add := func(e Entry) {
-		if !w.fits(e, MaxTableBytes) {
+		if !w.fits(e, limit) {
 			bound := w.bound()
 			data, _, err := w.Finish()
-			if err != nil || int64(len(data)) > MaxTableBytes || int64(len(data)) > bound {
+			if err != nil || int64(len(data)) > limit || int64(len(data)) > bound {
 				t.Fatalf("finish: %d bytes (bound %d), %v", len(data), bound, err)
 			}
 			finished++

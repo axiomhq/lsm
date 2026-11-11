@@ -95,6 +95,10 @@ type SpacePolicy struct {
 	// BuildTableOptions). The cost is an index entry per group a table
 	// holds.
 	Group func(key []byte) int
+	// FileBytes is the space's output file target (0: Options.FileBytes),
+	// at most MaxTableBytes: a space of large values a reader reaches by
+	// extent can keep few files, so a reader opens few.
+	FileBytes int64
 	// Raw stores every large value of the space as it is (a block of its
 	// own, Table.Single), whatever zstd would save: a reader reads parts
 	// of it by extent, a row of a vector page say, which a compressed
@@ -119,6 +123,14 @@ type SpacePolicy struct {
 // 48 MiB files (leveled: ratio 10, 256 MiB L1).
 func DefaultOptions() Options {
 	return Options{L0Trigger: 4, MaxRuns: 8, LevelRatio: 10, BaseBytes: 256 << 20, FileBytes: 48 << 20, BlockBytes: DefaultBlockBytes}
+}
+
+// fileBytes is the output file target of space.
+func (o Options) fileBytes(space byte) int64 {
+	if b := o.Spaces[space].FileBytes; b > 0 {
+		return min(b, MaxTableBytes)
+	}
+	return o.FileBytes
 }
 
 func (o Options) workers() int {
@@ -657,7 +669,7 @@ func (v Version) job(level int, inputs []FileRef, o Options) Job {
 		below := v.Levels[level+1]
 		i := sort.Search(len(below), func(i int) bool { return bytes.Compare(below[i].Max, lo) >= 0 })
 		if i > 0 {
-			if p := below[i-1]; p.Bytes < o.FileBytes/2 && p.Max[0] == lo[0] {
+			if p := below[i-1]; p.Bytes < o.fileBytes(p.Max[0])/2 && p.Max[0] == lo[0] {
 				j.Overlap = append([]FileRef{p}, j.Overlap...)
 			}
 		}
@@ -733,7 +745,7 @@ func Compact(ctx context.Context, v Version, j Job, o Options, r Reader, put Put
 	if len(j.Overlap) == 0 {
 		parts = spaceParts(j.Inputs)
 	} else {
-		parts = overlapParts(j.Overlap, overlaps, o.FileBytes)
+		parts = overlapParts(j.Overlap, overlaps, o)
 	}
 	// The outputs' age: a bottom job drops every tombstone and shadowed
 	// version, so its outputs are as new as the job; any other keeps the
@@ -807,7 +819,7 @@ func Compact(ctx context.Context, v Version, j Job, o Options, r Reader, put Put
 func (j Job) touches(i int, o Options) bool {
 	f := j.Overlap[i]
 	hi, incl := f.Max, true
-	if f.Bytes < o.FileBytes/2 {
+	if f.Bytes < o.fileBytes(f.Max[0])/2 {
 		hi, incl = spaceEnd(f.Max), false
 		if i+1 < len(j.Overlap) && (hi == nil || bytes.Compare(j.Overlap[i+1].Min, hi) < 0) {
 			hi = j.Overlap[i+1].Min
@@ -883,12 +895,12 @@ func spaceParts(inputs []FileRef) []partition {
 
 // overlapParts is the partitions of a job with overlap, in key order, each
 // a run of consecutive touched overlap files (and the gaps around them,
-// which hold input keys alone) worth about fileBytes of overlap: enough
+// which hold input keys alone) worth about a file of overlap: enough
 // files for the merge to run wide, never so many that every round leaves a
 // smaller file behind. opened[i] is overlap[i] open, nil when untouched. An
 // untouched file ends the partition before it and the next starts after
 // it, so no output spans it.
-func overlapParts(overlap []FileRef, opened []*named, fileBytes int64) []partition {
+func overlapParts(overlap []FileRef, opened []*named, o Options) []partition {
 	var parts []partition
 	var cur partition
 	var curBytes int64
@@ -899,7 +911,7 @@ func overlapParts(overlap []FileRef, opened []*named, fileBytes int64) []partiti
 			cur, curBytes = partition{lo: afterMax(f.Max)}, 0
 			continue
 		}
-		if curBytes >= fileBytes/2 {
+		if curBytes >= o.fileBytes(f.Min[0])/2 {
 			cur.hi = f.Min
 			parts = append(parts, cur)
 			cur, curBytes = partition{lo: f.Min}, 0
@@ -1075,10 +1087,11 @@ func (c *compaction) writePartition(ctx context.Context, pi int, p partition) (e
 		// A key space starts a file: the next round's untouched check
 		// (receives) can then leave a space no input writes to, where a
 		// file shared with a busy space is rewritten with it.
-		// A file closes before the entry that would take it past FileBytes
-		// (at most MaxTableBytes); every entry fits a file of its own.
+		// A file closes before the entry that would take it past its
+		// space's FileBytes (at most MaxTableBytes); every entry fits a
+		// file of its own.
 		e := Entry{Key: in.Key(), Kind: in.Kind(), Value: in.Value()}
-		if w != nil && (e.Key[0] != space || !w.fits(e, c.o.FileBytes)) {
+		if w != nil && (e.Key[0] != space || !w.fits(e, c.o.fileBytes(space))) {
 			if err := finish(); err != nil {
 				return err
 			}
@@ -1090,10 +1103,11 @@ func (c *compaction) writePartition(ctx context.Context, pi int, p partition) (e
 				if open, err = c.stream(ctx, pi, w); err != nil {
 					return err
 				}
-			} else if w.out = spare; w.out == nil {
-				// A file closes within FileBytes: one allocation per
-				// partition when puts are synchronous, never regrown.
-				w.out = make([]byte, 0, c.o.FileBytes)
+			} else if w.out = spare; int64(cap(w.out)) < c.o.fileBytes(space) {
+				// A file closes within its space's FileBytes: one
+				// allocation per partition and space size when puts are
+				// synchronous, never regrown.
+				w.out = make([]byte, 0, c.o.fileBytes(space))
 			}
 			spare = nil
 		}

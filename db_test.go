@@ -576,6 +576,38 @@ func TestCompactCutsFilesAtSpaces(t *testing.T) {
 	}
 }
 
+// TestCompactSpaceFileBytes: a space's FileBytes sizes its output files
+// apart from the other spaces'.
+func TestCompactSpaceFileBytes(t *testing.T) {
+	ctx := context.Background()
+	st := newMemStore()
+	o := DefaultOptions()
+	o.FileBytes = 1 << 20
+	o.Spaces = map[byte]SpacePolicy{'v': {Raw: true, FileBytes: 4 << 20}}
+	val := make([]byte, 64<<10)
+	rand.NewChaCha8([32]byte{7}).Read(val) // incompressible
+	var entries []Entry
+	for _, space := range "pv" {
+		for i := range 48 { // 3 MiB a space
+			entries = append(entries, Entry{Key: fmt.Appendf(nil, "%c%03d", space, i), Kind: KindPut, Value: val})
+		}
+	}
+	v, _, err := Flush(ctx, Version{}, entries, o, st.put)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, _, err = Compact(ctx, v, v.job(0, v.Levels[0], o), o, st.reader(), st.put); err != nil {
+		t.Fatal(err)
+	}
+	files := make(map[byte]int)
+	for _, f := range v.Levels[1] {
+		files[f.Spaces[0].Space]++
+	}
+	if files['p'] < 3 || files['v'] != 1 {
+		t.Fatalf("files per space %v, want p in 1 MiB files and v in one", files)
+	}
+}
+
 // TestCompactGrowsSmallTailFile: a space whose keys only ever append grows
 // its last file while it is under half a file, rather than leaving a small
 // file behind every round.

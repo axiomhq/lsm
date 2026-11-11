@@ -41,9 +41,12 @@ const (
 
 	blockZstd   byte = 0
 	blockStored byte = 1
-	// MaxTableBytes bounds one table object, and so one decoded block and
-	// one index, whatever the bytes claim.
-	MaxTableBytes = 64 << 20
+	// MaxTableBytes bounds one table object: a space of large raw values
+	// can keep its files few (SpacePolicy.FileBytes).
+	MaxTableBytes = 1 << 30
+	// MaxBlockBytes bounds one decoded block, one index and one entry,
+	// whatever the bytes claim.
+	MaxBlockBytes = 64 << 20
 )
 
 // unfilteredMagic is the footer magic of tables v0.4.0 through v0.6.2
@@ -64,11 +67,11 @@ var ErrUnsupportedFormat = errors.New("lsm: unsupported table format")
 // compaction can always start a file with it. Writers before v0.4.0 had
 // no per-entry check, only Finish's table check, so a table they wrote
 // could hold an entry past this limit: a key over about a third of
-// MaxTableBytes with a small value, or a value plus three times its key
-// within about a hundred bytes of MaxTableBytes, wherever it sat in its
+// MaxBlockBytes with a small value, or a value plus three times its key
+// within about a hundred bytes of MaxBlockBytes, wherever it sat in its
 // block. Such a table still reads, but a compaction over it fails with
 // ErrEntryTooLarge. No such entry is known to exist.
-const MaxEntryBytes = MaxTableBytes - entryOverhead
+const MaxEntryBytes = MaxBlockBytes - entryOverhead
 
 // entryOverhead is the most a table of one entry adds around it: footer,
 // index count, block crc, mode and count, the entry's varints and kind,
@@ -114,9 +117,9 @@ var blockEncoder = func() *zstd.Encoder {
 }()
 
 // blockDecoder decodes zstd blocks, up to GOMAXPROCS at once (the library
-// default caps at four), never more than MaxTableBytes of output per call.
+// default caps at four), never more than MaxBlockBytes of output per call.
 var blockDecoder = func() *zstd.Decoder {
-	d, err := zstd.NewReader(nil, zstd.WithDecoderMaxMemory(MaxTableBytes), zstd.WithDecoderConcurrency(0))
+	d, err := zstd.NewReader(nil, zstd.WithDecoderMaxMemory(MaxBlockBytes), zstd.WithDecoderConcurrency(0))
 	if err != nil {
 		panic(err)
 	}
@@ -127,11 +130,11 @@ var blockDecoder = func() *zstd.Decoder {
 // ceiling, not a size the stream dictates: a frame whose header claims more
 // is refused before anything is allocated, and a frame without a content
 // size (this package's writer always sets one) decodes under a decoder
-// capped at limit. Trailing frames can still allocate up to MaxTableBytes
-// before the final size check. limit is capped at MaxTableBytes. Every failure wraps
+// capped at limit. Trailing frames can still allocate up to MaxBlockBytes
+// before the final size check. limit is capped at MaxBlockBytes. Every failure wraps
 // ErrCorrupt.
 func DecompressBounded(data []byte, limit uint64) ([]byte, error) {
-	limit = min(limit, MaxTableBytes)
+	limit = min(limit, MaxBlockBytes)
 	var h zstd.Header
 	if err := h.Decode(data); err != nil {
 		return nil, fmt.Errorf("%w: lsm: zstd: %w", ErrCorrupt, err)
@@ -147,7 +150,7 @@ func DecompressBounded(data []byte, limit uint64) ([]byte, error) {
 		// Nothing in the header bounds the output: cap this call's decoder
 		// (its cap covers the frame's window as well as the output).
 		var err error
-		if dec, err = zstd.NewReader(nil, zstd.WithDecoderMaxMemory(min(limit+h.WindowSize, MaxTableBytes)), zstd.WithDecoderConcurrency(1)); err != nil {
+		if dec, err = zstd.NewReader(nil, zstd.WithDecoderMaxMemory(min(limit+h.WindowSize, MaxBlockBytes)), zstd.WithDecoderConcurrency(1)); err != nil {
 			return nil, err
 		}
 		defer dec.Close()
@@ -251,7 +254,7 @@ func NewTableWriter(blockBytes int) *TableWriter {
 
 // Add appends e. Keys must be strictly increasing and non-empty, and the
 // entry must fit a table of its own (ErrEntryTooLarge; see MaxEntryBytes).
-// A block's raw bytes never exceed MaxTableBytes, whatever blockBytes says.
+// A block's raw bytes never exceed MaxBlockBytes, whatever blockBytes says.
 func (w *TableWriter) Add(e Entry) error {
 	if w.err != nil {
 		return w.err
@@ -315,10 +318,10 @@ func (w *TableWriter) bound() int64 {
 
 // joins reports whether Add would put e in the open block rather than
 // close it first: the value is small, the block has room for it, and its
-// raw bytes stay within MaxTableBytes.
+// raw bytes stay within MaxBlockBytes.
 func (w *TableWriter) joins(e Entry) bool {
 	return w.n > 0 && len(e.Value) < LargeValueBytes && len(w.raw)+len(e.Value) <= w.blockBytes &&
-		int64(len(w.raw))+entryRaw(e)+int64(uvarintLen(uint64(w.n+1))) <= MaxTableBytes && w.sameGroup(e.Key)
+		int64(len(w.raw))+entryRaw(e)+int64(uvarintLen(uint64(w.n+1))) <= MaxBlockBytes && w.sameGroup(e.Key)
 }
 
 // sameGroup reports whether key may share the open block with the last
@@ -337,7 +340,8 @@ func (w *TableWriter) sameGroup(key []byte) bool {
 }
 
 // fits reports whether the table can take e, placed as Add would place it,
-// and still finish within limit (at most MaxTableBytes). Splitting output
+// and still finish within limit (at most MaxTableBytes), its index and
+// filter within MaxBlockBytes, which a reader accepts. Splitting output
 // files on it means a table Finish refuses is never built.
 func (w *TableWriter) fits(e Entry, limit int64) bool {
 	cost := entryRaw(e)
@@ -346,7 +350,8 @@ func (w *TableWriter) fits(e Entry, limit int64) bool {
 	} else {
 		cost += blockOverhead + indexEntry(e.Key, e.Key) // a block of its own, until more arrive
 	}
-	return w.bound()+cost <= min(limit, MaxTableBytes)
+	index := w.idx + binary.MaxVarintLen64 + filterFrame(w.meta.Count+2) + indexEntry(w.first, w.last) + indexEntry(e.Key, e.Key)
+	return w.bound()+cost <= min(limit, MaxTableBytes) && index <= MaxBlockBytes
 }
 
 func (w *TableWriter) flushBlock() {
@@ -421,8 +426,8 @@ func (w *TableWriter) Finish() ([]byte, TableMeta, error) {
 	w.out = binary.BigEndian.AppendUint32(w.out, crc32.Checksum(idx, castagnoli))
 	w.out = append(w.out, tableMagic...)
 	w.meta.Bytes = w.size()
-	if w.meta.Bytes > MaxTableBytes {
-		return nil, TableMeta{}, fmt.Errorf("lsm: table of %d bytes exceeds %d", w.meta.Bytes, MaxTableBytes)
+	if w.meta.Bytes > MaxTableBytes || w.meta.IndexLen > MaxBlockBytes {
+		return nil, TableMeta{}, fmt.Errorf("lsm: table of %d bytes, index %d, exceeds %d or %d", w.meta.Bytes, w.meta.IndexLen, MaxTableBytes, MaxBlockBytes)
 	}
 	if w.sink != nil {
 		w.spill(true)
@@ -534,7 +539,7 @@ type Table struct {
 // its crc32c must match the index.
 func OpenTableAt(ctx context.Context, src Source, meta TableMeta) (*Table, error) {
 	off, n := meta.IndexOff, meta.IndexLen
-	if off < 0 || off > MaxTableBytes || n <= 0 || n > MaxTableBytes {
+	if off < 0 || off > MaxTableBytes || n <= 0 || n > MaxBlockBytes {
 		return nil, fmt.Errorf("%w: lsm: table index at %d+%d", ErrCorrupt, off, n)
 	}
 	buf, err := src.ReadAt(ctx, off, n+footerBytes)
@@ -575,7 +580,7 @@ func OpenTableAt(ctx context.Context, src Source, meta TableMeta) (*Table, error
 			return nil, fmt.Errorf("%w: lsm: table index: %v", ErrCorrupt, d.err)
 		}
 		// b.length is bounded by subtraction: b.off+b.length can wrap.
-		if b.off != prevEnd || b.length <= 4 || b.rawLen <= 0 || b.rawLen > MaxTableBytes || b.length > off-b.off ||
+		if b.off != prevEnd || b.length <= 4 || b.rawLen <= 0 || b.rawLen > MaxBlockBytes || b.length > off-b.off ||
 			len(b.first) == 0 || bytes.Compare(b.first, b.last) > 0 || (prevLast != nil && bytes.Compare(prevLast, b.first) >= 0) {
 			return nil, fmt.Errorf("%w: lsm: table index block", ErrCorrupt)
 		}
