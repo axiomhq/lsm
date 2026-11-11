@@ -159,8 +159,7 @@ func (o Options) withDefaults() Options {
 // Compact calls put from up to Options.Uploads goroutines at once
 // (Workers when Uploads is negative); it must be safe for concurrent use
 // unless that is 1. Like io.Writer, put must not retain data once it
-// returns: a compaction whose puts are synchronous writes its next file
-// into the same buffer.
+// returns: a later file is written into the same buffer.
 type Putter func(ctx context.Context, level int, seq uint64, data []byte) (string, error)
 
 // Flush writes sorted, unique entries as one level-0 file and returns the
@@ -919,6 +918,27 @@ type compaction struct {
 	puts    sync.WaitGroup
 }
 
+// outputs holds compaction output buffers once their put returned: a
+// caller that compacts one key space after another, as a merge lane does,
+// would otherwise leave a FileBytes buffer of garbage in the heap per
+// Compact call until the next GC.
+var outputs sync.Pool // *[]byte
+
+// output is an empty buffer of at least n bytes' capacity.
+func output(n int64) []byte {
+	if p, ok := outputs.Get().(*[]byte); ok && int64(cap(*p)) >= n {
+		return (*p)[:0]
+	}
+	return make([]byte, 0, n)
+}
+
+// recycle returns a file's buffer once its put returned, which must not
+// retain it (Putter).
+func recycle(data []byte) {
+	data = data[:0]
+	outputs.Put(&data)
+}
+
 // writePartition merges partition pi and hands its files to put as it goes.
 func (c *compaction) writePartition(ctx context.Context, pi int, p partition) error {
 	its := make([]Iterator, 0, len(c.inputs)+len(p.overlaps))
@@ -946,7 +966,6 @@ func (c *compaction) writePartition(ctx context.Context, pi int, p partition) er
 	}
 	in := Resolve(NewMerge(its...), c.r.Merger, c.j.Bottom)
 	var w *TableWriter
-	var spare []byte // a synchronous put's buffer, for the next file
 	finish := func() error {
 		if w == nil {
 			return nil
@@ -977,11 +996,12 @@ func (c *compaction) writePartition(ctx context.Context, pi int, p partition) er
 			return err
 		}
 		if c.uploads == nil {
-			spare = data[:0]
+			defer recycle(data)
 			return up()
 		}
 		c.puts.Go(func() {
 			defer func() { <-c.uploads }()
+			defer recycle(data)
 			if err := up(); err != nil {
 				c.cancel(err)
 			}
@@ -1006,12 +1026,8 @@ func (c *compaction) writePartition(ctx context.Context, pi int, p partition) er
 		}
 		if w == nil {
 			w = NewTableWriterOptions(c.o)
-			// A file closes within FileBytes: one allocation per
-			// partition when puts are synchronous, never regrown.
-			if w.out = spare; w.out == nil {
-				w.out = make([]byte, 0, c.o.FileBytes)
-			}
-			spare = nil
+			// A file closes within FileBytes: never regrown.
+			w.out = output(c.o.FileBytes)
 			space = e.Key[0]
 		}
 		if err := w.Add(e); err != nil {
