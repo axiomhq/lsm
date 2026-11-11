@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"sort"
 
 	"github.com/klauspost/compress/zstd"
@@ -211,6 +212,32 @@ type TableWriter struct {
 	idx        int64                // index bytes of the closed blocks
 	hashes     []uint64             // keyHash of every key, for the filter
 	policies   map[byte]SpacePolicy // the spaces with a Group or Raw; nil: none
+	// sink, when set, takes each closed block and the index as they are
+	// written, so out holds one block: base is the bytes it took, err its
+	// first write error.
+	sink io.Writer
+	base int64
+	err  error
+}
+
+// size is the table's bytes so far.
+func (w *TableWriter) size() int64 { return w.base + int64(len(w.out)) }
+
+// spillBytes batches closed blocks into one sink write: a write per 4 KiB
+// block costs the sink a call, and a file sink a write-back, per block.
+const spillBytes = 1 << 20
+
+// spill hands out to the sink, if any, once it holds spillBytes or the
+// table is finished.
+func (w *TableWriter) spill(finished bool) {
+	if w.sink == nil || !finished && len(w.out) < spillBytes {
+		return
+	}
+	if w.err == nil {
+		_, w.err = w.sink.Write(w.out)
+	}
+	w.base += int64(len(w.out))
+	w.out = w.out[:0]
 }
 
 // NewTableWriter returns a writer closing blocks at blockBytes of raw
@@ -226,6 +253,9 @@ func NewTableWriter(blockBytes int) *TableWriter {
 // entry must fit a table of its own (ErrEntryTooLarge; see MaxEntryBytes).
 // A block's raw bytes never exceed MaxTableBytes, whatever blockBytes says.
 func (w *TableWriter) Add(e Entry) error {
+	if w.err != nil {
+		return w.err
+	}
 	if len(e.Key) == 0 {
 		return fmt.Errorf("%w: empty key", ErrBadEntry)
 	}
@@ -276,7 +306,7 @@ func (w *TableWriter) Add(e Entry) error {
 // bound is the finished table's size from above: the blocks written, the
 // open block as if stored raw, and the index and footer they will need.
 func (w *TableWriter) bound() int64 {
-	n := int64(len(w.out)) + w.idx + footerBytes + binary.MaxVarintLen64 + filterFrame(w.meta.Count+1)
+	n := w.size() + w.idx + footerBytes + binary.MaxVarintLen64 + filterFrame(w.meta.Count+1)
 	if w.n > 0 {
 		n += blockOverhead + int64(len(w.raw)) + indexEntry(w.first, w.last)
 	}
@@ -329,7 +359,8 @@ func (w *TableWriter) flushBlock() {
 	raw := binary.AppendUvarint(w.blk[:0], uint64(w.n))
 	raw = append(raw, w.raw...)
 	w.blk = raw
-	off := int64(len(w.out))
+	at := len(w.out)
+	off := w.base + int64(at)
 	w.out = append(w.out, 0, 0, 0, 0) // the checksum, over the payload once it is written
 	// A block is stored as it is when zstd saves less than an eighth, and
 	// a block that is one large value unless zstd at least halves it:
@@ -346,17 +377,18 @@ func (w *TableWriter) flushBlock() {
 	stored := large && w.policies[w.first[0]].Raw
 	if !stored {
 		w.out = blockEncoder.EncodeAll(raw, append(w.out, blockZstd))
-		stored = len(w.out)-int(off)-5 > len(raw)-saves
+		stored = len(w.out)-at-5 > len(raw)-saves
 	}
 	if stored {
-		w.out = w.out[:off+4]
+		w.out = w.out[:at+4]
 		w.out = append(append(w.out, blockStored), raw...)
 	}
-	binary.BigEndian.PutUint32(w.out[off:], crc32.Checksum(w.out[off+4:], castagnoli))
-	w.index = append(w.index, blockIndex{off: off, length: int64(len(w.out)) - off, rawLen: int64(len(raw)),
+	binary.BigEndian.PutUint32(w.out[at:], crc32.Checksum(w.out[at+4:], castagnoli))
+	w.index = append(w.index, blockIndex{off: off, length: int64(len(w.out) - at), rawLen: int64(len(raw)),
 		first: bytes.Clone(w.first), last: bytes.Clone(w.last)})
 	w.idx += indexEntry(w.first, w.last)
 	w.raw, w.n = w.raw[:0], 0
+	w.spill(false)
 }
 
 // Finish closes the table and returns its bytes and metadata.
@@ -381,16 +413,20 @@ func (w *TableWriter) Finish() ([]byte, TableMeta, error) {
 	f := buildFilter(w.hashes)
 	idx = binary.AppendUvarint(idx, uint64(len(f)))
 	idx = append(idx, f...)
-	w.meta.IndexOff, w.meta.IndexLen = int64(len(w.out)), int64(len(idx))
+	w.meta.IndexOff, w.meta.IndexLen = w.size(), int64(len(idx))
 	w.out = append(w.out, idx...)
 	w.out = binary.BigEndian.AppendUint64(w.out, uint64(w.meta.IndexOff))
 	w.out = binary.BigEndian.AppendUint64(w.out, uint64(w.meta.IndexLen))
 	w.out = binary.BigEndian.AppendUint64(w.out, uint64(w.meta.Count))
 	w.out = binary.BigEndian.AppendUint32(w.out, crc32.Checksum(idx, castagnoli))
 	w.out = append(w.out, tableMagic...)
-	w.meta.Bytes = int64(len(w.out))
+	w.meta.Bytes = w.size()
 	if w.meta.Bytes > MaxTableBytes {
 		return nil, TableMeta{}, fmt.Errorf("lsm: table of %d bytes exceeds %d", w.meta.Bytes, MaxTableBytes)
+	}
+	if w.sink != nil {
+		w.spill(true)
+		return nil, w.meta, w.err
 	}
 	return w.out, w.meta, nil
 }

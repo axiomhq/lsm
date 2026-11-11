@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"io"
 	"maps"
 	"math/rand/v2"
 	"slices"
@@ -224,10 +225,13 @@ func (m *memStore) clone() *memStore {
 func TestCompactReadAheadAndUploadsMatch(t *testing.T) {
 	ctx := context.Background()
 	st, v, j, o := compactFixture(t)
-	run := func(readAhead int64, workers, uploads int) (Edit, [][]byte) {
+	run := func(readAhead int64, workers, uploads int, stream bool) (Edit, [][]byte) {
 		s := st.clone()
 		o := o
 		o.ReadAheadBytes, o.Workers, o.Uploads = readAhead, workers, uploads
+		if stream {
+			o.Stream = streaming(s.put)
+		}
 		_, e, err := Compact(ctx, v, j, o, s.reader(), s.put)
 		if err != nil {
 			t.Fatal(err)
@@ -239,18 +243,31 @@ func TestCompactReadAheadAndUploadsMatch(t *testing.T) {
 		}
 		return e, files
 	}
-	wantEdit, want := run(-1, 1, -1)
+	wantEdit, want := run(-1, 1, -1, false)
 	if len(want) < 8 {
 		t.Fatalf("fixture wrote %d files", len(want))
 	}
 	for _, c := range []struct {
 		readAhead        int64
 		workers, uploads int
-	}{{0, 1, -1}, {0, 1, 0}, {1000, 3, 2}, {-1, 4, 1}, {1 << 20, 4, 8}} {
-		e, files := run(c.readAhead, c.workers, c.uploads)
+		stream           bool
+	}{{0, 1, -1, false}, {0, 1, 0, false}, {1000, 3, 2, false}, {-1, 4, 1, false}, {1 << 20, 4, 8, false},
+		{0, 1, -1, true}, {1000, 3, 2, true}, {-1, 4, 1, true}} {
+		e, files := run(c.readAhead, c.workers, c.uploads, c.stream)
 		if !slices.EqualFunc(files, want, bytes.Equal) || !slices.Equal(e.Del, wantEdit.Del) || e.NextSeq != wantEdit.NextSeq {
 			t.Fatalf("%+v: %d files, want %d; or the deletes or NextSeq differ", c, len(files), len(want))
 		}
+	}
+}
+
+// streaming is put as a StreamPutter.
+func streaming(put Putter) StreamPutter {
+	return func(ctx context.Context, level int, seq uint64, body io.Reader) (string, error) {
+		data, err := io.ReadAll(body)
+		if err != nil {
+			return "", err
+		}
+		return put(ctx, level, seq, data)
 	}
 }
 
@@ -258,34 +275,59 @@ func TestCompactReadAheadAndUploadsMatch(t *testing.T) {
 // fails the job with its error; the Edit lists exactly the files whose
 // puts succeeded, and never more than Uploads puts run at once.
 func TestCompactUploadFailure(t *testing.T) {
-	ctx := context.Background()
-	st, v, j, o := compactFixture(t)
-	o.Workers, o.Uploads = 3, 2
-	boom := errors.New("boom")
-	var calls, inflight, peak atomic.Int64
-	put := func(ctx context.Context, level int, seq uint64, data []byte) (string, error) {
-		n := inflight.Add(1)
-		defer inflight.Add(-1)
-		for p := peak.Load(); n > p && !peak.CompareAndSwap(p, n); p = peak.Load() {
+	for _, stream := range []bool{false, true} {
+		ctx := context.Background()
+		st, v, j, o := compactFixture(t)
+		o.Workers, o.Uploads = 3, 2
+		boom := errors.New("boom")
+		var calls, inflight, peak atomic.Int64
+		put := func(ctx context.Context, level int, seq uint64, data []byte) (string, error) {
+			n := inflight.Add(1)
+			defer inflight.Add(-1)
+			for p := peak.Load(); n > p && !peak.CompareAndSwap(p, n); p = peak.Load() {
+			}
+			if calls.Add(1) == 3 {
+				return "", boom
+			}
+			return st.put(ctx, level, seq, data)
 		}
-		if calls.Add(1) == 3 {
-			return "", boom
+		if stream {
+			o.Stream = streaming(put)
 		}
-		return st.put(ctx, level, seq, data)
+		_, e, err := Compact(ctx, v, j, o, st.reader(), put)
+		if !errors.Is(err, boom) {
+			t.Fatalf("stream %v: error %v", stream, err)
+		}
+		if peak.Load() > 2 {
+			t.Fatalf("stream %v: %d puts at once, Uploads 2", stream, peak.Load())
+		}
+		if len(e.Del) != 0 || len(e.Add[1]) != int(calls.Load())-1 {
+			t.Fatalf("stream %v: edit %d adds, %d dels after %d puts", stream, len(e.Add[1]), len(e.Del), calls.Load())
+		}
+		for _, f := range e.Add[1] {
+			if _, ok := st.objects[f.Key]; !ok || f.Seq >= e.NextSeq {
+				t.Fatalf("stream %v: added %s (seq %d, next %d) not stored", stream, f.Key, f.Seq, e.NextSeq)
+			}
+		}
 	}
-	_, e, err := Compact(ctx, v, j, o, st.reader(), put)
-	if !errors.Is(err, boom) {
-		t.Fatalf("error %v", err)
-	}
-	if peak.Load() > 2 {
-		t.Fatalf("%d puts at once, Uploads 2", peak.Load())
-	}
-	if len(e.Del) != 0 || len(e.Add[1]) != int(calls.Load())-1 {
-		t.Fatalf("edit %d adds, %d dels after %d puts", len(e.Add[1]), len(e.Del), calls.Load())
-	}
-	for _, f := range e.Add[1] {
-		if _, ok := st.objects[f.Key]; !ok || f.Seq >= e.NextSeq {
-			t.Fatalf("added %s (seq %d, next %d) not stored", f.Key, f.Seq, e.NextSeq)
+}
+
+// TestCompactStreamShortRead: a Stream put that returns without reading
+// its whole table fails the job instead of naming a truncated file.
+func TestCompactStreamShortRead(t *testing.T) {
+	for _, uploads := range []int{-1, 2} {
+		st, v, j, o := compactFixture(t)
+		o.Workers, o.Uploads = 2, uploads
+		o.Stream = func(ctx context.Context, level int, seq uint64, body io.Reader) (string, error) {
+			head := make([]byte, 100)
+			if _, err := io.ReadFull(body, head); err != nil {
+				return "", err
+			}
+			return st.put(ctx, level, seq, head)
+		}
+		_, e, err := Compact(context.Background(), v, j, o, st.reader(), st.put)
+		if err == nil || len(e.Add[1]) != 0 {
+			t.Fatalf("uploads %d: a short put gave %v with %d files", uploads, err, len(e.Add[1]))
 		}
 	}
 }

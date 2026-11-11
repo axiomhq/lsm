@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"runtime"
 	"slices"
 	"sort"
@@ -56,6 +58,12 @@ type Options struct {
 	// once every put has (0: Workers; negative: each merge waits for its
 	// own put).
 	Uploads int
+	// Stream, when set, takes each compaction output file as it is
+	// written instead of put taking it whole, so a merge holds a block of
+	// its output, not a file: a file's put starts with its first block
+	// and holds an Uploads slot until it returns. A body that fails to
+	// read must leave no object Stream reports as stored.
+	Stream StreamPutter
 	// Spaces sets a key space's merge policy (tiered only), by its first
 	// key byte; a space it does not name tiers by size.
 	Spaces map[byte]SpacePolicy
@@ -161,6 +169,10 @@ func (o Options) withDefaults() Options {
 // unless that is 1. Like io.Writer, put must not retain data once it
 // returns: a later file is written into the same buffer.
 type Putter func(ctx context.Context, level int, seq uint64, data []byte) (string, error)
+
+// StreamPutter is a Putter that reads its table from body, which ends at
+// the table's last byte or fails with the writer's error.
+type StreamPutter func(ctx context.Context, level int, seq uint64, body io.Reader) (string, error)
 
 // Flush writes sorted, unique entries as one level-0 file and returns the
 // version holding it. Cost: the entries' own bytes once.
@@ -939,8 +951,57 @@ func recycle(data []byte) {
 	outputs.Put(&data)
 }
 
+// streamed is an output file being written to Options.Stream.
+type streamed struct {
+	pw   *io.PipeWriter
+	meta chan TableMeta // the file's meta once written; closed unsent if writing failed
+	put  chan error     // the put's result
+}
+
+// stream starts w's file as a Stream put, which fills the file's FileRef
+// once both the put and the writer finished.
+func (c *compaction) stream(ctx context.Context, pi int, w *TableWriter) (*streamed, error) {
+	if c.uploads != nil {
+		select {
+		case c.uploads <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		if err := ctx.Err(); err != nil {
+			<-c.uploads
+			return nil, err
+		}
+	}
+	pr, pw := io.Pipe()
+	s := &streamed{pw: pw, meta: make(chan TableMeta, 1), put: make(chan error, 1)}
+	w.sink = pw
+	f := new(FileRef)
+	c.outputs[pi] = append(c.outputs[pi], f)
+	level, seq := c.j.Level+1, c.seq.Add(1)-1
+	c.puts.Go(func() {
+		if c.uploads != nil {
+			defer func() { <-c.uploads }()
+		}
+		key, err := c.o.Stream(ctx, level, seq, pr)
+		// A pipe write returns once read, so a writer still writing after
+		// the put returned fails here, and its file is never named.
+		pr.CloseWithError(cmp.Or(err, errors.New("lsm: put returned before its table ended")))
+		meta, written := <-s.meta
+		if err != nil {
+			err = fmt.Errorf("lsm: put level %d seq %d: %w", level, seq, err)
+			if written {
+				c.cancel(err)
+			}
+		} else if written {
+			*f = FileRef{Key: key, Seq: seq, Oldest: c.oldest, TableMeta: meta}
+		}
+		s.put <- err
+	})
+	return s, nil
+}
+
 // writePartition merges partition pi and hands its files to put as it goes.
-func (c *compaction) writePartition(ctx context.Context, pi int, p partition) error {
+func (c *compaction) writePartition(ctx context.Context, pi int, p partition) (err error) {
 	its := make([]Iterator, 0, len(c.inputs)+len(p.overlaps))
 	scans := make([]*namedIter, 0, cap(its))
 	// A partition that fails part way returns only once its scans' reads
@@ -966,6 +1027,13 @@ func (c *compaction) writePartition(ctx context.Context, pi int, p partition) er
 	}
 	in := Resolve(NewMerge(its...), c.r.Merger, c.j.Bottom)
 	var w *TableWriter
+	var open *streamed // w's Stream put
+	defer func() {
+		if open != nil { // a file left part written: its put must fail
+			open.pw.CloseWithError(cmp.Or(err, errors.New("lsm: compaction ended mid-file")))
+			close(open.meta)
+		}
+	}()
 	finish := func() error {
 		if w == nil {
 			return nil
@@ -975,6 +1043,16 @@ func (c *compaction) writePartition(ctx context.Context, pi int, p partition) er
 			return err
 		}
 		w = nil
+		if s := open; s != nil {
+			open = nil
+			s.pw.Close()
+			s.meta <- meta
+			close(s.meta)
+			if c.uploads == nil {
+				return <-s.put
+			}
+			return nil
+		}
 		if c.uploads != nil {
 			select {
 			case c.uploads <- struct{}{}:
@@ -1026,9 +1104,15 @@ func (c *compaction) writePartition(ctx context.Context, pi int, p partition) er
 		}
 		if w == nil {
 			w = NewTableWriterOptions(c.o)
-			// A file closes within FileBytes: never regrown.
-			w.out = output(c.o.FileBytes)
 			space = e.Key[0]
+			if c.o.Stream != nil {
+				if open, err = c.stream(ctx, pi, w); err != nil {
+					return err
+				}
+			} else {
+				// A file closes within FileBytes: never regrown.
+				w.out = output(c.o.FileBytes)
+			}
 		}
 		if err := w.Add(e); err != nil {
 			return fmt.Errorf("lsm: level %d: %w", c.j.Level+1, err)
