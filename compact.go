@@ -167,7 +167,9 @@ func (o Options) withDefaults() Options {
 // Compact calls put from up to Options.Uploads goroutines at once
 // (Workers when Uploads is negative); it must be safe for concurrent use
 // unless that is 1. Like io.Writer, put must not retain data once it
-// returns: a later file is written into the same buffer.
+// returns: a compaction whose puts are synchronous writes its next file
+// into the same buffer. A put that runs beside the merge (Uploads not
+// negative) gets a buffer no later file reuses.
 type Putter func(ctx context.Context, level int, seq uint64, data []byte) (string, error)
 
 // StreamPutter is a Putter that reads its table from body, which ends at
@@ -930,27 +932,6 @@ type compaction struct {
 	puts    sync.WaitGroup
 }
 
-// outputs holds compaction output buffers once their put returned: a
-// caller that compacts one key space after another, as a merge lane does,
-// would otherwise leave a FileBytes buffer of garbage in the heap per
-// Compact call until the next GC.
-var outputs sync.Pool // *[]byte
-
-// output is an empty buffer of at least n bytes' capacity.
-func output(n int64) []byte {
-	if p, ok := outputs.Get().(*[]byte); ok && int64(cap(*p)) >= n {
-		return (*p)[:0]
-	}
-	return make([]byte, 0, n)
-}
-
-// recycle returns a file's buffer once its put returned, which must not
-// retain it (Putter).
-func recycle(data []byte) {
-	data = data[:0]
-	outputs.Put(&data)
-}
-
 // streamed is an output file being written to Options.Stream.
 type streamed struct {
 	pw   *io.PipeWriter
@@ -1027,6 +1008,7 @@ func (c *compaction) writePartition(ctx context.Context, pi int, p partition) (e
 	}
 	in := Resolve(NewMerge(its...), c.r.Merger, c.j.Bottom)
 	var w *TableWriter
+	var spare []byte   // a synchronous put's buffer, for the next file
 	var open *streamed // w's Stream put
 	defer func() {
 		if open != nil { // a file left part written: its put must fail
@@ -1074,12 +1056,11 @@ func (c *compaction) writePartition(ctx context.Context, pi int, p partition) (e
 			return err
 		}
 		if c.uploads == nil {
-			defer recycle(data)
+			spare = data[:0]
 			return up()
 		}
 		c.puts.Go(func() {
 			defer func() { <-c.uploads }()
-			defer recycle(data)
 			if err := up(); err != nil {
 				c.cancel(err)
 			}
@@ -1109,10 +1090,12 @@ func (c *compaction) writePartition(ctx context.Context, pi int, p partition) (e
 				if open, err = c.stream(ctx, pi, w); err != nil {
 					return err
 				}
-			} else {
-				// A file closes within FileBytes: never regrown.
-				w.out = output(c.o.FileBytes)
+			} else if w.out = spare; w.out == nil {
+				// A file closes within FileBytes: one allocation per
+				// partition when puts are synchronous, never regrown.
+				w.out = make([]byte, 0, c.o.FileBytes)
 			}
+			spare = nil
 		}
 		if err := w.Add(e); err != nil {
 			return fmt.Errorf("lsm: level %d: %w", c.j.Level+1, err)

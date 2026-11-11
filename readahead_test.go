@@ -3,6 +3,7 @@ package lsm
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -256,6 +257,36 @@ func TestCompactReadAheadAndUploadsMatch(t *testing.T) {
 		e, files := run(c.readAhead, c.workers, c.uploads, c.stream)
 		if !slices.EqualFunc(files, want, bytes.Equal) || !slices.Equal(e.Del, wantEdit.Del) || e.NextSeq != wantEdit.NextSeq {
 			t.Fatalf("%+v: %d files, want %d; or the deletes or NextSeq differ", c, len(files), len(want))
+		}
+	}
+}
+
+// TestCompactRetainedPut: a put beside the merge (Uploads not negative)
+// may keep the buffer it was given; no later compaction writes into it.
+// ExampleCompact keeps its data this way.
+func TestCompactRetainedPut(t *testing.T) {
+	st, v, j, o := compactFixture(t)
+	o.Workers, o.Uploads = 2, 2
+	var mu sync.Mutex
+	kept := map[string][]byte{}
+	sums := map[string][32]byte{}
+	put := func(ctx context.Context, level int, seq uint64, data []byte) (string, error) {
+		key, err := st.put(ctx, level, seq, data)
+		mu.Lock()
+		kept[key], sums[key] = data, sha256.Sum256(data)
+		mu.Unlock()
+		return key, err
+	}
+	for range 4 {
+		v := v
+		v.NextSeq += uint64(len(kept)) // fresh keys for each run
+		if _, _, err := Compact(context.Background(), v, j, o, st.reader(), put); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for key, data := range kept {
+		if sha256.Sum256(data) != sums[key] {
+			t.Fatalf("%s changed after its put returned", key)
 		}
 	}
 }
