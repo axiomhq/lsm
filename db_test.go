@@ -642,6 +642,76 @@ func TestCompactGrowsSmallTailFile(t *testing.T) {
 	checkModel(t, ctx, v, st, m, rand.New(rand.NewPCG(3, 4)), universe)
 }
 
+// TestCompactAbsorbsSmallFiles: a merge that fills a file leaves its
+// remainder as a small file; the next merge beside it rewrites that file
+// into its own output, so rounds of inserts into a full file do not leave
+// one small file each.
+func TestCompactAbsorbsSmallFiles(t *testing.T) {
+	ctx := context.Background()
+	st := newMemStore()
+	o := DefaultOptions()
+	o.FileBytes = 16 << 10
+	rng := rand.NewChaCha8([32]byte{9})
+	want := map[string][]byte{}
+	put := func(k int) Entry {
+		val := make([]byte, 256)
+		rng.Read(val) // incompressible
+		e := Entry{Key: fmt.Appendf(nil, "p%06d", k), Kind: KindPut, Value: val}
+		want[string(e.Key)] = val
+		return e
+	}
+	var v Version
+	merge := func(entries []Entry) {
+		t.Helper()
+		next, _, err := Flush(ctx, v, entries, o, st.put)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v, _, err = Compact(ctx, next, next.job(0, next.Levels[0], o), o, st.reader(), st.put); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var entries []Entry
+	for i := range 160 { // about 2.5 files
+		entries = append(entries, put(i*100))
+	}
+	merge(entries)
+	// Each round inserts into the first file's range, which is full.
+	for round := range 24 {
+		entries = entries[:0]
+		for k := range 4 {
+			entries = append(entries, put(k*400+round+1))
+		}
+		merge(entries)
+	}
+	// Under half a file: the remainder still growing, and the range's end.
+	var sizes []int64
+	small := 0
+	for _, f := range v.Levels[1] {
+		sizes = append(sizes, f.Bytes)
+		if f.Bytes < o.FileBytes/2 {
+			small++
+		}
+	}
+	if small > 2 {
+		t.Fatalf("level 1 holds files of %v bytes, %d under half a file, want at most 2", sizes, small)
+	}
+	it, err := st.reader().Iter(ctx, v, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for ok := it.SeekGE(nil); ok; ok = it.Next() {
+		if !bytes.Equal(it.Value(), want[string(it.Key())]) {
+			t.Fatalf("key %s: wrong value", it.Key())
+		}
+		n++
+	}
+	if err := it.Err(); err != nil || n != len(want) {
+		t.Fatalf("scanned %d keys (%v), want %d", n, err, len(want))
+	}
+}
+
 // readMergeErr reads key k of a one-file version holding a single merge
 // operand op, through Get and through Iter, and returns both errors.
 func readMergeErr(t *testing.T, r func(*memStore) Reader, op []byte) (getErr, iterErr error) {

@@ -80,8 +80,9 @@ func simCompact(v Version, j Job, o Options, id *int) (e Edit, read int64) {
 		add(f)
 	}
 	var stay [256][][2]uint64 // per space, the overlap files no input touches
+	rewrite := j.touched(o)
 	for i, f := range j.Overlap {
-		if j.touches(i, o) {
+		if rewrite[i] {
 			add(f)
 		} else {
 			stay[f.Min[0]] = append(stay[f.Min[0]], [2]uint64{simPos(f.Min), simPos(f.Max)})

@@ -673,6 +673,15 @@ func (v Version) job(level int, inputs []FileRef, o Options) Job {
 				j.Overlap = append([]FileRef{p}, j.Overlap...)
 			}
 		}
+		// So does the small file just after the overlap, in its space: a
+		// merge into a full file leaves its remainder there (touched).
+		if n := len(j.Overlap); n > 0 {
+			last := j.Overlap[n-1]
+			k := sort.Search(len(below), func(i int) bool { return bytes.Compare(below[i].Min, last.Max) > 0 })
+			if k < len(below) && o.small(below[k]) && below[k].Min[0] == last.Max[0] {
+				j.Overlap = append(j.Overlap, below[k])
+			}
+		}
 	}
 	// Overlap widens the range that deeper levels must be clear of.
 	if len(j.Overlap) > 0 {
@@ -730,8 +739,9 @@ func Compact(ctx context.Context, v Version, j Job, o Options, r Reader, put Put
 	}
 	var touched []FileRef
 	overlaps := make([]*named, len(j.Overlap))
+	rewrite := j.touched(o)
 	for i, f := range j.Overlap {
-		if !j.touches(i, o) {
+		if !rewrite[i] {
 			continue
 		}
 		t, err := r.Open(ctx, f)
@@ -828,6 +838,38 @@ func (j Job) touches(i int, o Options) bool {
 	return receives(j.Inputs, f.Min, hi, incl)
 }
 
+// touched is, per overlap file, whether the job reads and rewrites it: the
+// files an input may write into (touches), and with them each small file
+// (Options.small) next to one of them in the same space, so it merges into
+// its neighbour's output instead of staying a file of its own. A merge
+// writes full files and leaves its remainder as a small file, and without
+// this each round of merges beside one would leave another.
+func (j Job) touched(o Options) []bool {
+	t := make([]bool, len(j.Overlap))
+	for i := range j.Overlap {
+		t[i] = j.touches(i, o)
+	}
+	absorb := func(i, next int) {
+		f, g := j.Overlap[i], j.Overlap[next]
+		if !t[i] && t[next] && o.small(f) && f.Min[0] == g.Min[0] {
+			t[i] = true
+		}
+	}
+	for i := 1; i < len(t); i++ {
+		absorb(i, i-1)
+	}
+	for i := len(t) - 2; i >= 0; i-- {
+		absorb(i, i+1)
+	}
+	return t
+}
+
+// small reports whether f holds one space and under half its file size: a
+// compaction beside it rewrites it into its neighbour's output.
+func (o Options) small(f FileRef) bool {
+	return f.Min[0] == f.Max[0] && f.Bytes < o.fileBytes(f.Min[0])/2
+}
+
 // sortedRuns splits a new run's level-0 inputs into those to merge and
 // those that move to level 1 as they are, unread and unwritten: the files
 // of a space that each hold that space alone and do not overlap one
@@ -897,9 +939,10 @@ func spaceParts(inputs []FileRef) []partition {
 // a run of consecutive touched overlap files (and the gaps around them,
 // which hold input keys alone) worth about a file of overlap: enough
 // files for the merge to run wide, never so many that every round leaves a
-// smaller file behind. opened[i] is overlap[i] open, nil when untouched. An
-// untouched file ends the partition before it and the next starts after
-// it, so no output spans it.
+// smaller file behind; a small file joins the partition before it, so its
+// keys follow that partition's remainder into one file. opened[i] is
+// overlap[i] open, nil when untouched. An untouched file ends the partition
+// before it and the next starts after it, so no output spans it.
 func overlapParts(overlap []FileRef, opened []*named, o Options) []partition {
 	var parts []partition
 	var cur partition
@@ -911,7 +954,7 @@ func overlapParts(overlap []FileRef, opened []*named, o Options) []partition {
 			cur, curBytes = partition{lo: afterMax(f.Max)}, 0
 			continue
 		}
-		if curBytes >= o.fileBytes(f.Min[0])/2 {
+		if curBytes >= o.fileBytes(f.Min[0])/2 && !o.small(f) {
 			cur.hi = f.Min
 			parts = append(parts, cur)
 			cur, curBytes = partition{lo: f.Min}, 0
