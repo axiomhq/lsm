@@ -688,6 +688,11 @@ func (v Version) job(level int, inputs []FileRef, o Options) Job {
 // Edit{NextSeq: edit.NextSeq} to it first, never the failed Edit's Add.
 func Compact(ctx context.Context, v Version, j Job, o Options, r Reader, put Putter) (Version, Edit, error) {
 	o = o.withDefaults()
+	all := j.Inputs
+	var moved []FileRef
+	if j.NewRun {
+		j.Inputs, moved = sortedRuns(j.Inputs)
+	}
 	inputs := make([]named, len(j.Inputs))
 	for i, f := range j.Inputs {
 		t, err := r.Open(ctx, f)
@@ -758,8 +763,8 @@ func Compact(ctx context.Context, v Version, j Job, o Options, r Reader, put Put
 	if err := context.Cause(gctx); err != nil {
 		return Version{}, published, err
 	}
-	e := Edit{Add: map[int][]FileRef{j.Level + 1: added}, NextSeq: published.NextSeq}
-	for _, f := range j.Inputs {
+	e := Edit{Add: map[int][]FileRef{j.Level + 1: append(added, moved...)}, NextSeq: published.NextSeq}
+	for _, f := range all {
 		e.Del = append(e.Del, f.Key)
 	}
 	for _, f := range touched {
@@ -794,6 +799,43 @@ func (j Job) touches(i int, o Options) bool {
 		}
 	}
 	return receives(j.Inputs, f.Min, hi, incl)
+}
+
+// sortedRuns splits a new run's level-0 inputs into those to merge and
+// those that move to level 1 as they are, unread and unwritten: the files
+// of a space that each hold that space alone and do not overlap one
+// another are a sorted run already. A file holding several spaces merges,
+// and so does every file of its spaces.
+func sortedRuns(inputs []FileRef) (merge, move []FileRef) {
+	var mixed [256]bool
+	bySpace := map[byte][]FileRef{}
+	for _, f := range inputs {
+		if f.Min[0] != f.Max[0] {
+			for b := int(f.Min[0]); b <= int(f.Max[0]); b++ {
+				mixed[b] = true
+			}
+			continue
+		}
+		bySpace[f.Min[0]] = append(bySpace[f.Min[0]], f)
+	}
+	disjoint := func(fs []FileRef) bool {
+		fs = slices.Clone(fs)
+		slices.SortFunc(fs, func(a, b FileRef) int { return bytes.Compare(a.Min, b.Min) })
+		for i := 1; i < len(fs); i++ {
+			if bytes.Compare(fs[i-1].Max, fs[i].Min) >= 0 {
+				return false
+			}
+		}
+		return true
+	}
+	for _, f := range inputs {
+		if s := f.Min[0]; f.Max[0] == s && !mixed[s] && disjoint(bySpace[s]) {
+			move = append(move, f)
+		} else {
+			merge = append(merge, f)
+		}
+	}
+	return merge, move
 }
 
 // spaceParts is the partitions of a job with no overlap: one per key

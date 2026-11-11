@@ -62,8 +62,8 @@ func TestTieredRunInvariants(t *testing.T) {
 							was[f.Key] = true
 						}
 						for _, f := range e.Add[1] {
-							if was[f.Key] {
-								t.Fatalf("level-1 add %s is not a new output", f.Key)
+							if was[f.Key] && !slices.ContainsFunc(prev.Levels[0], func(g FileRef) bool { return g.Key == f.Key }) {
+								t.Fatalf("level-1 add %s is neither a new output nor a moved level-0 file", f.Key)
 							}
 						}
 						for l, fs := range e.Add {
@@ -337,6 +337,63 @@ func TestWriteOnceChurnReclaims(t *testing.T) {
 		_, ok, err := st.reader().Get(ctx, v, key(i))
 		if err != nil || ok != (i > under) {
 			t.Fatalf("key %d: found %v, %v", i, ok, err)
+		}
+	}
+}
+
+// TestNewRunMovesSortedRun: a new run whose level-0 files hold one space
+// each, without overlap, moves them to level 1 without reading or writing
+// any; a space whose files overlap still merges. Reads see the same data.
+func TestNewRunMovesSortedRun(t *testing.T) {
+	ctx := context.Background()
+	st := newMemStore()
+	o := Options{L0Trigger: 4, FileBytes: 1 << 20, BlockBytes: 256}
+	entry := func(space byte, i int) Entry {
+		return Entry{Key: []byte(fmt.Sprintf("%c%04d", space, i)), Kind: KindPut, Value: []byte(fmt.Sprint(i))}
+	}
+	var v Version
+	// Space A: two disjoint files. Space B: two overlapping files.
+	for _, batch := range [][]Entry{
+		{entry('A', 0), entry('A', 1)}, {entry('A', 2), entry('A', 3)},
+		{entry('B', 0), entry('B', 2)}, {entry('B', 1), entry('B', 3)},
+	} {
+		next, _, err := Flush(ctx, v, batch, o, st.put)
+		if err != nil {
+			t.Fatal(err)
+		}
+		v = next
+	}
+	j, ok := Pick(v, o)
+	if !ok || !j.NewRun {
+		t.Fatalf("want a new run, got %+v", j)
+	}
+	puts := st.puts
+	next, e, err := Compact(ctx, v, j, o, st.reader(), st.put)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.puts-puts != 1 {
+		t.Fatalf("%d tables written, want 1 (space B's merge)", st.puts-puts)
+	}
+	moved := 0
+	for _, f := range e.Add[1] {
+		if slices.ContainsFunc(v.Levels[0], func(g FileRef) bool { return g.Key == f.Key }) {
+			moved++
+			if f.Min[0] != 'A' {
+				t.Fatalf("moved a file of space %c", f.Min[0])
+			}
+		}
+	}
+	if moved != 2 || len(next.Levels[0]) != 0 {
+		t.Fatalf("moved %d files, level 0 holds %d", moved, len(next.Levels[0]))
+	}
+	for _, space := range []byte{'A', 'B'} {
+		for i := range 4 {
+			want := entry(space, i)
+			got, ok, err := st.reader().Get(ctx, next, want.Key)
+			if err != nil || !ok || string(got) != string(want.Value) {
+				t.Fatalf("%s: got %q %v %v", want.Key, got, ok, err)
+			}
 		}
 	}
 }
