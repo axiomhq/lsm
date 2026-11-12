@@ -780,6 +780,11 @@ func (t *Table) Get(ctx context.Context, key []byte) (Entry, bool, error) {
 	return t.get(ctx, key, keyHash(key))
 }
 
+// MayContain reports whether the table's key filter admits key: false means
+// the table holds no entry for key, so a reader that fetches blocks itself
+// (Span, Single) can skip the table. It reads only the in-memory filter.
+func (t *Table) MayContain(key []byte) bool { return t.filter.mayHold(keyHash(key)) }
+
 // get is Get with key's hash, which a lookup across tables computes once.
 // A key the filter rules out reads no block.
 func (t *Table) get(ctx context.Context, key []byte, h uint64) (Entry, bool, error) {

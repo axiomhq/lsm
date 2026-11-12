@@ -325,7 +325,8 @@ func (c *countingSource) ReadAt(ctx context.Context, off, length int64) ([]byte,
 
 // TestFilterSkipsAbsentKeys: a point lookup of a key the table does not
 // hold reads a block for about one key in a hundred, not for every key
-// inside the table's range; a key it holds is never ruled out.
+// inside the table's range, and MayContain admits about as many; a key it
+// holds is never ruled out.
 func TestFilterSkipsAbsentKeys(t *testing.T) {
 	rng := rand.New(rand.NewPCG(3, 4))
 	keys := randKeys(rng, 4000, 'I')
@@ -355,8 +356,17 @@ func TestFilterSkipsAbsentKeys(t *testing.T) {
 	if src.reads > len(absent)*3/100 {
 		t.Fatalf("%d block reads for %d absent keys, want about 1%%", src.reads, len(absent))
 	}
+	admitted := 0
+	for _, k := range absent {
+		if tb.MayContain(k) {
+			admitted++
+		}
+	}
+	if admitted > len(absent)*3/100 {
+		t.Fatalf("MayContain admits %d of %d absent keys, want about 1%%", admitted, len(absent))
+	}
 	for _, k := range held {
-		if _, ok, err := tb.Get(context.Background(), k); !ok || err != nil {
+		if _, ok, err := tb.Get(context.Background(), k); !ok || err != nil || !tb.MayContain(k) {
 			t.Fatalf("held %x: %v %v", k, ok, err)
 		}
 	}
