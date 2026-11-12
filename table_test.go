@@ -9,6 +9,7 @@ import (
 	"hash/crc32"
 	"math"
 	"math/rand/v2"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -189,10 +190,9 @@ func TestTableRejectsCorruption(t *testing.T) {
 	}
 	// A block whose length would wrap the bounds sum is refused, not read.
 	idx := binary.AppendUvarint(nil, 1)
-	idx = binary.AppendUvarint(idx, 0)
 	idx = binary.AppendUvarint(idx, math.MaxInt64-3)
 	idx = binary.AppendUvarint(idx, 10)
-	idx = append(idx, 1, 'a', 1, 'a')
+	idx = append(idx, 0, 1, 'a', 1, 0)
 	tbl := slices.Concat(make([]byte, 64), idx, footerFor(64, idx, 1))
 	if _, err := OpenTableAt(ctx, BytesSource(tbl), TableMeta{IndexOff: 64, IndexLen: int64(len(idx))}); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("overflowing block length: %v", err)
@@ -211,23 +211,45 @@ func footerFor(off int64, idx []byte, count int64) []byte {
 	return append(f, tableMagic...)
 }
 
+// wholeKeys rewrites a table as writers before LSM3 built it: index
+// entries carrying offsets and whole keys, the filter frame kept when
+// filtered, and the footer behind them with magic.
+func wholeKeys(t *testing.T, data []byte, meta TableMeta, magic string, filtered bool) ([]byte, TableMeta) {
+	t.Helper()
+	tb, err := OpenTableAt(context.Background(), BytesSource(data), meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx := binary.AppendUvarint(nil, uint64(len(tb.index)))
+	for _, b := range tb.index {
+		for _, v := range []int64{b.off, b.length, b.rawLen, int64(len(b.first))} {
+			idx = binary.AppendUvarint(idx, uint64(v))
+		}
+		idx = append(idx, b.first...)
+		idx = binary.AppendUvarint(idx, uint64(len(b.last)))
+		idx = append(idx, b.last...)
+	}
+	if filtered {
+		f := filterBytes(meta.Count)
+		idx = append(idx, data[meta.IndexOff+meta.IndexLen-f-int64(uvarintLen(uint64(f))):meta.IndexOff+meta.IndexLen]...)
+	}
+	out := slices.Concat(data[:meta.IndexOff], idx, footerFor(meta.IndexOff, idx, meta.Count))
+	copy(out[len(out)-4:], magic)
+	meta.IndexLen = int64(len(idx))
+	return out, meta
+}
+
 // TestUnfilteredMagicOpens: a table written before v0.7.0 has no key
 // filter (LSM1, and DWL1 through v0.3.0) and still opens, and every key
 // reads back through Get.
 func TestUnfilteredMagicOpens(t *testing.T) {
 	entries := putEntries(randKeys(rand.New(rand.NewPCG(9, 9)), 50, 'L'))
+	built, bmeta, err := BuildTable(entries, 512)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, magic := range []string{unfilteredMagic, legacyMagic} {
-		data, meta, err := BuildTable(entries, 512)
-		if err != nil {
-			t.Fatal(err)
-		}
-		// The same table as a writer before the filter built it: the index
-		// without its filter frame, and the footer behind it.
-		f := filterBytes(meta.Count)
-		meta.IndexLen -= f + int64(uvarintLen(uint64(f)))
-		idx := data[meta.IndexOff : meta.IndexOff+meta.IndexLen]
-		data = append(slices.Clone(data[:meta.IndexOff+meta.IndexLen]), footerFor(meta.IndexOff, idx, meta.Count)...)
-		copy(data[len(data)-4:], magic)
+		data, meta := wholeKeys(t, built, bmeta, magic, false)
 		tb, err := OpenTableAt(context.Background(), BytesSource(data), meta)
 		if err != nil {
 			t.Fatalf("%s: %v", magic, err)
@@ -240,6 +262,53 @@ func TestUnfilteredMagicOpens(t *testing.T) {
 				t.Fatalf("%s: %x: %v %v", magic, e.Key, ok, err)
 			}
 		}
+	}
+}
+
+// TestIndexKeysSharePrefixes: a table's index stores each key as its
+// prefix shared with the key before it, so keys that differ only in their
+// tails (one large value a block) cost their tails, not their lengths; every
+// key still reads back, and a table whose index holds whole keys (LSM2)
+// opens to the same index.
+func TestIndexKeysSharePrefixes(t *testing.T) {
+	prefix := bytes.Repeat([]byte("p"), 60)
+	var entries []Entry
+	for i := range 400 {
+		k := binary.BigEndian.AppendUint32(slices.Clone(prefix), uint32(i*3))
+		entries = append(entries, Entry{Key: k, Kind: KindPut, Value: bytes.Repeat([]byte{byte(i)}, 300)})
+	}
+	data, meta, err := BuildTable(entries, 256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	tb, err := OpenTableAt(ctx, BytesSource(data), meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tb.index) < 300 {
+		t.Fatalf("%d blocks, want about one an entry", len(tb.index))
+	}
+	// Whole keys would take 2*64 bytes a block; shared ones about 12.
+	if keys := meta.IndexLen - filterBytes(meta.Count); keys > int64(len(tb.index))*24 {
+		t.Fatalf("index %d bytes for %d blocks", keys, len(tb.index))
+	}
+	for i, e := range entries {
+		if v, ok, err := tb.Get(ctx, e.Key); !ok || err != nil || !bytes.Equal(v.Value, e.Value) {
+			t.Fatalf("%x: %v %v", e.Key, ok, err)
+		}
+		absent := binary.BigEndian.AppendUint32(slices.Clone(prefix), uint32(i*3+1))
+		if _, ok, err := tb.Get(ctx, absent); ok || err != nil {
+			t.Fatalf("absent %x: %v %v", absent, ok, err)
+		}
+	}
+	old, m2 := wholeKeys(t, data, meta, fullKeysMagic, true)
+	t2, err := OpenTableAt(ctx, BytesSource(old), m2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(t2.index, tb.index) || !reflect.DeepEqual(t2.filter, tb.filter) {
+		t.Fatal("LSM2 table opens to another index")
 	}
 }
 

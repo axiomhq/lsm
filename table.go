@@ -30,7 +30,7 @@ import (
 // The footer is 32 bytes: index offset u64, index length u64, entry count
 // u64, crc32c(index) u32, magic.
 const (
-	tableMagic  = "LSM2"
+	tableMagic  = "LSM3"
 	footerBytes = 32
 	// DefaultBlockBytes is the raw size a block is closed at.
 	DefaultBlockBytes = 64 << 10
@@ -52,10 +52,26 @@ const (
 // unfilteredMagic is the footer magic of tables v0.4.0 through v0.6.2
 // wrote, and legacyMagic of those through v0.3.0: the same layout without
 // the key filter, read as a table whose filter holds every key.
+// fullKeysMagic is that of tables with the filter whose index entries
+// carry their offsets and whole keys.
 const (
 	unfilteredMagic = "LSM1"
 	legacyMagic     = "DWL1"
+	fullKeysMagic   = "LSM2"
 )
+
+// appendShared appends key as the length of its prefix shared with prev,
+// then the rest: an index's first key shares most of the previous block's
+// last, and a block of one entry's last key is its first.
+func appendShared(b, prev, key []byte) []byte {
+	n := 0
+	for n < len(prev) && n < len(key) && prev[n] == key[n] {
+		n++
+	}
+	b = binary.AppendUvarint(b, uint64(n))
+	b = binary.AppendUvarint(b, uint64(len(key)-n))
+	return append(b, key[n:]...)
+}
 
 // ErrUnsupportedFormat is a table whose footer magic is neither the
 // current nor an earlier one: bytes from a newer format, not corruption.
@@ -406,14 +422,13 @@ func (w *TableWriter) Finish() ([]byte, TableMeta, error) {
 	w.spaces[len(w.spaces)-1].Max = bytes.Clone(w.last)
 	w.meta.Spaces = w.spaces
 	idx := binary.AppendUvarint(nil, uint64(len(w.index)))
+	var prev []byte
 	for _, b := range w.index {
-		idx = binary.AppendUvarint(idx, uint64(b.off))
 		idx = binary.AppendUvarint(idx, uint64(b.length))
 		idx = binary.AppendUvarint(idx, uint64(b.rawLen))
-		idx = binary.AppendUvarint(idx, uint64(len(b.first)))
-		idx = append(idx, b.first...)
-		idx = binary.AppendUvarint(idx, uint64(len(b.last)))
-		idx = append(idx, b.last...)
+		idx = appendShared(idx, prev, b.first)
+		idx = appendShared(idx, b.first, b.last)
+		prev = b.last
 	}
 	f := buildFilter(w.hashes)
 	idx = binary.AppendUvarint(idx, uint64(len(f)))
@@ -557,7 +572,7 @@ func OpenTableAt(ctx context.Context, src Source, meta TableMeta) (*Table, error
 		return nil, fmt.Errorf("%w: lsm: table footer disagrees with the manifest", ErrCorrupt)
 	}
 	m := string(f[28:])
-	if m != tableMagic && m != unfilteredMagic && m != legacyMagic {
+	if m != tableMagic && m != fullKeysMagic && m != unfilteredMagic && m != legacyMagic {
 		return nil, fmt.Errorf("%w: magic %q", ErrUnsupportedFormat, m)
 	}
 	if crc32.Checksum(idx, castagnoli) != binary.BigEndian.Uint32(f[24:28]) {
@@ -573,9 +588,17 @@ func OpenTableAt(ctx context.Context, src Source, meta TableMeta) (*Table, error
 	var prevEnd int64
 	var prevLast []byte
 	for range blocks {
-		b := blockIndex{off: int64(d.uvarint()), length: int64(d.uvarint()), rawLen: int64(d.uvarint())}
-		b.first = bytes.Clone(d.bytes())
-		b.last = bytes.Clone(d.bytes())
+		var b blockIndex
+		if m == tableMagic {
+			// Blocks are contiguous from 0: an offset is the previous end.
+			b = blockIndex{off: prevEnd, length: int64(d.uvarint()), rawLen: int64(d.uvarint())}
+			b.first = d.shared(prevLast)
+			b.last = d.shared(b.first)
+		} else {
+			b = blockIndex{off: int64(d.uvarint()), length: int64(d.uvarint()), rawLen: int64(d.uvarint())}
+			b.first = bytes.Clone(d.bytes())
+			b.last = bytes.Clone(d.bytes())
+		}
 		if d.err != nil {
 			return nil, fmt.Errorf("%w: lsm: table index: %v", ErrCorrupt, d.err)
 		}
@@ -587,7 +610,7 @@ func OpenTableAt(ctx context.Context, src Source, meta TableMeta) (*Table, error
 		prevEnd, prevLast = b.off+b.length, b.last
 		t.index = append(t.index, b)
 	}
-	if m == tableMagic {
+	if m == tableMagic || m == fullKeysMagic {
 		f := d.bytes()
 		if d.err != nil || len(f) == 0 || len(f)%filterBlockBytes != 0 {
 			return nil, fmt.Errorf("%w: lsm: table filter", ErrCorrupt)
@@ -1062,6 +1085,20 @@ func (d *decoder) bytes() []byte {
 	out := d.b[:n]
 	d.b = d.b[n:]
 	return out
+}
+
+// shared reads a key appendShared wrote against prev.
+func (d *decoder) shared(prev []byte) []byte {
+	n := d.uvarint()
+	if d.err == nil && n > uint64(len(prev)) {
+		d.err = errors.New("shared prefix")
+		d.b = nil
+	}
+	rest := d.bytes()
+	if d.err != nil {
+		return nil
+	}
+	return append(prev[:n:n], rest...)
 }
 
 func (d *decoder) rest() int { return len(d.b) }

@@ -62,8 +62,8 @@ The leveled picker doesn't hold back your flushes. If you need to bound level
 | part | bytes |
 | --- | --- |
 | block | crc32c u32, mode byte (0 zstd, 1 stored), payload; raw is uvarint(count), then per entry uvarint(len key) key, kind byte, uvarint(len value) value |
-| index | uvarint(blocks), then per block offset, length, raw length, first key, last key (all uvarint-framed), then the key filter: uvarint(length), bloom bits |
-| footer | 32 bytes: index offset u64, index length u64, entry count u64, crc32c(index) u32, magic `LSM2` (`LSM1` through v0.6.2 and `DWL1` through v0.3.0: no key filter, still read) |
+| index | uvarint(blocks), then per block length and raw length (uvarints; blocks are contiguous from 0, so offsets are implied), first key as its prefix shared with the previous block's last key, last key as its prefix shared with the block's first (each uvarint(shared), uvarint(len rest), rest), then the key filter: uvarint(length), bloom bits |
+| footer | 32 bytes: index offset u64, index length u64, entry count u64, crc32c(index) u32, magic `LSM3` (`LSM2`: offsets and whole keys in the index; `LSM1` through v0.6.2 and `DWL1` through v0.3.0: also no key filter; all still read) |
 
 Blocks close at 64 KiB of raw bytes (`DefaultBlockBytes`). A value of 4 KiB or
 more (`LargeValueBytes`) gets a block of its own, so a point read of it
