@@ -881,8 +881,12 @@ func (t *Table) stopBefore(hi []byte) int {
 // (three at a window's edge, while the cursor's block aliases the last).
 // A window stops at the first block hi rules out (one block when the miss
 // is past it). Its blocks bypass Cache: they are read once, and would
-// evict what point reads share.
+// evict what point reads share. A negative window reads block by block,
+// through Cache (iterBelow).
 func (t *Table) scan(ctx context.Context, window int64, hi []byte) *TableIter {
+	if window < 0 {
+		return t.iterBelow(ctx, hi)
+	}
 	stop := t.stopBefore(hi)
 	return &TableIter{ctx: ctx, t: t, bi: -1, stop: stop, ra: &readAhead{t: t, window: window, stop: stop}}
 }

@@ -1048,7 +1048,7 @@ func (c *compaction) writePartition(ctx context.Context, pi int, p partition) (e
 		}
 	}()
 	scan := func(t named) {
-		s := t.scan(ctx, c.o.ReadAheadBytes, p.hi)
+		s := &namedIter{t.t.scan(ctx, c.o.ReadAheadBytes, p.hi), t.key}
 		scans = append(scans, s)
 		its = append(its, Bound(s, nil, p.hi))
 	}

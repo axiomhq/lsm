@@ -2,7 +2,6 @@ package lsm
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"slices"
 	"sort"
@@ -317,15 +316,6 @@ func (s *entriesIter) Err() error    { return nil }
 type named struct {
 	key string
 	t   *Table
-}
-
-// scan is iter for a compaction's pass over keys below hi, read window
-// bytes at a time (Table.scan); a negative window reads block by block.
-func (n named) scan(ctx context.Context, window int64, hi []byte) *namedIter {
-	if window < 0 {
-		return &namedIter{n.t.Iter(ctx), n.key}
-	}
-	return &namedIter{n.t.scan(ctx, window, hi), n.key}
 }
 
 type namedIter struct {
