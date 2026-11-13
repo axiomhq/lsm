@@ -125,8 +125,15 @@ var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 // eighth of its CPU for a few percent of size. EncodeAll is safe for
 // concurrent use and runs up to GOMAXPROCS encodes at once, so
 // Options.Workers is the only bound on a compaction's parallelism.
+//
+// Each encoder that compresses a block over 64 KiB keeps a history of twice
+// its window for good: zstd's 4 MiB default at this level is 8 MiB each,
+// 32 MiB on four cores. A 1 MiB window keeps 2 MiB each. A block of at most
+// 1 MiB is a single-segment frame that names no window, so its frame is
+// unchanged; a larger block's frame names a 1 MiB window (one byte more) and
+// finds no match beyond it.
 var blockEncoder = func() *zstd.Encoder {
-	e, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithZeroFrames(true))
+	e, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithZeroFrames(true), zstd.WithWindowSize(1<<20))
 	if err != nil {
 		panic(err)
 	}
