@@ -667,8 +667,7 @@ func (v Version) job(level int, inputs []FileRef, o Options) Job {
 	// leave a small file behind every round).
 	if level+1 < len(v.Levels) {
 		below := v.Levels[level+1]
-		i := sort.Search(len(below), func(i int) bool { return bytes.Compare(below[i].Max, lo) >= 0 })
-		if i > 0 {
+		if i := firstReaching(below, lo); i > 0 {
 			if p := below[i-1]; p.Bytes < o.fileBytes(p.Max[0])/2 && p.Max[0] == lo[0] {
 				j.Overlap = append([]FileRef{p}, j.Overlap...)
 			}
@@ -684,15 +683,8 @@ func (v Version) job(level int, inputs []FileRef, o Options) Job {
 		}
 	}
 	// Overlap widens the range that deeper levels must be clear of.
-	if len(j.Overlap) > 0 {
-		olo, ohi := keyRange(j.Overlap)
-		if bytes.Compare(olo, lo) < 0 {
-			lo = olo
-		}
-		if ohi = afterMax(ohi); bytes.Compare(ohi, hi) > 0 {
-			hi = ohi
-		}
-	}
+	lo, hi = keyRange(slices.Concat(inputs, j.Overlap))
+	hi = afterMax(hi)
 	for l := level + 2; l < len(v.Levels); l++ {
 		if len(v.overlapIn(l, lo, hi)) > 0 {
 			j.Bottom = false
