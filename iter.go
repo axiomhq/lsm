@@ -319,11 +319,6 @@ type named struct {
 	t   *Table
 }
 
-// iterBelow iterates keys below hi, loading no block past it.
-func (n named) iterBelow(ctx context.Context, hi []byte) Iterator {
-	return &namedIter{n.t.iterBelow(ctx, hi), n.key}
-}
-
 // scan is iter for a compaction's pass over keys below hi, read window
 // bytes at a time (Table.scan); a negative window reads block by block.
 func (n named) scan(ctx context.Context, window int64, hi []byte) *namedIter {

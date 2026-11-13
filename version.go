@@ -283,7 +283,7 @@ func (r Reader) Iter(ctx context.Context, v Version, lo, hi []byte) (Iterator, e
 		if err != nil {
 			return nil, fmt.Errorf("lsm: open %s: %w", f.Key, err)
 		}
-		its = append(its, Bound(named{f.Key, t}.iterBelow(ctx, hi), lo, hi))
+		its = append(its, Bound(&namedIter{t.iterBelow(ctx, hi), f.Key}, lo, hi))
 	}
 	return Resolve(NewMerge(its...), r.Merger, true), nil
 }
