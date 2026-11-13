@@ -618,7 +618,7 @@ func OpenTableAt(ctx context.Context, src Source, meta TableMeta) (*Table, error
 		}
 		t.filter = filter(bytes.Clone(f))
 	}
-	if d.rest() != 0 {
+	if len(d.b) != 0 {
 		return nil, fmt.Errorf("%w: lsm: table index trailing bytes", ErrCorrupt)
 	}
 	return t, nil
@@ -1092,5 +1092,3 @@ func (d *decoder) shared(prev []byte) []byte {
 	}
 	return append(prev[:n:n], rest...)
 }
-
-func (d *decoder) rest() int { return len(d.b) }
