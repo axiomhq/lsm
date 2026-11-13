@@ -301,9 +301,13 @@ walk:
 			if !f.holds(key) {
 				continue
 			}
-			e, ok, err := r.getIn(ctx, f, key, h)
+			t, err := r.Open(ctx, f)
 			if err != nil {
-				return nil, false, err
+				return nil, false, fmt.Errorf("lsm: open %s: %w", f.Key, err)
+			}
+			e, ok, err := t.get(ctx, key, h)
+			if err != nil {
+				return nil, false, fmt.Errorf("lsm: %s: %w", f.Key, err)
 			}
 			if !ok {
 				continue
@@ -375,17 +379,4 @@ func (r Reader) Locate(ctx context.Context, v Version, key []byte) (l Located, o
 		}
 	}
 	return Located{}, false, nil
-}
-
-// getIn is one table's point lookup.
-func (r Reader) getIn(ctx context.Context, f FileRef, key []byte, h uint64) (Entry, bool, error) {
-	t, err := r.Open(ctx, f)
-	if err != nil {
-		return Entry{}, false, fmt.Errorf("lsm: open %s: %w", f.Key, err)
-	}
-	e, ok, err := t.get(ctx, key, h)
-	if err != nil {
-		return Entry{}, false, fmt.Errorf("lsm: %s: %w", f.Key, err)
-	}
-	return e, ok, nil
 }
