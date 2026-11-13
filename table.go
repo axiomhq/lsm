@@ -630,14 +630,7 @@ func OpenTableAt(ctx context.Context, src Source, meta TableMeta) (*Table, error
 // index, so a caller can derive a cache signature from which blocks of a
 // table a key range touches without reading a block.
 func (t *Table) Span(lo, hi []byte) (first, last int, ok bool) {
-	first = t.blockFor(lo)
-	if first == len(t.index) {
-		return 0, 0, false
-	}
-	if hi == nil {
-		return first, len(t.index) - 1, true
-	}
-	last = sort.Search(len(t.index), func(i int) bool { return bytes.Compare(t.index[i].first, hi) >= 0 }) - 1
+	first, last = t.blockFor(lo), t.stopBefore(hi)-1
 	if last < first {
 		return 0, 0, false
 	}
