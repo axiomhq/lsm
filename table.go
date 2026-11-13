@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math/bits"
 	"sort"
 
 	"github.com/klauspost/compress/zstd"
@@ -846,14 +847,7 @@ func (t *Table) ReadAt(ctx context.Context, off, length int64) ([]byte, error) {
 	return t.src.ReadAt(ctx, off, length)
 }
 
-func uvarintLen(x uint64) int {
-	n := 1
-	for x >= 0x80 {
-		x >>= 7
-		n++
-	}
-	return n
-}
+func uvarintLen(x uint64) int { return (bits.Len64(x|1) + 6) / 7 }
 
 // Iter returns an iterator over the table. It is not positioned until
 // SeekGE.
