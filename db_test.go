@@ -942,7 +942,9 @@ func TestCompactReportsOrphansOnFailure(t *testing.T) {
 	if !errors.Is(err, boom) || !strings.Contains(err.Error(), "put level 1 seq") {
 		t.Fatalf("error %v", err)
 	}
-	if len(e.Add[1]) != 1 || len(e.Del) != 0 || e.NextSeq != e.Add[1][0].Seq+2 {
+	// A file is numbered when the merge starts it, so the one the merge had
+	// begun when the put failed counts too.
+	if len(e.Add[1]) != 1 || len(e.Del) != 0 || e.NextSeq < e.Add[1][0].Seq+2 {
 		t.Fatalf("edit after failure %+v, want the one published file, no deletes, and NextSeq past the failed put", e)
 	}
 	// Applying the failed edit's floor makes a retry skip the consumed seqs.

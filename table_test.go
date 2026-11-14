@@ -7,13 +7,18 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"io/fs"
 	"math"
 	"math/bits"
 	"math/rand/v2"
+	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 // randKeys returns n sorted, unique keys in space, 8-20 bytes.
@@ -458,6 +463,55 @@ func FuzzOpenTable(f *testing.F) {
 	})
 }
 
+// FuzzDecodeBlocks: a run of blocks, as a read by a wrong extent gives,
+// either fails with ErrCorrupt or decodes to strictly increasing keys. The
+// checksum of each block the walk finds is fixed up so the fuzzer reaches
+// the decoder behind it. Seeds: blocks of every kind the walk knows.
+func FuzzDecodeBlocks(f *testing.F) {
+	rng := rand.New(rand.NewPCG(13, 14))
+	entries := putEntries(randKeys(rng, 60, 'A'))
+	entries[7].Value = bytes.Repeat([]byte{1}, LargeValueBytes)
+	entries[9].Value = make([]byte, 140<<10) // a frame of several zstd blocks, RLE among them
+	for i := range 64 << 10 {
+		entries[9].Value[i] = byte(rng.IntN(256))
+	}
+	data, meta, err := BuildTableOptions(entries, Options{BlockBytes: 256, Spaces: map[byte]SpacePolicy{'A': {Raw: true}}})
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(data[:meta.IndexOff])
+	tb, err := OpenTableAt(context.Background(), BytesSource(data), meta)
+	if err != nil {
+		f.Fatal(err)
+	}
+	for i := range len(tb.index) {
+		off, length := tb.BlockExtent(i)
+		f.Add(data[off : off+length])
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		for p := data; ; {
+			n, _, err := blockLen(p)
+			if err != nil || n > len(p) {
+				break
+			}
+			binary.BigEndian.PutUint32(p, crc32.Checksum(p[4:n], castagnoli))
+			p = p[n:]
+		}
+		es, err := DecodeBlocks(data)
+		if err != nil {
+			if !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("error %v does not wrap ErrCorrupt", err)
+			}
+			return
+		}
+		for i := 1; i < len(es); i++ {
+			if bytes.Compare(es[i-1].Key, es[i].Key) >= 0 {
+				t.Fatalf("keys %x, %x not increasing", es[i-1].Key, es[i].Key)
+			}
+		}
+	})
+}
+
 // TestSingleLocatesStoredValues: Single finds, from the index alone, the
 // extent of a value that is alone in a stored block, and declines a value
 // that shares its block or sits in a compressed one. Large values of every
@@ -754,5 +808,124 @@ func TestNoFilterSpace(t *testing.T) {
 				t.Fatalf("%s: get %x: %v %v", name, e.Key, ok, err)
 			}
 		}
+	}
+}
+
+// TestDecodeBlocksWalksTables: walking a table's blocks from their own
+// bytes finds exactly the extents its index holds, in tables of small
+// compressed blocks, stored large values, frames of several zstd blocks
+// (RLE among them) and over 1 MiB, and a block whose frame names no
+// content size; the blocks decode to what the table iterates, and a
+// flipped byte anywhere in a block fails it. LSM_TABLE_DIR names a
+// directory of tables to walk as well, every file that ends in a table
+// magic (go test -run TestDecodeBlocksWalksTables -v with it set).
+func TestDecodeBlocksWalksTables(t *testing.T) {
+	ctx := context.Background()
+	rng := rand.New(rand.NewPCG(11, 12))
+	tables := scanTables(t)
+	// A quarter random, then zeros: zstd halves it. The random part and
+	// the entry's header end within the first 128 KiB zstd block, so the
+	// next is all zeros, which zstd writes as RLE.
+	large := func(n int) []byte {
+		v := make([]byte, n)
+		for i := range min(n/4, 128<<10-64) {
+			v[i] = byte(rng.IntN(256))
+		}
+		return v
+	}
+	for name, c := range map[string]struct {
+		entries []Entry
+		o       Options
+	}{
+		"raw values":  {putEntries(randKeys(rng, 40, 'R')), Options{BlockBytes: 512, Spaces: map[byte]SpacePolicy{'R': {Raw: true}}}},
+		"long frames": {[]Entry{{Key: []byte("L1"), Kind: KindPut, Value: large(300 << 10)}, {Key: []byte("L2"), Kind: KindPut, Value: large(3 << 20)}}, Options{}},
+		"tiny block":  {[]Entry{{Key: []byte("T"), Kind: KindPut, Value: bytes.Repeat([]byte("ab"), 40)}}, Options{}},
+	} {
+		for i := range c.entries {
+			if name == "raw values" && i%3 == 0 {
+				c.entries[i].Value = large(LargeValueBytes + i)
+			}
+		}
+		data, _, err := BuildTableOptions(c.entries, c.o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tables[name] = data
+	}
+	if h := new(zstd.Header); h.Decode(tables["tiny block"][5:]) != nil || tables["tiny block"][4] != blockZstd || h.HasFCS {
+		t.Fatal("the tiny block's frame names its content size: the test lost that case")
+	}
+	walk := func(name string, data []byte, flips bool) {
+		meta := tableMetaOf(t, data)
+		tb, err := OpenTableAt(ctx, BytesSource(data), meta)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		var i int
+		var entries int64
+		for at := int64(0); at < meta.IndexOff; i++ {
+			n, _, err := blockLen(data[at:meta.IndexOff])
+			if err != nil {
+				t.Fatalf("%s: block %d at %d: %v", name, i, at, err)
+			}
+			if off, length := tb.BlockExtent(i); i >= len(tb.index) || off != at || length != int64(n) {
+				t.Fatalf("%s: block %d walks to %d+%d, index has %d+%d", name, i, at, n, off, length)
+			}
+			block := data[at : at+int64(n)]
+			es, err := DecodeBlocks(block)
+			if err != nil {
+				t.Fatalf("%s: block %d: %v", name, i, err)
+			}
+			entries += int64(len(es))
+			for j := 0; flips && j < len(block); j += 1 + j/64 {
+				bad := bytes.Clone(block)
+				bad[j] ^= 0x10
+				if _, err := DecodeBlocks(bad); !errors.Is(err, ErrCorrupt) {
+					t.Fatalf("%s: block %d with byte %d flipped: %v", name, i, j, err)
+				}
+			}
+			at += int64(n)
+		}
+		if count := int64(binary.BigEndian.Uint64(data[len(data)-footerBytes+16:])); i != len(tb.index) || entries != count {
+			t.Fatalf("%s: walked %d blocks of %d entries, index has %d blocks of %d", name, i, entries, len(tb.index), count)
+		}
+		t.Logf("%s: %d blocks of %d entries", name, i, entries)
+	}
+	for name, data := range tables {
+		walk(name, data, true)
+		tb := openBytes(t, data)
+		all, err := DecodeBlocks(data[:tableMetaOf(t, data).IndexOff])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := collect(t, tb.Iter(ctx)); !reflect.DeepEqual(all, want) {
+			t.Fatalf("%s: blocks decode to %d entries, the table iterates %d", name, len(all), len(want))
+		}
+	}
+	dir := os.Getenv("LSM_TABLE_DIR")
+	if dir == "" {
+		return
+	}
+	walked := 0
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if len(data) < footerBytes {
+			return nil
+		}
+		switch string(data[len(data)-4:]) {
+		case tableMagic, fullKeysMagic, unfilteredMagic, legacyMagic:
+			walk(path, data, false)
+			walked++
+		}
+		return nil
+	})
+	if err != nil || walked == 0 {
+		t.Fatalf("%s: %d tables walked: %v", dir, walked, err)
 	}
 }

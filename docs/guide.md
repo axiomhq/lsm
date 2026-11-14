@@ -46,6 +46,10 @@ bytes in memory.
 - `t.Span(lo, hi)` returns the block indexes of a table that may hold keys in
   `[lo, hi)`, from the in-memory index alone. That's enough to build a cache
   key for a range without reading any blocks.
+- `lsm.DecodeBlocks(data)` decodes a run of whole blocks read by extent,
+  without opening the table: each block's end comes from its own bytes and
+  its checksum is verified. The extents come from `SpacePolicy.Placed`, or
+  from `t.BlockExtent(i)`.
 
 ## Merging
 

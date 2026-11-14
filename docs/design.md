@@ -72,6 +72,14 @@ the block is stored raw.
 A block that is one large value is stored raw unless zstd at least halves
 it, so dense vectors stay readable by extent (`Table.Single`).
 
+A block's length is stored only in the index, but a block also delimits
+itself: a zstd frame's block headers carry their sizes and a last-block bit,
+and a stored block is its entry count and length-prefixed entries.
+`DecodeBlocks` walks a run of blocks this way with no index, then checks each
+block's crc32c. A space with `SpacePolicy.Placed` is told, as a flush or a
+compaction writes it, the table sequence and block extent of each entry, so a
+reader can keep those extents and read them without opening the table.
+
 The key filter is a bloom filter at 10 bits per key, which gives about 1%
 false positives. A point lookup of a key that a table doesn't hold reads no
 blocks from it, so a key written once costs one block read, however deep

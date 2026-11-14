@@ -1,11 +1,13 @@
 package lsm
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math"
 	"math/rand/v2"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 )
@@ -395,5 +397,185 @@ func TestNewRunMovesSortedRun(t *testing.T) {
 				t.Fatalf("%s: got %q %v %v", want.Key, got, ok, err)
 			}
 		}
+	}
+}
+
+// TestPlacedExtentsReadBack: flushes and the merges the tiered picker
+// runs over them (several runs merged into one, Workers at once, put whole
+// or streamed) tell
+// SpacePolicy.Placed where every entry of a reporting space lands. In
+// every table of the final version, a flushed one too, each reported
+// extent read alone decodes (DecodeBlocks) to exactly the entries reported
+// in it, with the table's values (in level 0, other spaces' entries may
+// share a block); every entry of a reporting space is reported, at the
+// block the index puts it in; a group's blocks are one contiguous run
+// holding no other group; and a space without Placed reports nothing.
+func TestPlacedExtentsReadBack(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprint("stream=", stream), func(t *testing.T) {
+			type placement struct {
+				key       string
+				off, size int64
+			}
+			ctx := context.Background()
+			rng := rand.New(rand.NewPCG(4, 4))
+			st := newMemStore()
+			var mu sync.Mutex
+			placed := map[uint64][]placement{} // by table seq
+			report := func(seq uint64, off, length int64, keys [][]byte) {
+				mu.Lock()
+				defer mu.Unlock()
+				for _, k := range keys {
+					placed[seq] = append(placed[seq], placement{string(k), off, length})
+				}
+			}
+			group := func(key []byte) int { return 3 }
+			o := Options{L0Trigger: 4, MaxRuns: 2, FileBytes: 64 << 10, BlockBytes: 1024, Workers: 4, Spaces: map[byte]SpacePolicy{
+				'V': {Raw: true, Placed: report},
+				'P': {Group: group, Placed: report},
+			}}
+			if stream {
+				o.Stream = streaming(st.put)
+			}
+			vKeys, pKeys, xKeys := randKeys(rng, 300, 'V'), randKeys(rng, 600, 'P'), randKeys(rng, 200, 'X')
+			for _, k := range pKeys { // 20 groups
+				k[1], k[2] = 0, byte(rng.IntN(20))
+			}
+			slices.SortFunc(pKeys, bytes.Compare)
+			pKeys = slices.CompactFunc(pKeys, bytes.Equal)
+			value := func(key []byte) []byte {
+				if key[0] == 'V' && rng.IntN(3) == 0 {
+					v := make([]byte, LargeValueBytes+rng.IntN(512))
+					for i := range v {
+						v[i] = byte(rng.IntN(256))
+					}
+					return v
+				}
+				return fmt.Appendf(nil, "%x-%d", key, rng.IntN(1000))
+			}
+			var v Version
+			merges := 0
+			for round := range 25 {
+				var batch []Entry
+				for _, keys := range [][][]byte{vKeys, pKeys, xKeys} {
+					for _, k := range keys {
+						switch r := rng.IntN(10); {
+						case r == 0:
+							batch = append(batch, Entry{Key: k, Kind: KindDelete})
+						case r < 4:
+							batch = append(batch, Entry{Key: k, Kind: KindPut, Value: value(k)})
+						}
+					}
+				}
+				slices.SortFunc(batch, func(a, b Entry) int { return bytes.Compare(a.Key, b.Key) })
+				var err error
+				if v, _, err = Flush(ctx, v, batch, o, st.put); err != nil {
+					t.Fatal(err)
+				}
+				for round < 24 { // the last flush stays in level 0
+
+					j, ok := Pick(v, o)
+					if !ok {
+						break
+					}
+					if !j.NewRun {
+						merges++
+					}
+					if v, _, err = Compact(ctx, v, j, o, st.reader(), st.put); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if merges == 0 {
+				t.Fatal("no merge of runs")
+			}
+			tables, stored, shared := 0, 0, 0
+			for _, level := range v.Levels {
+				for _, f := range level {
+					tables++
+					data := st.objects[f.Key]
+					tb, err := OpenTableAt(ctx, BytesSource(data), f.TableMeta)
+					if err != nil {
+						t.Fatal(err)
+					}
+					reps := placed[f.Seq]
+					at := map[string]placement{}
+					byExtent := map[[2]int64][]string{}
+					for _, p := range reps {
+						if _, dup := at[p.key]; dup {
+							t.Fatalf("%s: %x reported twice", f.Key, p.key)
+						}
+						at[p.key] = p
+						byExtent[[2]int64{p.off, p.size}] = append(byExtent[[2]int64{p.off, p.size}], p.key)
+					}
+					for ext, keys := range byExtent {
+						all, err := DecodeBlocks(data[ext[0] : ext[0]+ext[1]])
+						if err != nil {
+							t.Fatalf("%s: extent %v: %v", f.Key, ext, err)
+						}
+						// A level-0 block may hold other spaces' entries too.
+						got := slices.DeleteFunc(all, func(e Entry) bool { return e.Key[0] == 'X' })
+						if got[0].Key[0] == 'P' && len(got) != len(all) {
+							t.Fatalf("%s: extent %v holds group %x and another space", f.Key, ext, got[0].Key[:3])
+						}
+						if len(got) != len(keys) {
+							t.Fatalf("%s: extent %v holds %d entries, reported %d", f.Key, ext, len(got), len(keys))
+						}
+						if data[ext[0]+4] == blockStored && len(got) == 1 && len(got[0].Value) >= LargeValueBytes {
+							stored++
+						} else if len(got) > 1 {
+							shared++
+						}
+						if got[0].Key[0] == 'P' && !bytes.Equal(got[0].Key[:3], got[len(got)-1].Key[:3]) {
+							t.Fatalf("%s: extent %v holds groups %x and %x", f.Key, ext, got[0].Key[:3], got[len(got)-1].Key[:3])
+						}
+						for i, e := range got {
+							if string(e.Key) != keys[i] {
+								t.Fatalf("%s: extent %v entry %d is %x, reported %x", f.Key, ext, i, e.Key, keys[i])
+							}
+							want, ok, err := tb.Get(ctx, e.Key)
+							if !ok || err != nil || want.Kind != e.Kind || !bytes.Equal(want.Value, e.Value) {
+								t.Fatalf("%s: %x reads %v, table has %v %v %v", f.Key, e.Key, e, want, ok, err)
+							}
+						}
+					}
+					n := 0
+					lastOf := map[string]int64{} // a group's extent end so far
+					it := tb.Iter(ctx)
+					for ok := it.SeekGE(nil); ok; ok = it.Next() {
+						k := it.Key()
+						p, reported := at[string(k)]
+						if k[0] == 'X' {
+							if reported {
+								t.Fatalf("%s: %x of a space without Placed reported", f.Key, k)
+							}
+							continue
+						}
+						n++
+						i := tb.blockFor(k)
+						if off, size := tb.BlockExtent(i); !reported || p.off != off || p.size != size {
+							t.Fatalf("%s: %x reported %v, its block is %d+%d", f.Key, k, p, off, size)
+						}
+						if k[0] == 'P' {
+							g := string(k[:3])
+							if end, seen := lastOf[g]; seen && p.off != end && p.off+p.size != end {
+								t.Fatalf("%s: group %x's blocks are not contiguous", f.Key, g)
+							}
+							lastOf[g] = p.off + p.size
+						}
+					}
+					if err := it.Err(); err != nil {
+						t.Fatal(err)
+					}
+					if n != len(reps) {
+						t.Fatalf("%s: %d entries of reporting spaces, %d reported", f.Key, n, len(reps))
+					}
+				}
+			}
+			if tables < 3 || stored == 0 || shared == 0 {
+				t.Fatalf("%d tables, %d stored large values, %d shared blocks", tables, stored, shared)
+			}
+			t.Logf("%d tables, %d merges, %d stored large values, %d shared blocks", tables, merges, stored, shared)
+		})
 	}
 }

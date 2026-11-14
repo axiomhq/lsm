@@ -239,6 +239,14 @@ type TableWriter struct {
 	idx        int64                // index bytes of the closed blocks
 	hashes     []uint64             // keyHash of every key, for the filter
 	policies   map[byte]SpacePolicy // the spaces with a Group, Raw or NoFilter; nil: none
+	// seq is the table's sequence, for SpacePolicy.Placed; placedBy is
+	// each space's Placed (nil: no space has one), placed the extent in raw
+	// of each key of such a space, reported with keys (scratch) once its
+	// block is written.
+	seq      uint64
+	placedBy *[256]func(seq uint64, off, length int64, keys [][]byte)
+	placed   [][2]int
+	keys     [][]byte
 	// sink, when set, takes each closed block and the index as they are
 	// written, so out holds one block: base is the bytes it took, err its
 	// first write error.
@@ -303,6 +311,9 @@ func (w *TableWriter) Add(e Entry) error {
 		w.first = append(w.first[:0], e.Key...)
 	}
 	w.raw = binary.AppendUvarint(w.raw, uint64(len(e.Key)))
+	if w.placedBy != nil && w.placedBy[e.Key[0]] != nil {
+		w.placed = append(w.placed, [2]int{len(w.raw), len(w.raw) + len(e.Key)})
+	}
 	w.raw = append(w.raw, e.Key...)
 	w.raw = append(w.raw, byte(e.Kind))
 	w.raw = binary.AppendUvarint(w.raw, uint64(len(e.Value)))
@@ -416,7 +427,16 @@ func (w *TableWriter) flushBlock() {
 	w.index = append(w.index, blockIndex{off: off, length: int64(len(w.out) - at), rawLen: int64(len(raw)),
 		first: bytes.Clone(w.first), last: bytes.Clone(w.last)})
 	w.idx += indexEntry(w.first, w.last)
-	w.raw, w.n = w.raw[:0], 0
+	// A block's keys of one space are consecutive: one call per space.
+	for i := 0; i < len(w.placed); {
+		space := w.raw[w.placed[i][0]]
+		w.keys = w.keys[:0]
+		for ; i < len(w.placed) && w.raw[w.placed[i][0]] == space; i++ {
+			w.keys = append(w.keys, w.raw[w.placed[i][0]:w.placed[i][1]])
+		}
+		w.placedBy[space](w.seq, off, int64(len(w.out)-at), w.keys)
+	}
+	w.raw, w.n, w.placed = w.raw[:0], 0, w.placed[:0]
 	w.spill(false)
 }
 
@@ -473,6 +493,12 @@ func NewTableWriterOptions(o Options) *TableWriter {
 				w.policies = map[byte]SpacePolicy{}
 			}
 			w.policies[s] = p
+		}
+		if p.Placed != nil {
+			if w.placedBy == nil {
+				w.placedBy = new([256]func(uint64, int64, int64, [][]byte))
+			}
+			w.placedBy[s] = p.Placed
 		}
 	}
 	return w
@@ -706,6 +732,102 @@ func (t *Table) readBlock(ctx context.Context, i int) (*Block, error) {
 	return b, nil
 }
 
+// DecodeBlocks decodes data, a run of whole blocks of a table read by
+// extent (SpacePolicy.Placed, Table.BlockExtent), with no index: each
+// block's end is read from the block itself (a zstd frame's block headers,
+// a stored block's entries), its checksum is verified, and keys must
+// increase across blocks as within one. Entries alias data or the blocks'
+// decoded bytes. Every failure wraps ErrCorrupt.
+func DecodeBlocks(data []byte) ([]Entry, error) {
+	if len(data) == 0 {
+		return nil, fmt.Errorf("%w: lsm: no block", ErrCorrupt)
+	}
+	var out []Entry
+	for len(data) > 0 {
+		n, rawLen, err := blockLen(data)
+		if err != nil {
+			return nil, err
+		}
+		b, err := decodeBlock(data[:n], rawLen)
+		if err != nil {
+			return nil, err
+		}
+		if len(out) > 0 && bytes.Compare(out[len(out)-1].Key, b.key(0)) >= 0 {
+			return nil, fmt.Errorf("%w: lsm: blocks out of order", ErrCorrupt)
+		}
+		for i := range b.offs {
+			out = append(out, b.entry(i))
+		}
+		data = data[n:]
+	}
+	return out, nil
+}
+
+// blockLen is the length of the block data starts with, and its raw length
+// (-1: its frame does not say), read from the block's own bytes. A zstd
+// frame is its header, then blocks of a 3-byte header (last flag, type,
+// size) and content, then a checksum if the header says so; an RLE
+// block's size is what it decodes to, its content one byte. A stored block
+// is its entry count and its entries.
+func blockLen(data []byte) (int, int64, error) {
+	if len(data) < 6 {
+		return 0, 0, fmt.Errorf("%w: lsm: block header", ErrCorrupt)
+	}
+	p := data[5:]
+	switch data[4] {
+	case blockZstd:
+		var h zstd.Header
+		if err := h.Decode(p); err != nil || h.Skippable {
+			return 0, 0, fmt.Errorf("%w: lsm: zstd frame header", ErrCorrupt)
+		}
+		at := h.HeaderSize
+		for last := false; !last; {
+			if len(p)-at < 3 {
+				return 0, 0, fmt.Errorf("%w: lsm: zstd frame truncated", ErrCorrupt)
+			}
+			bh := int(p[at]) | int(p[at+1])<<8 | int(p[at+2])<<16
+			size := bh >> 3
+			switch bh >> 1 & 3 {
+			case 1:
+				size = 1
+			case 3:
+				return 0, 0, fmt.Errorf("%w: lsm: zstd block type", ErrCorrupt)
+			}
+			last, at = bh&1 == 1, at+3+size
+		}
+		if h.HasCheckSum {
+			at += 4
+		}
+		if at > len(p) {
+			return 0, 0, fmt.Errorf("%w: lsm: zstd frame truncated", ErrCorrupt)
+		}
+		rawLen := int64(-1)
+		if h.HasFCS && h.FrameContentSize <= MaxBlockBytes {
+			rawLen = int64(h.FrameContentSize)
+		}
+		return 5 + at, rawLen, nil
+	case blockStored:
+		d := decoder{b: p}
+		n := d.uvarint()
+		for i := uint64(0); i < n && d.err == nil; i++ {
+			d.bytes()
+			if len(d.b) == 0 {
+				return 0, 0, errBlockEntry
+			}
+			d.b = d.b[1:] // kind
+			d.bytes()
+		}
+		if d.err != nil {
+			return 0, 0, errBlockEntry
+		}
+		end := len(p) - len(d.b)
+		return 5 + end, int64(end), nil
+	}
+	return 0, 0, fmt.Errorf("%w: lsm: block mode %d", ErrCorrupt, data[4])
+}
+
+// decodeBlock decodes one block of rawLen raw bytes (-1: at most
+// MaxBlockBytes).
 func decodeBlock(stored []byte, rawLen int64) (*Block, error) {
 	if len(stored) < 6 || crc32.Checksum(stored[4:], castagnoli) != binary.BigEndian.Uint32(stored) {
 		return nil, fmt.Errorf("%w: lsm: block checksum", ErrCorrupt)
@@ -714,8 +836,12 @@ func decodeBlock(stored []byte, rawLen int64) (*Block, error) {
 	aliased := false
 	switch stored[4] {
 	case blockZstd:
+		limit := uint64(MaxBlockBytes)
+		if rawLen >= 0 {
+			limit = uint64(rawLen)
+		}
 		var err error
-		if raw, err = DecompressBounded(stored[5:], uint64(rawLen)); err != nil {
+		if raw, err = DecompressBounded(stored[5:], limit); err != nil {
 			return nil, err
 		}
 	case blockStored:
@@ -723,7 +849,7 @@ func decodeBlock(stored []byte, rawLen int64) (*Block, error) {
 	default:
 		return nil, fmt.Errorf("%w: lsm: block mode %d", ErrCorrupt, stored[4])
 	}
-	if int64(len(raw)) != rawLen {
+	if rawLen >= 0 && int64(len(raw)) != rawLen {
 		return nil, fmt.Errorf("%w: lsm: block raw length", ErrCorrupt)
 	}
 	n, at := binary.Uvarint(raw)

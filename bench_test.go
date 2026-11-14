@@ -1,10 +1,12 @@
 package lsm
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
 	"math/rand/v2"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -415,6 +417,132 @@ func BenchmarkOpenTableAt(b *testing.B) {
 		for i := 0; b.Loop(); i++ {
 			if _, ok, err := tb.Get(ctx, lookups[i%len(lookups)]); !ok || err != nil {
 				b.Fatalf("get: %v %v", ok, err)
+			}
+		}
+	})
+}
+
+// BenchmarkMergeRuns merges four overlapping runs of one space into one,
+// in memory: small entries, many a block (P's shape), and large values a
+// block each (V's), with SpacePolicy.Placed off and on (counting the keys
+// it is told).
+func BenchmarkMergeRuns(b *testing.B) {
+	ctx := context.Background()
+	for _, shape := range []struct {
+		name  string
+		space byte
+		runs  int
+		value int
+	}{{"small", 'P', 60_000, 24}, {"large", 'V', 1_500, LargeValueBytes}} {
+		rng := rand.New(rand.NewPCG(5, 5))
+		objects := map[string][]byte{}
+		var v Version
+		var inBytes int64
+		for f := range 4 {
+			var entries []Entry
+			for i := f; i < 4*shape.runs; i += 4 {
+				val := make([]byte, shape.value)
+				for j := range val {
+					val[j] = byte(rng.IntN(16))
+				}
+				entries = append(entries, Entry{Key: binary.BigEndian.AppendUint64([]byte{shape.space, 0, byte(i % 64)}, uint64(i)), Kind: KindPut, Value: val})
+			}
+			slices.SortFunc(entries, func(a, b Entry) int { return bytes.Compare(a.Key, b.Key) })
+			data, meta, err := BuildTable(entries, LargeValueBytes)
+			if err != nil {
+				b.Fatal(err)
+			}
+			key := fmt.Sprint("in/", f)
+			objects[key] = data
+			inBytes += meta.Bytes
+			if v, err = v.Apply(Edit{Add: map[int][]FileRef{0: {{Key: key, Seq: v.NextSeq, TableMeta: meta}}}}); err != nil {
+				b.Fatal(err)
+			}
+		}
+		r := Reader{Open: func(ctx context.Context, f FileRef) (*Table, error) {
+			return OpenTableAt(ctx, BytesSource(objects[f.Key]), f.TableMeta)
+		}}
+		put := func(context.Context, int, uint64, []byte) (string, error) { return "out", nil }
+		for _, on := range []bool{false, true} {
+			b.Run(fmt.Sprintf("%s/placed=%v", shape.name, on), func(b *testing.B) {
+				var placed atomic.Int64
+				p := SpacePolicy{Raw: true}
+				if on {
+					p.Placed = func(_ uint64, _, _ int64, keys [][]byte) { placed.Add(int64(len(keys))) }
+				}
+				o := Options{BlockBytes: LargeValueBytes, Workers: 1, Uploads: -1, Spaces: map[byte]SpacePolicy{shape.space: p}}
+				j := v.job(0, v.Levels[0], o)
+				b.SetBytes(inBytes)
+				for b.Loop() {
+					if _, _, err := Compact(ctx, v, j, o, r, put); err != nil {
+						b.Fatal(err)
+					}
+				}
+				if on && placed.Load() == 0 {
+					b.Fatal("nothing placed")
+				}
+			})
+		}
+	}
+}
+
+// BenchmarkGroupRead reads one group of a grouped table, about 16 blocks
+// of 4 KiB, whole: through the open table's index, a block read and
+// decode each, and as one extent DecodeBlocks walks.
+func BenchmarkGroupRead(b *testing.B) {
+	ctx := context.Background()
+	rng := rand.New(rand.NewPCG(6, 6))
+	var entries []Entry
+	for g := range 64 {
+		for i := range 1500 {
+			val := make([]byte, 24)
+			for j := range val {
+				val[j] = byte(rng.IntN(16))
+			}
+			entries = append(entries, Entry{Key: binary.BigEndian.AppendUint32([]byte{'P', 0, byte(g)}, uint32(i)), Kind: KindPut, Value: val})
+		}
+	}
+	data, meta, err := BuildTableOptions(entries, Options{BlockBytes: LargeValueBytes, Spaces: map[byte]SpacePolicy{'P': {Group: func([]byte) int { return 3 }}}})
+	if err != nil {
+		b.Fatal(err)
+	}
+	tb, err := OpenTableAt(ctx, BytesSource(data), meta)
+	if err != nil {
+		b.Fatal(err)
+	}
+	first, last, _ := tb.Span([]byte{'P', 0, 7}, []byte{'P', 0, 8})
+	off, _ := tb.BlockExtent(first)
+	end, n := tb.BlockExtent(last)
+	end += n
+	b.Logf("%d blocks, %d bytes", last-first+1, end-off)
+	b.Run("index", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			var out []Entry
+			for i := first; i <= last; i++ {
+				blk, err := tb.readBlock(ctx, i)
+				if err != nil {
+					b.Fatal(err)
+				}
+				for j := range blk.offs {
+					out = append(out, blk.entry(j))
+				}
+			}
+			if len(out) != 1500 {
+				b.Fatalf("%d entries", len(out))
+			}
+		}
+	})
+	b.Run("walk", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			ext, err := tb.ReadAt(ctx, off, end-off)
+			if err != nil {
+				b.Fatal(err)
+			}
+			out, err := DecodeBlocks(ext)
+			if err != nil || len(out) != 1500 {
+				b.Fatalf("%d entries: %v", len(out), err)
 			}
 		}
 	})

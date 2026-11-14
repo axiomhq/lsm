@@ -122,6 +122,19 @@ type SpacePolicy struct {
 	// range, where the filter rules nothing out. A table that mixes spaces
 	// keeps a filter over all its keys. Readers read either as before.
 	NoFilter bool
+	// Placed, when set, is told where the entries of the space a writer of
+	// this Options writes land, a block at a time once it is written: seq
+	// is the table's sequence (FileRef.Seq; 0 from BuildTableOptions,
+	// WriteTableOptions and NewTableWriterOptions, whose caller numbers the
+	// table), off and length the block's extent, which DecodeBlocks reads
+	// with no index, and keys the space's keys in the block, in order. A
+	// large value of a Raw space is a block of its own; in level 0 a block
+	// may also hold other spaces' entries. Flush and Compact report every
+	// entry they write, before the table is put, so a call that fails may
+	// report tables that were never stored. Compact calls Placed from
+	// Options.Workers goroutines at once; it must not retain keys or their
+	// bytes.
+	Placed func(seq uint64, off, length int64, keys [][]byte)
 }
 
 // DefaultOptions returns tiered compaction with 4 L0 files, 8 runs and
@@ -197,7 +210,9 @@ type StreamPutter func(ctx context.Context, level int, seq uint64, body io.Reade
 // version holding it. Cost: the entries' own bytes once.
 func Flush(ctx context.Context, v Version, entries []Entry, o Options, put Putter) (Version, FileRef, error) {
 	o = o.withDefaults()
-	data, meta, err := BuildTableOptions(entries, o)
+	w := NewTableWriterOptions(o)
+	w.seq = v.NextSeq
+	data, meta, err := buildTable(entries, w)
 	if err != nil {
 		return Version{}, FileRef{}, err
 	}
@@ -1010,7 +1025,7 @@ func (c *compaction) stream(ctx context.Context, pi int, w *TableWriter) (*strea
 	w.sink = pw
 	f := new(FileRef)
 	c.outputs[pi] = append(c.outputs[pi], f)
-	level, seq := c.j.Level+1, c.seq.Add(1)-1
+	level, seq := c.j.Level+1, w.seq
 	c.puts.Go(func() {
 		if c.uploads != nil {
 			defer func() { <-c.uploads }()
@@ -1076,6 +1091,7 @@ func (c *compaction) writePartition(ctx context.Context, pi int, p partition) (e
 		if err != nil {
 			return err
 		}
+		seq := w.seq
 		w = nil
 		if s := open; s != nil {
 			open = nil
@@ -1102,7 +1118,6 @@ func (c *compaction) writePartition(ctx context.Context, pi int, p partition) (e
 		}
 		f := new(FileRef)
 		c.outputs[pi] = append(c.outputs[pi], f)
-		seq := c.seq.Add(1) - 1
 		up := func() (err error) {
 			*f, err = publish(ctx, c.j.Level+1, seq, c.oldest, data, meta, c.put)
 			return err
@@ -1138,6 +1153,7 @@ func (c *compaction) writePartition(ctx context.Context, pi int, p partition) (e
 		}
 		if w == nil {
 			w = NewTableWriterOptions(c.o)
+			w.seq = c.seq.Add(1) - 1 // before its blocks, for Placed
 			space = e.Key[0]
 			if c.o.Stream != nil {
 				if open, err = c.stream(ctx, pi, w); err != nil {
