@@ -18,4 +18,5 @@ jobs:
       - run: go test -race ./...
       - run: go test -run '^$' -fuzz FuzzOpenTable -fuzztime 10s
       - run: go test -run '^$' -fuzz FuzzDecodeBlock -fuzztime 10s
+      - run: go test -run '^$' -fuzz FuzzWalkBlocks -fuzztime 10s
       - run: cd setmerge && go test -run '^$' -fuzz FuzzDecodeOperand -fuzztime 10s

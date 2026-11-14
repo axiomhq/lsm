@@ -463,11 +463,11 @@ func FuzzOpenTable(f *testing.F) {
 	})
 }
 
-// FuzzDecodeBlocks: a run of blocks, as a read by a wrong extent gives,
+// FuzzWalkBlocks: a run of blocks, as a read by a wrong extent gives,
 // either fails with ErrCorrupt or decodes to strictly increasing keys. The
 // checksum of each block the walk finds is fixed up so the fuzzer reaches
 // the decoder behind it. Seeds: blocks of every kind the walk knows.
-func FuzzDecodeBlocks(f *testing.F) {
+func FuzzWalkBlocks(f *testing.F) {
 	rng := rand.New(rand.NewPCG(13, 14))
 	entries := putEntries(randKeys(rng, 60, 'A'))
 	entries[7].Value = bytes.Repeat([]byte{1}, LargeValueBytes)
