@@ -548,6 +548,16 @@ func FuzzDecodeBlock(f *testing.F) {
 		if len(stored) >= 4 {
 			binary.BigEndian.PutUint32(stored, crc32.Checksum(stored[4:], castagnoli))
 		}
+		// DecodeBlock bounds the raw length by MaxBlockBytes instead.
+		if d, err := DecodeBlock(stored); err != nil && !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("DecodeBlock error %v does not wrap ErrCorrupt", err)
+		} else if err == nil {
+			for i := range d.Len() {
+				if e := d.Entry(i); i > 0 && bytes.Compare(d.Entry(i-1).Key, e.Key) >= 0 {
+					t.Fatalf("DecodeBlock keys %x, %x not increasing", d.Entry(i-1).Key, e.Key)
+				}
+			}
+		}
 		b, err := decodeBlock(stored, rawLen)
 		if err != nil {
 			if !errors.Is(err, ErrCorrupt) {

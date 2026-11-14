@@ -91,6 +91,11 @@ returns `lsm.ErrStale`. Delete your outputs and pick again.
 - `Options.Uploads` (defaults to `Workers`) caps how many finished output
   files are being put at once. A merge hands a file to `put` and moves on,
   and `Compact` returns once every put has finished.
+- `SpacePolicy.Group` keeps each group of a space in one block: since
+  v0.16.0 a grouped space writes each group as one block, up to
+  `MaxBlockBytes`, whatever `BlockBytes` says, so `DecodeBlock` reads a
+  group from its extent alone. Before, a group only stayed out of other
+  groups' blocks.
 - `Options.MaxTableAge` bounds how long a delete or overwrite can wait above
   the bottom level, which is where the versions it supersedes get dropped.
 
