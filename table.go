@@ -595,7 +595,11 @@ func OpenTableAt(ctx context.Context, src Source, meta TableMeta) (*Table, error
 	if blocks == 0 || blocks > uint64(n)/7 { // an index entry is at least 7 bytes
 		return nil, fmt.Errorf("%w: lsm: table index blocks", ErrCorrupt)
 	}
-	t.index = make([]blockIndex, 0, blocks) // blocks <= n/7: about 10 bytes an index byte
+	// blocks is only bounded by IndexLen/7, 72 bytes of entries for 7 of
+	// index: up to 18 MiB of entries are made at once, and past them the
+	// index doubles as entries validate (append's quarter steps cost twice
+	// the open time in page faults).
+	t.index = make([]blockIndex, 0, min(blocks, 1<<18))
 	var prevEnd int64
 	var prevLast []byte
 	for range blocks {
@@ -619,6 +623,9 @@ func OpenTableAt(ctx context.Context, src Source, meta TableMeta) (*Table, error
 			return nil, fmt.Errorf("%w: lsm: table index block", ErrCorrupt)
 		}
 		prevEnd, prevLast = b.off+b.length, b.last
+		if len(t.index) == cap(t.index) {
+			t.index = append(make([]blockIndex, 0, min(2*uint64(len(t.index)), blocks)), t.index...)
+		}
 		t.index = append(t.index, b)
 	}
 	if m == tableMagic || m == fullKeysMagic {

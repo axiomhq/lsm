@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"math"
+	"math/bits"
 	"math/rand/v2"
 	"reflect"
 	"slices"
@@ -313,8 +314,8 @@ func TestIndexKeysSharePrefixes(t *testing.T) {
 }
 
 // TestOpenTableAllocs: opening a table allocates its index and keys a few
-// times, not once a block, in the current format and the one with whole
-// keys.
+// times plus one a doubling of its block count, not once a block, in the
+// current format and the one with whole keys.
 func TestOpenTableAllocs(t *testing.T) {
 	data, meta, err := BuildTable(putEntries(randKeys(rand.New(rand.NewPCG(5, 6)), 4000, 'A')), 64)
 	if err != nil {
@@ -331,7 +332,7 @@ func TestOpenTableAllocs(t *testing.T) {
 			t.Fatal(err)
 		}
 		allocs := testing.AllocsPerRun(10, func() { OpenTableAt(ctx, BytesSource(tc.data), tc.meta) })
-		if len(tb.index) < 1000 || allocs > 10 {
+		if len(tb.index) < 1000 || allocs > float64(10+bits.Len(uint(len(tb.index)))) {
 			t.Fatalf("%v allocations to open %d blocks", allocs, len(tb.index))
 		}
 	}
