@@ -77,7 +77,10 @@ false positives. A point lookup of a key that a table doesn't hold reads no
 blocks from it, so a key written once costs one block read, however deep
 level 0 gets. Below level 0, a point lookup binary-searches each level for its
 one candidate file, so its cost grows with the number of levels, not the
-number of files.
+number of files. A space read only by key range can set
+`SpacePolicy.NoFilter`: a table that holds that space alone then carries a
+one-block filter that holds every key, since a full one would rule nothing
+out.
 
 Every read verifies checksums. Corrupt bytes return an error that wraps
 `lsm.ErrCorrupt`. `lsm.DecompressBounded(data, limit)` exposes the
