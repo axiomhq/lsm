@@ -590,12 +590,12 @@ func OpenTableAt(ctx context.Context, src Source, meta TableMeta) (*Table, error
 		return nil, fmt.Errorf("%w: lsm: table index checksum", ErrCorrupt)
 	}
 	t := &Table{src: src}
-	d := decoder{b: idx}
+	d := decoder{b: idx, chunk: int(n)}
 	blocks := d.uvarint()
 	if blocks == 0 || blocks > uint64(n)/7 { // an index entry is at least 7 bytes
 		return nil, fmt.Errorf("%w: lsm: table index blocks", ErrCorrupt)
 	}
-	t.index = make([]blockIndex, 0, min(blocks, 1<<12)) // blocks is only bounded by IndexLen/7: let append grow it
+	t.index = make([]blockIndex, 0, blocks) // blocks <= n/7: about 10 bytes an index byte
 	var prevEnd int64
 	var prevLast []byte
 	for range blocks {
@@ -607,8 +607,8 @@ func OpenTableAt(ctx context.Context, src Source, meta TableMeta) (*Table, error
 			b.last = d.shared(b.first)
 		} else {
 			b = blockIndex{off: int64(d.uvarint()), length: int64(d.uvarint()), rawLen: int64(d.uvarint())}
-			b.first = bytes.Clone(d.bytes())
-			b.last = bytes.Clone(d.bytes())
+			b.first = d.key(nil, d.bytes())
+			b.last = d.key(nil, d.bytes())
 		}
 		if d.err != nil {
 			return nil, fmt.Errorf("%w: lsm: table index: %v", ErrCorrupt, d.err)
@@ -1068,6 +1068,10 @@ func (it *TableIter) Err() error    { return it.err }
 type decoder struct {
 	b   []byte
 	err error
+	// keys is the arena key copies its keys into, chunk bytes at a time:
+	// a table's keys take a few allocations, not one each.
+	keys  []byte
+	chunk int
 }
 
 func (d *decoder) uvarint() uint64 {
@@ -1104,5 +1108,21 @@ func (d *decoder) shared(prev []byte) []byte {
 	if d.err != nil {
 		return nil
 	}
-	return append(prev[:n:n], rest...)
+	if len(rest) == 0 {
+		return prev[:n:n]
+	}
+	return d.key(prev[:n], rest)
+}
+
+// key copies prefix then rest into the arena. A key is at most the index
+// bytes, the chunk size, so a chunk is allocated only once the keys
+// decoded so far fill the one before it.
+func (d *decoder) key(prefix, rest []byte) []byte {
+	n := len(prefix) + len(rest)
+	if cap(d.keys)-len(d.keys) < n {
+		d.keys = make([]byte, 0, d.chunk)
+	}
+	at := len(d.keys)
+	d.keys = append(append(d.keys, prefix...), rest...)
+	return d.keys[at:len(d.keys):len(d.keys)]
 }

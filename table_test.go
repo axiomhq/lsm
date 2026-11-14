@@ -312,6 +312,31 @@ func TestIndexKeysSharePrefixes(t *testing.T) {
 	}
 }
 
+// TestOpenTableAllocs: opening a table allocates its index and keys a few
+// times, not once a block, in the current format and the one with whole
+// keys.
+func TestOpenTableAllocs(t *testing.T) {
+	data, meta, err := BuildTable(putEntries(randKeys(rand.New(rand.NewPCG(5, 6)), 4000, 'A')), 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, oldMeta := wholeKeys(t, data, meta, fullKeysMagic, true)
+	ctx := context.Background()
+	for _, tc := range []struct {
+		data []byte
+		meta TableMeta
+	}{{data, meta}, {old, oldMeta}} {
+		tb, err := OpenTableAt(ctx, BytesSource(tc.data), tc.meta)
+		if err != nil {
+			t.Fatal(err)
+		}
+		allocs := testing.AllocsPerRun(10, func() { OpenTableAt(ctx, BytesSource(tc.data), tc.meta) })
+		if len(tb.index) < 1000 || allocs > 10 {
+			t.Fatalf("%v allocations to open %d blocks", allocs, len(tb.index))
+		}
+	}
+}
+
 // countingSource counts the block reads a lookup makes.
 type countingSource struct {
 	BytesSource

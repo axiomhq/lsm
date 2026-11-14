@@ -364,3 +364,58 @@ func BenchmarkRuns(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkOpenTableAt opens a table of 240,000 blocks of two entries,
+// keys a space byte and big-endian integers, as a vector index's are:
+// adjacent keys share all but their last byte or two. Span and Get look
+// keys up through the index it decodes.
+func BenchmarkOpenTableAt(b *testing.B) {
+	const blocks = 240_000
+	ctx := context.Background()
+	key := func(i int) []byte {
+		return binary.BigEndian.AppendUint64(binary.BigEndian.AppendUint32([]byte{'V'}, 3), uint64(i))
+	}
+	entries := make([]Entry, 2*blocks)
+	for i := range entries {
+		entries[i] = Entry{Key: key(i), Kind: KindPut, Value: make([]byte, 16)}
+	}
+	data, meta, err := BuildTable(entries, 64)
+	if err != nil {
+		b.Fatal(err)
+	}
+	tb, err := OpenTableAt(ctx, BytesSource(data), meta)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if len(tb.index) != blocks {
+		b.Fatalf("%d blocks, want %d", len(tb.index), blocks)
+	}
+	b.Run("open", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := OpenTableAt(ctx, BytesSource(data), meta); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	rng := rand.New(rand.NewPCG(3, 4))
+	lookups, next := make([][]byte, 1024), make([][]byte, 1024)
+	for i := range lookups {
+		k := rng.IntN(len(entries))
+		lookups[i], next[i] = key(k), key(k+1)
+	}
+	b.Run("span", func(b *testing.B) {
+		for i := 0; b.Loop(); i++ {
+			if _, _, ok := tb.Span(lookups[i%len(lookups)], next[i%len(next)]); !ok {
+				b.Fatalf("span %x", lookups[i%len(lookups)])
+			}
+		}
+	})
+	b.Run("get", func(b *testing.B) {
+		for i := 0; b.Loop(); i++ {
+			if _, ok, err := tb.Get(ctx, lookups[i%len(lookups)]); !ok || err != nil {
+				b.Fatalf("get: %v %v", ok, err)
+			}
+		}
+	})
+}
