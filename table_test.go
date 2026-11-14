@@ -697,3 +697,36 @@ func TestFitsSplitsBeforeOverflow(t *testing.T) {
 		t.Fatalf("%d small entries finished into %d bytes (%v), want within 90%% of 1 MiB", n, len(data), err)
 	}
 }
+
+// A table of a NoFilter space alone carries a one-block filter that holds
+// every key; a table mixing it with another space keeps a filter over all
+// its keys, the NoFilter space's too. Get finds every key either way.
+func TestNoFilterSpace(t *testing.T) {
+	rng := rand.New(rand.NewPCG(3, 4))
+	o := Options{BlockBytes: 1024, Spaces: map[byte]SpacePolicy{'P': {NoFilter: true}}}
+	p := putEntries(randKeys(rng, 2000, 'P'))
+	mixed := slices.Concat(p, putEntries(randKeys(rng, 2000, 'V')))
+	ctx := context.Background()
+	for name, entries := range map[string][]Entry{"P only": p, "mixed": mixed} {
+		data, meta, err := BuildTableOptions(entries, o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tb, err := OpenTableAt(ctx, BytesSource(data), meta)
+		if err != nil {
+			t.Fatal(err)
+		}
+		whole := bytes.Equal(tb.filter, bytes.Repeat([]byte{0xff}, filterBlockBytes))
+		if whole != (name == "P only") || int64(len(tb.filter)) != map[bool]int64{true: filterBlockBytes, false: filterBytes(int64(len(entries)))}[whole] {
+			t.Fatalf("%s: filter of %d bytes, all ones %v", name, len(tb.filter), whole)
+		}
+		if absent := []byte("P absent"); name == "P only" && !tb.MayContain(absent) {
+			t.Fatalf("%s: the filter rules out a key", name)
+		}
+		for _, e := range p {
+			if got, ok, err := tb.Get(ctx, e.Key); err != nil || !ok || !bytes.Equal(got.Value, e.Value) {
+				t.Fatalf("%s: get %x: %v %v", name, e.Key, ok, err)
+			}
+		}
+	}
+}

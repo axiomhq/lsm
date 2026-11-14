@@ -238,7 +238,7 @@ type TableWriter struct {
 	spaces     []SpaceRange
 	idx        int64                // index bytes of the closed blocks
 	hashes     []uint64             // keyHash of every key, for the filter
-	policies   map[byte]SpacePolicy // the spaces with a Group or Raw; nil: none
+	policies   map[byte]SpacePolicy // the spaces with a Group, Raw or NoFilter; nil: none
 	// sink, when set, takes each closed block and the index as they are
 	// written, so out holds one block: base is the bytes it took, err its
 	// first write error.
@@ -439,6 +439,9 @@ func (w *TableWriter) Finish() ([]byte, TableMeta, error) {
 		prev = b.last
 	}
 	f := buildFilter(w.hashes)
+	if len(w.spaces) == 1 && w.policies[w.spaces[0].Space].NoFilter {
+		f = filter(bytes.Repeat([]byte{0xff}, filterBlockBytes))
+	}
 	idx = binary.AppendUvarint(idx, uint64(len(f)))
 	idx = append(idx, f...)
 	w.meta.IndexOff, w.meta.IndexLen = w.size(), int64(len(idx))
@@ -465,7 +468,7 @@ func NewTableWriterOptions(o Options) *TableWriter {
 	o = o.withDefaults()
 	w := NewTableWriter(o.BlockBytes)
 	for s, p := range o.Spaces {
-		if p.Group != nil || p.Raw {
+		if p.Group != nil || p.Raw || p.NoFilter {
 			if w.policies == nil {
 				w.policies = map[byte]SpacePolicy{}
 			}

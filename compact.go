@@ -117,6 +117,11 @@ type SpacePolicy struct {
 	// whose put a merge above the bottom dropped still counts, so 1 fires
 	// when such tombstones pile up.
 	DeadRatio float64
+	// NoFilter gives a table that holds keys of this space alone a filter
+	// of one block that holds every key, for a space read only by key
+	// range, where the filter rules nothing out. A table that mixes spaces
+	// keeps a filter over all its keys. Readers read either as before.
+	NoFilter bool
 }
 
 // DefaultOptions returns tiered compaction with 4 L0 files, 8 runs and
