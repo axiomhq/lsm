@@ -184,13 +184,34 @@ func TestGroupedSpaceBlocks(t *testing.T) {
 		for g := range 40 {
 			lo := fmt.Appendf(nil, "H%02d", g)
 			first, last, ok := tb.Span(lo, fmt.Appendf(nil, "H%02d", g+1))
-			if !ok {
-				t.Fatalf("%s: group %d spans nothing", name, g)
+			// A group of up to 20 entries of about 37 bytes passes the
+			// 512-byte BlockBytes, and is still one block.
+			if !ok || first != last {
+				t.Fatalf("%s: group %d spans blocks %d..%d (%v)", name, g, first, last, ok)
 			}
-			for i := first; i <= last; i++ {
-				if !bytes.HasPrefix(tb.index[i].first, lo) {
-					t.Fatalf("%s: group %d's span holds block %d of %q", name, g, i, tb.index[i].first)
+			off, n := tb.BlockExtent(first)
+			b, err := DecodeBlock(data[off : off+n])
+			if err != nil {
+				t.Fatalf("%s: group %d: %v", name, g, err)
+			}
+			var want []Entry
+			for _, e := range entries {
+				if bytes.HasPrefix(e.Key, lo) {
+					want = append(want, e)
 				}
+			}
+			if b.Len() != len(want) {
+				t.Fatalf("%s: group %d decodes %d entries, want %d", name, g, b.Len(), len(want))
+			}
+			for i, e := range want {
+				if got := b.Entry(i); !bytes.Equal(got.Key, e.Key) || got.Kind != e.Kind || !bytes.Equal(got.Value, e.Value) {
+					t.Fatalf("%s: group %d entry %d: %q, want %q", name, g, i, got.Key, e.Key)
+				}
+			}
+			bad := bytes.Clone(data[off : off+n])
+			bad[len(bad)-1] ^= 1
+			if _, err := DecodeBlock(bad); !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("%s: group %d: a flipped byte gave %v", name, g, err)
 			}
 		}
 		for _, e := range entries {
@@ -211,10 +232,6 @@ func TestGroupedSpaceBlocks(t *testing.T) {
 	boom := errors.New("boom")
 	if _, err := WriteTableOptions(&failAfter{n: len(data) / 2, err: boom}, entries, o); !errors.Is(err, boom) {
 		t.Fatalf("a failing writer gave %v", err)
-	}
-	if plain, _, err := BuildTable(entries, o.BlockBytes); err != nil || len(plain) >= len(data) {
-		// The grouped table has more, smaller blocks: a bigger index.
-		t.Fatalf("an ungrouped table is %d bytes, the grouped one %d (%v)", len(plain), len(data), err)
 	}
 
 	m := newMemStore()

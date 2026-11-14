@@ -324,7 +324,7 @@ func (w *TableWriter) Add(e Entry) error {
 		w.spaces = append(w.spaces, SpaceRange{Space: space, Min: bytes.Clone(e.Key)})
 	}
 	w.last = append(w.last[:0], e.Key...)
-	if large || len(w.raw) >= w.blockBytes {
+	if w.policies[space].Group == nil && (large || len(w.raw) >= w.blockBytes) {
 		w.flushBlock()
 	}
 	return nil
@@ -343,9 +343,13 @@ func (w *TableWriter) bound() int64 {
 // joins reports whether Add would put e in the open block rather than
 // close it first: the value is small, the block has room for it, and its
 // raw bytes stay within MaxBlockBytes.
+// A grouped space's entry joins its group's open block whatever its size,
+// within MaxBlockBytes: a group is one block.
 func (w *TableWriter) joins(e Entry) bool {
-	return w.n > 0 && len(e.Value) < LargeValueBytes && len(w.raw)+len(e.Value) <= w.blockBytes &&
-		int64(len(w.raw))+entryRaw(e)+int64(uvarintLen(uint64(w.n+1))) <= MaxBlockBytes && w.sameGroup(e.Key)
+	if w.n == 0 || int64(len(w.raw))+entryRaw(e)+int64(uvarintLen(uint64(w.n+1))) > MaxBlockBytes || !w.sameGroup(e.Key) {
+		return false
+	}
+	return w.policies[e.Key[0]].Group != nil || len(e.Value) < LargeValueBytes && len(w.raw)+len(e.Value) <= w.blockBytes
 }
 
 // sameGroup reports whether key may share the open block with the last
@@ -696,6 +700,20 @@ func (t *Table) readBlock(ctx context.Context, i int) (*Block, error) {
 	return b, nil
 }
 
+// DecodeBlock decodes one block as a table stores it, from its checksum on,
+// without the table: a reader that keeps a block's extent elsewhere reads
+// it alone. Its decoded size is bounded by MaxBlockBytes, as a block's
+// raw length is in the table index only. Every failure wraps ErrCorrupt.
+func DecodeBlock(stored []byte) (*Block, error) { return decodeBlock(stored, -1) }
+
+// Len is the block's entry count.
+func (b *Block) Len() int { return len(b.offs) }
+
+// Entry is entry i of the block, in key order; it aliases the block.
+func (b *Block) Entry(i int) Entry { return b.entry(i) }
+
+// decodeBlock decodes stored, whose raw length is rawLen, or at most
+// MaxBlockBytes when rawLen is negative.
 func decodeBlock(stored []byte, rawLen int64) (*Block, error) {
 	if len(stored) < 6 || crc32.Checksum(stored[4:], castagnoli) != binary.BigEndian.Uint32(stored) {
 		return nil, fmt.Errorf("%w: lsm: block checksum", ErrCorrupt)
@@ -705,7 +723,11 @@ func decodeBlock(stored []byte, rawLen int64) (*Block, error) {
 	switch stored[4] {
 	case blockZstd:
 		var err error
-		if raw, err = DecompressBounded(stored[5:], uint64(rawLen)); err != nil {
+		limit := uint64(MaxBlockBytes)
+		if rawLen >= 0 {
+			limit = uint64(rawLen)
+		}
+		if raw, err = DecompressBounded(stored[5:], limit); err != nil {
 			return nil, err
 		}
 	case blockStored:
@@ -713,7 +735,7 @@ func decodeBlock(stored []byte, rawLen int64) (*Block, error) {
 	default:
 		return nil, fmt.Errorf("%w: lsm: block mode %d", ErrCorrupt, stored[4])
 	}
-	if int64(len(raw)) != rawLen {
+	if rawLen >= 0 && int64(len(raw)) != rawLen {
 		return nil, fmt.Errorf("%w: lsm: block raw length", ErrCorrupt)
 	}
 	n, at := binary.Uvarint(raw)

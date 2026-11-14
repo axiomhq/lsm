@@ -89,8 +89,10 @@ type SpacePolicy struct {
 	MaxRuns int
 	// Group, when set, is the length of the prefix of a key of the space
 	// that names its group: a table block never holds two groups, nor a
-	// group and another space's keys, so a group's entries in a table are
-	// whole blocks a reader fetches exactly (Table.Span, BlockExtent).
+	// group and another space's keys, and a group's entries are one block,
+	// whatever BlockBytes and LargeValueBytes say, up to MaxBlockBytes, so
+	// a reader fetches a group exactly (Table.Span, BlockExtent) and can
+	// decode it alone (DecodeBlock).
 	// Every table this Options builds keeps it (Flush, Compact,
 	// BuildTableOptions). The cost is an index entry per group a table
 	// holds.
