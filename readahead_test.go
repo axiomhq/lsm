@@ -424,3 +424,75 @@ func TestCompactFailureSettlesReads(t *testing.T) {
 		}
 	}
 }
+
+// TestCompactPartBytes: cutting a merge into one large file at block
+// boundaries changes which files hold the records, not which records the
+// version holds, and never cuts inside a group.
+func TestCompactPartBytes(t *testing.T) {
+	ctx := context.Background()
+	group := func(key []byte) int { return min(len(key), 2) }
+	o := Options{L0Trigger: 1, FileBytes: 1 << 20, BlockBytes: 256, Workers: 4,
+		Spaces: map[byte]SpacePolicy{'K': {Group: group}}}
+	rng := rand.New(rand.NewPCG(5, 6))
+	universe := randKeys(rng, 4000, 'K')
+	batch := func(n int) []Entry {
+		var out []Entry
+		for _, i := range rng.Perm(len(universe))[:n] {
+			e := Entry{Key: universe[i], Kind: KindPut, Value: setmerge.Value(set(uint32(rng.IntN(1000))))}
+			if rng.IntN(7) == 0 {
+				e.Kind, e.Value = KindDelete, nil
+			}
+			out = append(out, e)
+		}
+		slices.SortFunc(out, func(a, b Entry) int { return bytes.Compare(a.Key, b.Key) })
+		return out
+	}
+	st := newMemStore()
+	v, _, err := Flush(ctx, Version{}, batch(4000), o, st.put)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, _, err = Compact(ctx, v, Job{Level: 0, Inputs: v.Levels[0], Bottom: true}, o, st.reader(), st.put); err != nil {
+		t.Fatal(err)
+	}
+	if v, _, err = Flush(ctx, v, batch(900), o, st.put); err != nil {
+		t.Fatal(err)
+	}
+	j := Job{Level: 0, Inputs: v.Levels[0], Overlap: v.Levels[1], Bottom: true}
+	if len(j.Overlap) != 1 {
+		t.Fatalf("fixture overlap %d files, want 1", len(j.Overlap))
+	}
+	run := func(partBytes int64) (Version, *memStore) {
+		s := st.clone()
+		o := o
+		o.PartBytes = partBytes
+		out, _, err := Compact(ctx, v, j, o, s.reader(), s.put)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out, s
+	}
+	whole, ws := run(0)
+	cut, cs := run(4 << 10)
+	if len(whole.Levels[1]) != 1 || len(cut.Levels[1]) < 4 {
+		t.Fatalf("outputs: %d whole, %d cut", len(whole.Levels[1]), len(cut.Levels[1]))
+	}
+	read := func(v Version, s *memStore) []Entry {
+		it, err := s.reader().Iter(ctx, v, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return collect(t, it)
+	}
+	if a, b := read(whole, ws), read(cut, cs); !slices.EqualFunc(a, b, func(x, y Entry) bool {
+		return x.Kind == y.Kind && bytes.Equal(x.Key, y.Key) && bytes.Equal(x.Value, y.Value)
+	}) {
+		t.Fatalf("cut merge holds %d records, whole %d, or different ones", len(b), len(a))
+	}
+	files := cut.Levels[1]
+	for i := 1; i < len(files); i++ {
+		if bytes.Equal(files[i-1].Max[:2], files[i].Min[:2]) {
+			t.Fatalf("group %x spans files %d and %d", files[i].Min[:2], i-1, i)
+		}
+	}
+}

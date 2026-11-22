@@ -38,6 +38,12 @@ type Options struct {
 	// is split by its overlap files' key ranges, and each range is an
 	// independent merge (0: half the CPUs, at least one).
 	Workers int
+	// PartBytes, when positive, cuts a job's overlap further: each
+	// partition is cut at block boundaries of its overlap files into
+	// pieces of about PartBytes of them, at a group boundary where the
+	// space has a Group policy, so a merge into one large file still runs
+	// on Workers. Each piece writes files of its own.
+	PartBytes int64
 	// MaxTableAge bounds how long a write stays above the bottom level:
 	// Pick compacts a file whose Oldest is older than this down a level
 	// even when no size rule fires, so a delete or an overwrite reaches
@@ -767,7 +773,9 @@ func Compact(ctx context.Context, v Version, j Job, o Options, r Reader, put Put
 	if len(j.Overlap) == 0 {
 		parts = spaceParts(j.Inputs)
 	} else {
-		parts = overlapParts(j.Overlap, overlaps, o)
+		for _, p := range overlapParts(j.Overlap, overlaps, o) {
+			parts = append(parts, o.cut(p)...)
+		}
 	}
 	// The outputs' age: a bottom job drops every tombstone and shadowed
 	// version, so its outputs are as new as the job; any other keeps the
@@ -975,6 +983,37 @@ func overlapParts(overlap []FileRef, opened []*named, o Options) []partition {
 		curBytes += f.Bytes
 	}
 	return append(parts, cur)
+}
+
+// cut is p in pieces of about o.PartBytes of its overlap files, cut at the
+// first key of a block of one of them (and with the space's Group policy
+// only where that block starts a group), or p alone. The overlap files are
+// one run, in key order.
+func (o Options) cut(p partition) []partition {
+	if o.PartBytes <= 0 || len(p.overlaps) == 0 || len(p.overlaps[0].t.index) == 0 {
+		return []partition{p}
+	}
+	group := o.Spaces[p.overlaps[0].t.index[0].first[0]].Group
+	var out []partition
+	lo, acc := p.lo, int64(0)
+	var last []byte // the last key of the block before
+	for _, n := range p.overlaps {
+		for _, b := range n.t.index {
+			next := b.first
+			at := last != nil && acc >= o.PartBytes && (lo == nil || bytes.Compare(next, lo) > 0) && (p.hi == nil || bytes.Compare(next, p.hi) < 0)
+			if at && group != nil {
+				k, m := group(next), group(last)
+				at = k != m || !bytes.Equal(next[:k], last[:m])
+			}
+			if at {
+				out = append(out, partition{lo: lo, hi: next, overlaps: p.overlaps})
+				lo, acc = next, 0
+			}
+			acc += b.length
+			last = b.last
+		}
+	}
+	return append(out, partition{lo: lo, hi: p.hi, overlaps: p.overlaps})
 }
 
 // partition is one independent merge of a compaction: the inputs and the
