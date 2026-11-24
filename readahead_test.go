@@ -496,3 +496,52 @@ func TestCompactPartBytes(t *testing.T) {
 		}
 	}
 }
+
+// TestCompactKeep: a bottom job over every file with Keep writes exactly
+// the resolved entries Keep accepts, so a version can be split in two by
+// two compactions whose Keeps are complements.
+func TestCompactKeep(t *testing.T) {
+	ctx := context.Background()
+	st, v, _, o := compactFixture(t)
+	var all []FileRef
+	for _, l := range v.Levels {
+		all = append(all, l...)
+	}
+	read := func(st *memStore, v Version) map[string][]byte {
+		it, err := st.reader().Iter(ctx, v, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := map[string][]byte{}
+		for ok := it.SeekGE(nil); ok; ok = it.Next() {
+			if it.Kind() != KindDelete {
+				out[string(it.Key())] = bytes.Clone(it.Value())
+			}
+		}
+		if err := it.Err(); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	want := read(st, v)
+	even := func(e Entry) bool { return e.Key[len(e.Key)-1]%2 == 0 }
+	got := map[string][]byte{}
+	for _, side := range []bool{true, false} {
+		o := o
+		o.Keep = func(e Entry) bool { return even(e) == side }
+		s := st.clone() // each side numbers its tables from v.NextSeq
+		out, _, err := Compact(ctx, v, Job{Level: 0, Inputs: all, Bottom: true}, o, s.reader(), s.put)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for k, val := range read(s, out) {
+			if even(Entry{Key: []byte(k)}) != side {
+				t.Fatalf("key %x kept on the wrong side", k)
+			}
+			got[k] = val
+		}
+	}
+	if len(want) == 0 || !maps.EqualFunc(got, want, bytes.Equal) {
+		t.Fatalf("the two sides hold %d entries, the version %d, or a value differs", len(got), len(want))
+	}
+}

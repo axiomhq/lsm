@@ -73,6 +73,11 @@ type Options struct {
 	// Spaces sets a key space's merge policy (tiered only), by its first
 	// key byte; a space it does not name tiers by size.
 	Spaces map[byte]SpacePolicy
+	// Keep, when set, drops from a compaction's output every entry, as the
+	// merge resolves it, for which it returns false: a caller copies part
+	// of a version into new tables, as when an index splits in two. The
+	// entry's bytes are valid only during the call.
+	Keep func(Entry) bool
 }
 
 // SpacePolicy is one key space's merge policy.
@@ -1185,6 +1190,9 @@ func (c *compaction) writePartition(ctx context.Context, pi int, p partition) (e
 		// space's FileBytes (at most MaxTableBytes); every entry fits a
 		// file of its own.
 		e := Entry{Key: in.Key(), Kind: in.Kind(), Value: in.Value()}
+		if c.o.Keep != nil && !c.o.Keep(e) {
+			continue
+		}
 		if w != nil && (e.Key[0] != space || !w.fits(e, c.o.fileBytes(space))) {
 			if err := finish(); err != nil {
 				return err
