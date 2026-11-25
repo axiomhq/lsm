@@ -776,7 +776,9 @@ func Compact(ctx context.Context, v Version, j Job, o Options, r Reader, put Put
 	}
 	var parts []partition
 	if len(j.Overlap) == 0 {
-		parts = spaceParts(j.Inputs)
+		for _, p := range spaceParts(j.Inputs) {
+			parts = append(parts, o.cutInputs(p, inputs)...)
+		}
 	} else {
 		for _, p := range overlapParts(j.Overlap, overlaps, o) {
 			parts = append(parts, o.cut(p)...)
@@ -1019,6 +1021,70 @@ func (o Options) cut(p partition) []partition {
 		}
 	}
 	return append(out, partition{lo: lo, hi: p.hi, overlaps: p.overlaps})
+}
+
+// cutInputs cuts a no-overlap partition p into pieces of about o.PartBytes of
+// total input bytes using the largest input table's block boundaries in [lo, hi).
+func (o Options) cutInputs(p partition, inputs []named) []partition {
+	if o.PartBytes <= 0 || len(inputs) == 0 {
+		return []partition{p}
+	}
+	var guide *named
+	var guideBytes, totalBytes int64
+	for i := range inputs {
+		idx := inputs[i].t.index
+		if len(idx) == 0 {
+			continue
+		}
+		var inPart int64
+		for _, b := range idx {
+			if p.lo != nil && bytes.Compare(b.last, p.lo) < 0 {
+				continue
+			}
+			if p.hi != nil && bytes.Compare(b.first, p.hi) >= 0 {
+				break
+			}
+			inPart += b.length
+		}
+		totalBytes += inPart
+		if inPart > guideBytes {
+			guideBytes = inPart
+			guide = &inputs[i]
+		}
+	}
+	if guide == nil || totalBytes <= o.PartBytes {
+		return []partition{p}
+	}
+	// Scale PartBytes to the guide table's share of totalBytes.
+	step := max(o.PartBytes*guideBytes/totalBytes, 1)
+	var out []partition
+	lo, acc := p.lo, int64(0)
+	var last []byte
+	var group func([]byte) int
+	for _, b := range guide.t.index {
+		if p.lo != nil && bytes.Compare(b.last, p.lo) < 0 {
+			continue
+		}
+		if p.hi != nil && bytes.Compare(b.first, p.hi) >= 0 {
+			break
+		}
+		if group == nil && len(b.first) > 0 {
+			group = o.Spaces[b.first[0]].Group
+		}
+		next := b.first
+		at := last != nil && acc >= step && (lo == nil || bytes.Compare(next, lo) > 0) && (p.hi == nil || bytes.Compare(next, p.hi) < 0)
+		if at && group != nil {
+			k, m := group(next), group(last)
+			at = k != m || !bytes.Equal(next[:k], last[:m])
+		}
+		if at {
+			out = append(out, partition{lo: lo, hi: next})
+			lo, acc = next, 0
+		}
+		acc += b.length
+		last = b.last
+	}
+	return append(out, partition{lo: lo, hi: p.hi})
 }
 
 // partition is one independent merge of a compaction: the inputs and the
